@@ -47,21 +47,25 @@ kept close, made perfect.
 
 ---
 
-## The Indian form: the akash kandil
+## The Indian form: the laltain
 
-The final mark realizes Kept Flame through the **akash kandil** — the
-star lantern hung at the threshold through Diwali, lit paper glowing
-from a single lamp inside. It is India's lantern, and it answers the
-app's name directly: a light hung out so that others can find the house.
+The final mark realizes Kept Flame through the **laltain** — the kerosene
+hurricane lantern of the Indian village night, chosen from the owner's own
+reference: painted steel gone soft with years, a wire bail for a nail or a
+branch, and a glass globe that holds the flame steady against wind. Before
+the grid reached the villages, this was the network: one laltain lit,
+carried, hung where the household gathered.
 
-Eight points — tall, wide, and four short diagonals — with the white-gold
-heart at the centre where the flame lives, saffron deepening to crimson
-at the tips the way lit paper darkens toward its folds. Fold lines barely
-present: the craft of the paper, felt more than seen. A cord and loop
-above, because a kandil is *hung*, deliberately, where the lane can see
-it. Streamers below, caught mid-sway, fading like the light they trail.
+The anatomy is kept faithful and reduced to its essentials: the flat cap
+disc and vented dome; the trapezoid of side tubes that gives the hurricane
+lantern its unmistakable stance; the barrel globe, widest at the belly,
+with the white heart of the flame low where the wick burns; the crossed
+guard wires, confined to the glass; the fuel drum below with its filler
+cap — the detail every hand remembers — and the base rim it stands on.
+Steel in deep laltain green, warmed at every edge that faces its own
+flame. The night indigo field and the amber radiance carry over unchanged.
 
-An earlier study used the diya; the kandil supersedes it. A diya is a
-light kept at your own feet. A kandil is a light raised for the
-neighborhood — and this app is the neighborhood's. One star, hung out,
-glowing for whoever is near. Nothing else.
+Earlier studies used the diya and the akash kandil. The laltain supersedes
+both, and rightly: it is not a festival's light but an *every night* light
+— working light, carried light, the lamp you trusted to still be burning
+at the door. That is what this app is. One laltain, lit. Nothing else.

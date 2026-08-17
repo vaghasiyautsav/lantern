@@ -1,9 +1,10 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <!--
-    Lantern icon — "Kept Flame", Indian form: the akash kandil.
-    The star lantern hung at the threshold during Diwali: lit paper,
-    eight points, streamers in the night breeze. One glowing star,
-    kept close. Nothing else.
+    Lantern icon — "Kept Flame", Indian form: the laltain.
+    The kerosene hurricane lantern of every Indian village night —
+    painted steel, wire bail, a glass globe holding the flame steady
+    against wind. Hung on a nail, a branch, a doorway: light where
+    the people are. One lantern, lit. Nothing else.
   -->
   <defs>
     <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
@@ -13,29 +14,38 @@
     </linearGradient>
 
     <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0"   stop-color="#ffd9a0" stop-opacity="0.45"/>
-      <stop offset="0.35" stop-color="#ffb454" stop-opacity="0.20"/>
-      <stop offset="0.7" stop-color="#8f7ce0" stop-opacity="0.06"/>
-      <stop offset="1"   stop-color="#4a5aa8" stop-opacity="0"/>
+      <stop offset="0"    stop-color="#ffd9a0" stop-opacity="0.48"/>
+      <stop offset="0.35" stop-color="#ffb454" stop-opacity="0.22"/>
+      <stop offset="0.7"  stop-color="#8f7ce0" stop-opacity="0.06"/>
+      <stop offset="1"    stop-color="#4a5aa8" stop-opacity="0"/>
     </radialGradient>
 
-    <!-- Lit paper: white-gold heart to saffron to crimson point-tips -->
-    <radialGradient id="paper" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0"    stop-color="#fff3d8"/>
-      <stop offset="0.3"  stop-color="#ffce75"/>
-      <stop offset="0.62" stop-color="#ff9e3d"/>
-      <stop offset="0.85" stop-color="#ef6c2a"/>
-      <stop offset="1"    stop-color="#d84f26"/>
+    <!-- The globe, lit -->
+    <radialGradient id="fire" cx="0.5" cy="0.55" r="0.6">
+      <stop offset="0"    stop-color="#fff6e0"/>
+      <stop offset="0.4"  stop-color="#ffce75"/>
+      <stop offset="0.8"  stop-color="#ff9e3d"/>
+      <stop offset="1"    stop-color="#ef7c2a"/>
     </radialGradient>
 
-    <linearGradient id="tassel" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"   stop-color="#ffb454" stop-opacity="0.9"/>
-      <stop offset="0.7" stop-color="#ff9e3d" stop-opacity="0.5"/>
-      <stop offset="1"   stop-color="#ff9e3d" stop-opacity="0"/>
+    <!-- Painted steel: the deep laltain green, lit by its own lamp -->
+    <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#47695c"/>
+      <stop offset="0.5" stop-color="#33504a"/>
+      <stop offset="1"   stop-color="#1e3230"/>
     </linearGradient>
 
     <clipPath id="squircle">
       <rect x="0" y="0" width="1024" height="1024" rx="232" ry="232"/>
+    </clipPath>
+
+    <clipPath id="globeclip">
+      <path d="M 430 400
+               C 372 460 358 540 372 610
+               C 384 668 440 700 512 700
+               C 584 700 640 668 652 610
+               C 666 540 652 460 594 400
+               Z"/>
     </clipPath>
 
     <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
@@ -48,45 +58,73 @@
     <rect width="1024" height="1024" fill="url(#field)"/>
 
     <!-- radiance -->
-    <circle cx="512" cy="470" r="470" fill="url(#glow)"/>
+    <circle cx="512" cy="520" r="470" fill="url(#glow)"/>
 
-    <!-- cord and loop -->
-    <circle cx="512" cy="78" r="16" fill="none" stroke="#4d5788" stroke-width="12"/>
-    <line x1="512" y1="94" x2="512" y2="208" stroke="#4d5788" stroke-width="10"
-          stroke-linecap="round"/>
+    <!-- bail handle: one wire arc, hung from nothing but night -->
+    <path d="M 408 372 C 396 210 628 210 616 372"
+          fill="none" stroke="#3c5a52" stroke-width="17" stroke-linecap="round"/>
 
-    <!-- halo behind the star -->
-    <circle cx="512" cy="470" r="200" fill="#ff9e3d" opacity="0.30" filter="url(#soft)"/>
+    <!-- halo behind the globe -->
+    <ellipse cx="512" cy="540" rx="220" ry="220" fill="#ff9e3d"
+             opacity="0.30" filter="url(#soft)"/>
 
-    <!-- the kandil: eight points — tall, wide, and four short diagonals -->
-    <path d="M 512 210
-             L 547 385 L 624 358 L 597 435 L 742 470
-             L 597 505 L 624 582 L 547 555 L 512 730
-             L 477 555 L 400 582 L 427 505 L 282 470
-             L 427 435 L 400 358 L 477 385 Z"
-          fill="url(#paper)"/>
+    <!-- the globe: barrel glass, widest at the belly -->
+    <path d="M 430 400
+             C 372 460 358 540 372 610
+             C 384 668 440 700 512 700
+             C 584 700 640 668 652 610
+             C 666 540 652 460 594 400
+             Z"
+          fill="url(#fire)"/>
+    <!-- white heart low in the globe, where the wick burns -->
+    <circle cx="512" cy="588" r="66" fill="#fffdf5" opacity="0.9"/>
+    <!-- glass highlight -->
+    <path d="M 428 448 C 408 508 406 570 420 622" fill="none"
+          stroke="#fff6e0" stroke-width="14" stroke-linecap="round" opacity="0.4"/>
 
-    <!-- fold lines: the paper's craft, barely there -->
-    <g stroke="#a83a1e" stroke-width="5" opacity="0.28" stroke-linecap="round">
-      <line x1="512" y1="470" x2="512" y2="222"/>
-      <line x1="512" y1="470" x2="512" y2="718"/>
-      <line x1="512" y1="470" x2="294" y2="470"/>
-      <line x1="512" y1="470" x2="730" y2="470"/>
-      <line x1="512" y1="470" x2="616" y2="366"/>
-      <line x1="512" y1="470" x2="616" y2="574"/>
-      <line x1="512" y1="470" x2="408" y2="366"/>
-      <line x1="512" y1="470" x2="408" y2="574"/>
+    <!-- wire guard: the crossed wires that keep the glass safe -->
+    <g clip-path="url(#globeclip)" stroke="#22352f" stroke-width="8"
+       fill="none" opacity="0.4" stroke-linecap="round">
+      <path d="M 386 470 C 470 540 554 592 646 620"/>
+      <path d="M 638 470 C 554 540 470 592 378 620"/>
     </g>
 
-    <!-- the flame heart at the star's centre -->
-    <circle cx="512" cy="470" r="72" fill="#fff3d8" opacity="0.85"/>
-    <circle cx="512" cy="470" r="44" fill="#fffdf5"/>
+    <!-- top: flat cap disc, vented dome, collar -->
+    <rect x="462" y="288" width="100" height="22" rx="11" fill="url(#steel)"/>
+    <path d="M 434 356 Q 512 296 590 356 L 590 372 L 434 372 Z" fill="url(#steel)"/>
+    <g fill="#141f1e" opacity="0.6">
+      <circle cx="472" cy="352" r="6"/>
+      <circle cx="500" cy="346" r="6"/>
+      <circle cx="528" cy="346" r="6"/>
+      <circle cx="556" cy="352" r="6"/>
+    </g>
+    <rect x="418" y="372" width="188" height="30" rx="15" fill="url(#steel)"/>
 
-    <!-- streamers, hanging from the star's lower points -->
-    <rect x="500" y="726" width="24" height="178" rx="12" fill="url(#tassel)"/>
-    <rect x="391" y="576" width="18" height="142" rx="9" fill="url(#tassel)"
-          transform="rotate(-8 400 580)"/>
-    <rect x="615" y="576" width="18" height="142" rx="9" fill="url(#tassel)"
-          transform="rotate(8 624 580)"/>
+    <!-- side frame tubes: the hurricane trapezoid -->
+    <path d="M 432 396 C 402 500 390 610 394 706" fill="none"
+          stroke="url(#steel)" stroke-width="26" stroke-linecap="round"/>
+    <path d="M 592 396 C 622 500 634 610 630 706" fill="none"
+          stroke="url(#steel)" stroke-width="26" stroke-linecap="round"/>
+
+    <!-- burner collar under the globe -->
+    <rect x="452" y="694" width="120" height="26" rx="13" fill="#33504a"/>
+
+    <!-- fuel tank: the drum that fed a whole evening -->
+    <path d="M 386 716
+             C 386 706 638 706 638 716
+             L 644 776
+             C 644 800 380 800 380 776 Z"
+          fill="url(#steel)"/>
+    <!-- filler cap, remembered from every real laltain -->
+    <ellipse cx="602" cy="712" rx="20" ry="12" fill="#47695c"/>
+    <!-- base rim -->
+    <rect x="360" y="792" width="304" height="34" rx="17" fill="url(#steel)"/>
+
+    <!-- warm rim-light where the steel faces its own flame -->
+    <g stroke="#e8945e" fill="none" stroke-linecap="round" opacity="0.5">
+      <path d="M 442 402 C 414 500 402 606 406 700" stroke-width="6"/>
+      <path d="M 582 402 C 610 500 622 606 618 700" stroke-width="6"/>
+      <path d="M 400 722 C 460 712 564 712 624 722" stroke-width="7"/>
+    </g>
   </g>
 </svg>
