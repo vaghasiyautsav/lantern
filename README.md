@@ -39,7 +39,9 @@ native shell needs a Windows machine (or CI) — deferred per the roadmap.
 
 ## Using it
 
-- People on the same network appear in the left sidebar automatically.
+- People on the same network appear in the left sidebar automatically. The
+  **refresh** button in the title bar asks everyone to check in right away
+  instead of waiting for the next heartbeat.
 - Click a person → type → Enter. ✓✓ means delivered.
 - Drop a file anywhere on the window to send it. Files are BLAKE3-verified
   chunk by chunk; interrupted transfers resume from where they stopped.
@@ -50,6 +52,23 @@ native shell needs a Windows machine (or CI) — deferred per the roadmap.
   manager shows, and on Linux the localised one if your desktop uses a
   different name for it. The app tells you the exact path when a file
   arrives.
+
+While a file moves you get a live rate — "12.3 MB of 50.0 MB · 8.4 MB/s" —
+and on the receiving side the bytes counted are the ones that already passed
+their hash, so the number never runs ahead of what is actually safe on disk.
+
+## Updating
+
+```bash
+lantern-update           # fetch, rebuild, reinstall
+lantern-update --check   # just tell me what's new
+```
+
+Lantern does **not** check for updates by itself, and that is on purpose: the
+app never opens a connection off your local network, so it cannot tell anyone
+that you are running it. Updating is a thing you ask for, in a terminal, not
+something the app does behind you. It refuses to run over uncommitted changes
+and only fast-forwards.
 
 ## When nobody shows up
 
@@ -95,7 +114,7 @@ Open http://localhost:3999 and http://localhost:4000 side by side.
 ## CLI
 
 A headless client ships too: `~/.lantern/bin/lantern --name You --broadcast`
-with `/peers`, `/msg`, `/send`, `/verify`, `/trust` commands.
+with `/peers`, `/msg`, `/send`, `/refresh`, `/verify`, `/trust` commands.
 
 ## Uninstall
 

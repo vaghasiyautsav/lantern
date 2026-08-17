@@ -62,8 +62,10 @@ mkdir -p "$HOME/.lantern/bin"
 
 # Copy-then-rename, never a plain cp over the destination: an in-app update
 # reinstalls while a Lantern may still be running, and Linux refuses to write
-# to a busy executable (ETXTBSY) while macOS lets you corrupt one. A rename
-# swaps the directory entry and leaves any running process on its old inode.
+# to a busy executable (ETXTBSY) while macOS lets you corrupt one. Renaming
+# swaps the directory entry, leaving any running process on its old inode —
+# and unlike unlink-then-copy there is no moment where the binary is missing,
+# so a failed copy can't leave the machine without a Lantern.
 install_bin() { # <built file> <destination>
     tmp="$2.new.$$"
     cp "$1" "$tmp"
@@ -72,11 +74,19 @@ install_bin() { # <built file> <destination>
 }
 install_bin target/release/lantern-gui "$HOME/.lantern/bin/lantern-gui"
 install_bin target/release/lantern "$HOME/.lantern/bin/lantern"
-# The updater itself, so `git pull` isn't the only way to get a newer one.
-install_bin packaging/update.sh "$HOME/.lantern/bin/lantern-update"
 install_bin target/release/lantern-doctor "$HOME/.lantern/bin/lantern-doctor"
 if [ "${BUILD_GTK:-0}" = "1" ] && [ -f target/release/lantern-gtk ]; then
     install_bin target/release/lantern-gtk "$HOME/.lantern/bin/lantern-gtk"
+fi
+
+# The updater, as a tool a person can run deliberately (`lantern-update`) as
+# well as the script the in-app button hands off to. One script, two ways in.
+# The checkout it was built from is baked in so it knows what to pull.
+if [ -f packaging/update.sh ]; then
+    tmp="$HOME/.lantern/bin/lantern-update.new.$$"
+    sed "s|__REPO__|$(pwd)|" packaging/update.sh > "$tmp"
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$HOME/.lantern/bin/lantern-update"
 fi
 
 # Linux: desktop entry + icon so Lantern appears in the app launcher.
@@ -92,7 +102,13 @@ if [ "$(uname)" = "Linux" ]; then
     else
         LAUNCH_EXEC="sh -c '$HOME/.lantern/bin/lantern-gui & sleep 1; xdg-open http://localhost:3999'"
     fi
-    cat > "$HOME/.local/share/applications/lantern.desktop" <<EOF
+    # The filename must equal the GTK application id. A Wayland compositor
+    # only knows a window by its app_id, and finds its icon by looking for
+    # <app_id>.desktop — so a file named lantern.desktop leaves the running
+    # app with a generic fallback icon even though search finds it fine.
+    # StartupWMClass covers the same match on X11.
+    rm -f "$HOME/.local/share/applications/lantern.desktop"
+    cat > "$HOME/.local/share/applications/local.lantern.gtk.desktop" <<EOF
 [Desktop Entry]
 Name=Lantern
 Comment=Serverless LAN messenger
@@ -101,7 +117,9 @@ Terminal=false
 Icon=lantern
 Type=Application
 Categories=Network;InstantMessaging;
+StartupWMClass=local.lantern.gtk
 EOF
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
     echo "Added Lantern to your application launcher."
 fi
 

@@ -263,7 +263,7 @@ async function api(path, opts){ const r = await fetch(path, opts); return r.json
 /* "12.0 MB of 40.0 MB · 8.4 MB/s · 3 s left" — speed and ETA are dropped
    rather than guessed when the engine can't measure them yet. */
 function progressLine(ev){
-  const parts = [`${fmtSize(ev.done)} of ${fmtSize(ev.total)}`];
+  const parts = [`${fmtSize(ev.bytes)} of ${fmtSize(ev.total)}`];
   if(ev.bps) parts.push(fmtSize(ev.bps)+'/s');
   if(ev.eta_s) parts.push(ev.eta_s+' s left');
   return parts.join(' · ');
@@ -554,13 +554,13 @@ $('um-apply').onclick = async () => {
     + 'Progress is in ~/.lantern/update.log.';
 };
 
-/* refresh — say hello again so peers answer now, then rebuild the list.
+/* refresh — Ping the link so everyone checks in, then rebuild the list.
    Discovery is automatic; this is for "I just opened it over there". */
 $('refresh-btn').onclick = async () => {
   const b = $('refresh-btn');
   b.disabled = true; b.textContent = '…';
   try {
-    const r = await api('/api/announce', {method:'POST'});
+    const r = await api('/api/refresh', {method:'POST'});
     await refreshPeers();
     if(!r.online) banner('Nobody answered. Check Lantern is open on the other '
       + 'machine and both are on the same network.');

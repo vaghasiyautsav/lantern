@@ -263,7 +263,11 @@ impl Store {
     ///
     /// No `reply_to` fixup is needed: replies only ever reference messages
     /// in the same conversation, so every reference dies with its target.
-    /// The peer row itself (name, trust, pinned key) is untouched — you are
+    ///
+    /// The peer row itself stays: it carries the pinned key and the verified
+    /// flag, and dropping those would silently downgrade a verified contact
+    /// back to first-contact trust — the next connection would be accepted as
+    /// new rather than checked against what we already pinned. You are
     /// clearing what was said, not un-knowing the person.
     pub fn clear_history(&self, peer_id: &[u8; 32]) -> Result<usize, StoreError> {
         let gone = self.conn.execute(
@@ -285,6 +289,40 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_a_conversation_keeps_the_peer_and_its_trust() {
+        let store = Store::open_in_memory().unwrap();
+        let peer = [7u8; 32];
+        let other = [8u8; 32];
+        store.record_peer(&peer, "Mira", "mira-mbp", 1000).unwrap();
+        store.record_peer(&other, "Ravi", "ravi-box", 1000).unwrap();
+        store.set_verified(&peer, true).unwrap();
+
+        for (who, text) in [(peer, "one"), (peer, "two"), (other, "theirs")] {
+            store
+                .insert_message(&StoredMessage {
+                    mid: Uuid::new_v4(),
+                    peer_id: who,
+                    outgoing: false,
+                    ts: 2000,
+                    text: text.into(),
+                    state: 0,
+                    reply_to: None,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(store.clear_history(&peer).unwrap(), 2);
+        assert!(store.history(&peer, 10).unwrap().is_empty());
+        // Only that conversation.
+        assert_eq!(store.history(&other, 10).unwrap().len(), 1);
+        // And the peer survives with its trust intact — dropping the row
+        // would downgrade a verified contact back to first-contact trust.
+        assert!(store.is_verified(&peer).unwrap());
+        // Clearing an already-empty conversation is a no-op, not a failure.
+        assert_eq!(store.clear_history(&peer).unwrap(), 0);
+    }
 
     #[test]
     fn message_log_round_trip() {
@@ -386,23 +424,4 @@ mod tests {
         assert_eq!(surviving_answer.reply_to, None);
     }
 
-    #[test]
-    fn clearing_a_conversation_spares_every_other_one() {
-        let store = Store::open_in_memory().unwrap();
-        let mira = [1u8; 32];
-        let dev = [2u8; 32];
-        store.record_peer(&mira, "Mira", "mira-mbp", 1000).unwrap();
-        store.set_verified(&mira, true).unwrap();
-        store.insert_message(&msg(mira, 1000, "hello")).unwrap();
-        store.insert_message(&msg(mira, 1001, "and again")).unwrap();
-        store.insert_message(&msg(dev, 1002, "different peer")).unwrap();
-
-        assert_eq!(store.clear_history(&mira).unwrap(), 2);
-        assert!(store.history(&mira, 10).unwrap().is_empty());
-        assert_eq!(store.history(&dev, 10).unwrap().len(), 1);
-        // Clearing what was said doesn't un-know the person.
-        assert!(store.is_verified(&mira).unwrap());
-        // Clearing an already-empty conversation is a no-op, not a failure.
-        assert_eq!(store.clear_history(&mira).unwrap(), 0);
-    }
 }

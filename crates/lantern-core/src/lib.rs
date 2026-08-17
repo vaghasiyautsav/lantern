@@ -80,18 +80,26 @@ pub enum CoreEvent {
     /// Sender-side stats after streaming: how many chunks the peer actually
     /// needed. `sent < total` is a resume in action.
     ChunksSent { xid: Uuid, sent: u32, total: u32 },
-    /// Bytes are moving. Emitted for both directions, clock-paced (about five
-    /// a second) rather than once per chunk, so a fast LAN transfer doesn't
-    /// bury the UI in events.
+    /// Live progress in both directions. `bytes` of `total` of the file are in
+    /// place — on a resume that starts partway up, because chunks already held
+    /// count toward it.
     ///
-    /// `done`/`total` are the bytes of *this* transfer's work: on a resume the
-    /// sender counts only the chunks it must re-send, while the receiver
-    /// counts the whole file, because that's what each side is waiting on.
+    /// Clock-paced (about five a second), not once per chunk: a 150 MB/s LAN
+    /// transfer moves 150 chunks a second, and no interface needs 150 frames
+    /// to show one bar moving.
+    ///
+    /// The rate is measured here rather than left to each shell to divide for
+    /// itself. Not because a shell couldn't, but because doing it well is the
+    /// whole problem — a raw delta between two 1 MiB bursts swings by an order
+    /// of magnitude, so `rate` smooths it and reports nothing at all until a
+    /// measurement window has closed. Four shells dividing badly in four
+    /// different ways is worse than one place doing it properly; a shell that
+    /// wants its own figure still has `bytes` and its own clock.
     TransferProgress {
         xid: Uuid,
         /// True when we're the sender.
         outgoing: bool,
-        done: u64,
+        bytes: u64,
         total: u64,
         /// Smoothed bytes per second — None until it's been measurable for
         /// long enough to state without lying (see `rate`).
@@ -272,6 +280,8 @@ struct Inner {
     accept_waiters: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<u32>, String>>>,
     /// Identities we've already raised a TOFU conflict for (dedup).
     warned: std::collections::HashSet<[u8; 32]>,
+    /// When we last answered a Ping. Rate limit — see the discovery loop.
+    last_ping_reply: Option<std::time::Instant>,
 }
 
 pub struct Core {
@@ -323,6 +333,7 @@ impl Core {
                 pending_offers: HashMap::new(),
                 accept_waiters: HashMap::new(),
                 warned: std::collections::HashSet::new(),
+                last_ping_reply: None,
             })),
             events: event_tx,
             seq: std::sync::atomic::AtomicU64::new(1),
@@ -402,9 +413,11 @@ impl Core {
             .unwrap_or(false)
     }
 
-    /// Delete the whole conversation with `peer` from this machine's history.
-    /// Returns how many messages went. Trust and the peer's name survive —
-    /// see `Store::clear_history`.
+    /// Delete the whole conversation with `peer` from this machine's history,
+    /// returning how many messages went. Purely local: nothing is sent, and
+    /// the peer keeps their copy — any UI offering this must say so rather
+    /// than implying a recall. Trust and the peer's name survive; see
+    /// `Store::clear_history`.
     pub fn clear_history(&self, peer: &[u8; 32]) -> usize {
         self.store
             .lock()
@@ -474,6 +487,20 @@ impl Core {
 
     pub async fn announce(&self) {
         let b = self.make_beacon(BeaconType::Hello);
+        self.discovery.send_beacon(&b, self.identity.signing_key()).await;
+    }
+
+    /// Ask everyone on the link to announce themselves now, rather than
+    /// waiting out the heartbeat.
+    ///
+    /// A plain `announce()` is not enough for this. Peers only answer a
+    /// beacon from someone *new* to them, so re-announcing to a peer that
+    /// already has us in its roster produces no reply and the roster stays
+    /// stale for up to a heartbeat. `Ping` is the "everyone speak up" that
+    /// `BeaconType` has always had a slot for (DESIGN §4.2) and nothing ever
+    /// sent.
+    pub async fn refresh(&self) {
+        let b = self.make_beacon(BeaconType::Ping);
         self.discovery.send_beacon(&b, self.identity.signing_key()).await;
     }
 
@@ -657,17 +684,14 @@ impl Core {
             let mut file = tokio::fs::File::open(path).await?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut buf = vec![0u8; CHUNK_SIZE as usize];
-            // What this run has to move — on a resume that's the gaps only,
-            // which is also the number the person is waiting on.
-            let work: u64 = need
-                .iter()
-                .filter(|i| **i < total)
-                .map(|i| {
-                    let start = *i as u64 * CHUNK_SIZE as u64;
-                    (size - start).min(CHUNK_SIZE as u64)
-                })
-                .sum();
+            // Chunks the peer already had count as done, so a resumed
+            // transfer's progress starts where it left off instead of at zero.
+            let already = (total as u64).saturating_sub(need.len() as u64)
+                * CHUNK_SIZE as u64;
             let mut moved = 0u64;
+            // Fed `moved`, not `already + moved`: the head start didn't happen
+            // now, and counting it as this second's traffic would open with a
+            // fantasy speed.
             let mut meter = RateMeter::new(Instant::now());
             for idx in &need {
                 if *idx >= total {
@@ -683,16 +707,17 @@ impl Core {
                 uni.write_all(&buf[..len]).await?;
                 moved += len as u64;
                 // The meter decides when there's something worth saying, so
-                // a 40 MB/s transfer emits ~5 events a second, not 40.
+                // a 150 MB/s transfer emits ~5 events a second, not 150.
                 if meter.sample(moved, Instant::now()) {
+                    let bytes = (already + moved).min(size);
                     let _ = events
                         .send(CoreEvent::TransferProgress {
                             xid,
                             outgoing: true,
-                            done: moved,
-                            total: work,
+                            bytes,
+                            total: size,
                             bps: meter.bps(),
-                            eta_s: meter.eta_s(work.saturating_sub(moved)),
+                            eta_s: meter.eta_s(size.saturating_sub(bytes)),
                         })
                         .await;
                 }
@@ -704,8 +729,8 @@ impl Core {
                 .send(CoreEvent::TransferProgress {
                     xid,
                     outgoing: true,
-                    done: moved,
-                    total: work,
+                    bytes: (already + moved).min(size),
+                    total: size,
                     bps: meter.bps(),
                     eta_s: Some(0),
                 })
@@ -1093,19 +1118,22 @@ impl Core {
                             }
                         };
 
-                        // Receiver progress is measured against the whole file:
-                        // a resumed transfer should read "60 of 100 MB", not
-                        // restart the bar at nothing.
+                        // Verified bytes, not received bytes: a chunk that
+                        // failed its hash never lands, so progress can only
+                        // move on data that is actually good. Measured against
+                        // the whole file, so a resumed transfer reads "60 of
+                        // 100 MB" rather than restarting the bar at nothing.
                         stream_bytes += len as u64;
-                        let have = (verified_count as u64 * m.chunk_size as u64)
-                            .min(m.size);
+                        let have = (verified_count as u64 * m.chunk_size as u64).min(m.size);
                         let complete = verified_count as u32 == m.chunk_count();
+                        // The rate comes from what this stream moved; `have`
+                        // includes chunks from an earlier attempt.
                         if meter.sample(stream_bytes, Instant::now()) || complete {
                             let _ = events
                                 .send(CoreEvent::TransferProgress {
                                     xid,
                                     outgoing: false,
-                                    done: have,
+                                    bytes: have,
                                     total: m.size,
                                     bps: meter.bps(),
                                     eta_s: if complete {
@@ -1224,9 +1252,32 @@ impl Core {
                     .lock()
                     .unwrap()
                     .record_peer(&beacon.id, &beacon.name, &beacon.host, now_ms());
+                // Answer a Ping so whoever asked learns us immediately, and
+                // answer a first sighting so the new arrival does too.
+                //
+                // Ping replies are rate limited, because one broadcast Ping
+                // draws a reply from every node on the link. Without a limit
+                // an attacker sends Pings in a loop and each one costs them a
+                // packet and everyone else N — a cheap amplifier, and signing
+                // does not help since anyone can mint an identity. One reply
+                // per two seconds keeps a refresh button instant while
+                // flattening a flood into a trickle.
+                let answer_ping = beacon.beacon_type == BeaconType::Ping && {
+                    let mut inner = self.inner.lock().await;
+                    let now = std::time::Instant::now();
+                    let due = inner
+                        .last_ping_reply
+                        .is_none_or(|t| now.duration_since(t).as_secs_f32() >= 2.0);
+                    if due {
+                        inner.last_ping_reply = Some(now);
+                    }
+                    due
+                };
                 if is_new {
                     info!("discovered {} ({})", beacon.name, from);
-                    // Answer so the new arrival learns us quickly too.
+                }
+                if is_new || answer_ping {
+                    // Answer so the other side learns us quickly too.
                     self.announce().await;
                 }
                 let _ = self

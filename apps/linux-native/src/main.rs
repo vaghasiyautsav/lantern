@@ -15,21 +15,47 @@ use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use lantern_core::{Core, CoreConfig, CoreEvent, Uuid};
+use lantern_core::{Core, CoreConfig, CoreEvent};
 
+/// Also the Wayland `app_id`. GNOME matches a window to its launcher by
+/// looking for `<app_id>.desktop`, and uses that file's `Icon=` for the dock.
+/// If this constant and the installed .desktop filename ever disagree, the
+/// app runs with a generic fallback icon — see `install.sh`.
 const APP_ID: &str = "local.lantern.gtk";
 
 struct Backend {
     core: Arc<Core>,
     rt: tokio::runtime::Handle,
+    /// Shown as the sender on our own messages.
+    my_name: String,
+}
+
+/// The widgets of one file card, kept so events can update it in place,
+/// plus what is needed to turn per-chunk progress into a rate.
+struct FileRow {
+    status: gtk::Label,
+    icon: gtk::Image,
+    size: u64,
+    /// Bytes and the moment they were observed, from the last repaint.
+    last: Option<(u64, std::time::Instant)>,
+    /// Smoothed bytes/sec. Raw per-chunk deltas jitter far too much to read.
+    rate: f64,
+}
+
+#[derive(Clone)]
+struct PeerRow {
+    id: [u8; 32],
+    name: String,
+    host: String,
+    addr: String,
 }
 
 #[derive(Default)]
 struct UiState {
-    peers: Vec<([u8; 32], String, String)>, // id, name, host
+    peers: Vec<PeerRow>,
     selected: Option<[u8; 32]>,
-    /// xid -> status label of the file row, so events can update it.
-    file_rows: HashMap<String, gtk::Label>,
+    /// xid -> the file card, so events can update it.
+    file_rows: HashMap<String, FileRow>,
     /// Unread arrivals per peer. Incremented when something lands for a
     /// peer that is not on screen; cleared when that peer is selected.
     unread: HashMap<[u8; 32], u32>,
@@ -100,6 +126,7 @@ fn main() -> glib::ExitCode {
     let backend = Rc::new(Backend {
         core,
         rt: rt_handle,
+        my_name: name,
     });
 
     // Keep the runtime alive for the whole app lifetime.
@@ -126,6 +153,117 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+// ---- small formatting helpers ------------------------------------------
+// Deliberately mirrors apps/macos-native/Lantern.swift so a person on either
+// platform sees the same initials, the same avatar colour for the same peer,
+// and the same size units.
+
+/// Up to two initials, matching the macOS shell's `initials()`.
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .take(2)
+        .filter_map(|w| w.chars().next())
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// Which of the six avatar colours a key gets. Same arithmetic as the macOS
+/// shell's `avatarColor()` — sum of the first four characters — so one peer
+/// is the same colour on both platforms.
+fn avatar_slot(key: &str) -> usize {
+    let n: u32 = key.chars().take(4).map(|c| c as u32).sum();
+    (n as usize) % 6
+}
+
+/// Local wall-clock time of a millisecond timestamp, e.g. "14:32".
+fn fmt_time(ts: u64) -> String {
+    glib::DateTime::from_unix_local((ts / 1000) as i64)
+        .and_then(|d| d.format("%H:%M"))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// Matches the macOS shell's `fmtSize()`.
+fn fmt_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// `/home/u/Downloads` → `~/Downloads`, so a status line stays readable.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(std::path::PathBuf::from(home)) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// A round, coloured initials badge.
+fn avatar(name: &str, key: &str, size: i32) -> gtk::Label {
+    let a = gtk::Label::new(Some(&initials(name)));
+    a.add_css_class("lantern-avatar");
+    a.add_css_class(&format!("lantern-av-{}", avatar_slot(key)));
+    a.set_size_request(size, size);
+    a.set_valign(gtk::Align::Start);
+    a
+}
+
+const STYLE: &str = "
+.lantern-unread {
+    background-color: alpha(currentColor, 0.16);
+    border-radius: 999px;
+    padding: 0 8px;
+    font-size: 0.85em;
+    font-weight: bold;
+}
+.lantern-drop-active { background-color: alpha(currentColor, 0.06); }
+.lantern-avatar {
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 0.8em;
+    border-radius: 999px;
+}
+.lantern-av-0 { background-color: #6b5ce8; }
+.lantern-av-1 { background-color: #0f8a73; }
+.lantern-av-2 { background-color: #c2400d; }
+.lantern-av-3 { background-color: #7d3bed; }
+.lantern-av-4 { background-color: #0369a1; }
+.lantern-av-5 { background-color: #bf175c; }
+/* Both bubble tints derive from the theme's own foreground, so they track
+   light and dark without hardcoding a palette. Outgoing is the stronger of
+   the two; alignment already carries most of the distinction. Laltain green
+   stays reserved for the mark (brand guide §04). */
+.lantern-bubble {
+    border-radius: 14px;
+    padding: 8px 12px;
+}
+.lantern-bubble-in  { background-color: alpha(currentColor, 0.08); }
+.lantern-bubble-out { background-color: alpha(currentColor, 0.18); }
+.lantern-filecard {
+    border-radius: 10px;
+    padding: 10px;
+    background-color: alpha(currentColor, 0.06);
+    border: 1px solid alpha(currentColor, 0.14);
+}
+.lantern-banner {
+    background-color: alpha(currentColor, 0.10);
+    padding: 6px 12px;
+}
+.lantern-meta { font-size: 0.8em; }
+";
+
 fn build_ui(
     app: &gtk::Application,
     backend: Rc<Backend>,
@@ -133,23 +271,8 @@ fn build_ui(
 ) {
     let state = Rc::new(RefCell::new(UiState::default()));
 
-    // ---- style ----------------------------------------------------------
-    // Derived from the theme's own foreground, so the badge and the drop
-    // highlight follow light/dark without hardcoding a colour. Laltain green
-    // stays reserved for the mark (brand guide §04).
     let css = gtk::CssProvider::new();
-    css.load_from_data(
-        ".lantern-unread { \
-             background-color: alpha(currentColor, 0.16); \
-             border-radius: 999px; \
-             padding: 0 8px; \
-             font-size: 0.85em; \
-             font-weight: bold; \
-         } \
-         .lantern-drop-active { \
-             background-color: alpha(currentColor, 0.06); \
-         }",
-    );
+    css.load_from_data(STYLE);
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -173,17 +296,17 @@ fn build_ui(
     subtitle.add_css_class("dim-label");
     subtitle.set_tooltip_text(Some(&format!("Your safety words: {me_words}")));
     header.pack_end(&subtitle);
-    let update_btn = gtk::Button::with_label("Updates");
-    let build = lantern_core::update::BuildInfo::current();
-    update_btn.set_tooltip_text(Some(&format!(
-        "Build {} ({}) — check GitHub for a newer Lantern",
-        build.commit, build.date
-    )));
-    header.pack_start(&update_btn);
+
+    // "Look who's there now" — sends a Ping, which every node answers,
+    // instead of waiting out the heartbeat.
+    let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
+    refresh_btn.set_tooltip_text(Some("Look for devices on this network now"));
+    header.pack_start(&refresh_btn);
+
     window.set_titlebar(Some(&header));
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-    paned.set_position(260);
+    paned.set_position(280);
     paned.set_shrink_start_child(false);
     paned.set_shrink_end_child(false);
 
@@ -199,28 +322,8 @@ fn build_ui(
     ));
     empty_label.add_css_class("dim-label");
     empty_label.set_margin_top(24);
-    // Sidebar header: what the list is, and the one control that belongs to
-    // the list rather than to a conversation.
-    let roster_head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    roster_head.set_margin_top(8);
-    roster_head.set_margin_bottom(2);
-    roster_head.set_margin_start(12);
-    roster_head.set_margin_end(6);
-    let roster_lbl = gtk::Label::new(Some("On this network"));
-    roster_lbl.add_css_class("dim-label");
-    roster_lbl.set_xalign(0.0);
-    roster_lbl.set_hexpand(true);
-    let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
-    refresh_btn.add_css_class("flat");
-    refresh_btn.set_tooltip_text(Some(
-        "Look for people again now — Lantern also checks on its own every \
-         few seconds",
-    ));
-    roster_head.append(&roster_lbl);
-    roster_head.append(&refresh_btn);
-
+    empty_label.set_wrap(true);
     let left_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    left_box.append(&roster_head);
     left_box.append(&empty_label);
     left_box.append(&peers_scroll);
     peers_scroll.set_vexpand(true);
@@ -229,36 +332,89 @@ fn build_ui(
     // Right: conversation
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
+    // Conversation header: avatar, name, host · addr, verify state.
+    let head_avatar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let conv_title = gtk::Label::new(Some("Select someone to start"));
-    conv_title.add_css_class("title-4");
-    conv_title.set_margin_top(10);
-    conv_title.set_margin_bottom(6);
+    conv_title.add_css_class("heading");
+    conv_title.set_halign(gtk::Align::Start);
+    let conv_sub = gtk::Label::new(None);
+    conv_sub.add_css_class("dim-label");
+    conv_sub.add_css_class("lantern-meta");
+    conv_sub.set_halign(gtk::Align::Start);
+    let head_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    head_text.append(&conv_title);
+    head_text.append(&conv_sub);
+    let head_left = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    head_left.append(&head_avatar);
+    head_left.append(&head_text);
+    head_left.set_margin_start(12);
+
     let verify_btn = gtk::Button::with_label("Verify identity");
     verify_btn.set_sensitive(false);
-    let clear_btn = gtk::Button::with_label("Clear chat");
+    verify_btn.set_valign(gtk::Align::Center);
+
+    let clear_btn = gtk::Button::from_icon_name("edit-clear-all-symbolic");
+    clear_btn.set_tooltip_text(Some("Clear this conversation"));
     clear_btn.set_sensitive(false);
-    clear_btn.set_tooltip_text(Some(
-        "Delete this conversation from this machine — the other machine \
-         keeps its own copy",
-    ));
-    let title_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    title_actions.append(&verify_btn);
-    title_actions.append(&clear_btn);
+    clear_btn.set_valign(gtk::Align::Center);
+
+    let head_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    head_actions.append(&clear_btn);
+    head_actions.append(&verify_btn);
+
     let title_row = gtk::CenterBox::new();
-    title_row.set_center_widget(Some(&conv_title));
-    title_row.set_end_widget(Some(&title_actions));
-    title_row.set_margin_end(10);
+    title_row.set_start_widget(Some(&head_left));
+    title_row.set_end_widget(Some(&head_actions));
+    title_row.set_margin_top(8);
+    title_row.set_margin_bottom(8);
+    title_row.set_margin_end(12);
     right.append(&title_row);
     right.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-    let msg_list = gtk::ListBox::new();
-    msg_list.set_selection_mode(gtk::SelectionMode::None);
+    // Transient error banner, mirroring the macOS shell's flash().
+    let banner = gtk::Label::new(None);
+    banner.add_css_class("lantern-banner");
+    banner.set_wrap(true);
+    banner.set_visible(false);
+    right.append(&banner);
+
+    // Messages. A plain Box, not a ListBox — bubbles align themselves and
+    // rows are not selectable.
+    let msg_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    msg_box.set_margin_top(12);
+    msg_box.set_margin_bottom(12);
+    msg_box.set_margin_start(14);
+    msg_box.set_margin_end(14);
     let msg_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&msg_list)
+        .child(&msg_box)
         .vexpand(true)
         .build();
-    right.append(&msg_scroll);
+
+    // Placeholder shown until a peer is picked.
+    let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    placeholder.set_valign(gtk::Align::Center);
+    placeholder.set_halign(gtk::Align::Center);
+    let ph_icon = gtk::Image::from_icon_name("system-users-symbolic");
+    ph_icon.set_pixel_size(48);
+    ph_icon.add_css_class("dim-label");
+    let ph_title = gtk::Label::new(Some("Select someone to start"));
+    ph_title.add_css_class("title-3");
+    let ph_sub = gtk::Label::new(Some(
+        "Messages and files go straight to their machine.\nNo server, no cloud, nothing in between.",
+    ));
+    ph_sub.add_css_class("dim-label");
+    ph_sub.set_justify(gtk::Justification::Center);
+    placeholder.append(&ph_icon);
+    placeholder.append(&ph_title);
+    placeholder.append(&ph_sub);
+
+    let stack = gtk::Stack::new();
+    stack.add_named(&placeholder, Some("empty"));
+    stack.add_named(&msg_scroll, Some("messages"));
+    stack.set_visible_child_name("empty");
+    stack.set_vexpand(true);
+    right.append(&stack);
 
     let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     composer.set_margin_top(8);
@@ -273,6 +429,7 @@ fn build_ui(
         .build();
     let send_btn = gtk::Button::with_label("Send");
     send_btn.add_css_class("suggested-action");
+    send_btn.set_sensitive(false);
     composer.append(&attach_btn);
     composer.append(&entry);
     composer.append(&send_btn);
@@ -282,108 +439,256 @@ fn build_ui(
     window.set_child(Some(&paned));
 
     // ---- helpers --------------------------------------------------------
-    // `mid` is what makes a row deletable: given one, the row carries a ⋯
-    // menu that removes that message from this machine. Rows without one —
-    // transfers, trust warnings, Lantern's own notices — aren't in the
-    // message log, so offering to delete them would promise something the
-    // store can't do.
-    let append_row = {
-        let msg_list = msg_list.clone();
+
+    // Transient banner, auto-hiding. Failures used to be swallowed entirely.
+    let flash = {
+        let banner = banner.clone();
+        move |text: &str| {
+            banner.set_text(text);
+            banner.set_visible(true);
+            let banner = banner.clone();
+            glib::timeout_add_seconds_local_once(6, move || banner.set_visible(false));
+        }
+    };
+
+    // Auto-scroll.
+    //
+    // Appending a row does not move the adjustment until GTK has allocated
+    // the new widget, and allocation runs on the frame clock — after any idle
+    // callback we could schedule here. Scrolling from an idle therefore reads
+    // the previous upper bound and stops one message short, which is exactly
+    // the "it doesn't follow my own messages" symptom. The bottom is also
+    // `upper - page_size`, not `upper`.
+    //
+    // So let the adjustment announce when it has grown, and follow only when
+    // the view is already parked at the bottom: someone who scrolled up to
+    // read should not be yanked back down because a message arrived.
+    // Two things make this harder than it looks.
+    //
+    // A row's height is unknown until GTK allocates it, which happens on the
+    // frame clock — after any idle callback we could queue — and a wrapped
+    // label can take more than one layout pass to settle, each pass pushing
+    // the bottom further down. So pin across a few frames instead of trying
+    // to guess the one correct moment.
+    //
+    // And the bottom is `upper - page_size`; `upper` alone is the full
+    // content height, which just clamps and lands short.
+    let pin_to_bottom = {
         let msg_scroll = msg_scroll.clone();
-        let backend = Rc::clone(&backend);
-        move |title: &str, body: &gtk::Widget, mid: Option<Uuid>| {
-            let row_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            row_box.set_margin_top(6);
-            row_box.set_margin_bottom(6);
-            row_box.set_margin_start(12);
-            row_box.set_margin_end(12);
-
-            let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let head = gtk::Label::new(Some(title));
-            head.set_halign(gtk::Align::Start);
-            head.set_hexpand(true);
-            head.add_css_class("caption-heading");
-            head_row.append(&head);
-
-            if let Some(mid) = mid {
-                let more = gtk::MenuButton::new();
-                more.set_icon_name("view-more-symbolic");
-                more.add_css_class("flat");
-                more.set_valign(gtk::Align::Center);
-                more.set_tooltip_text(Some("More — delete this message"));
-                let pop = gtk::Popover::new();
-                let del = gtk::Button::with_label("Delete on this machine");
-                del.add_css_class("destructive-action");
-                del.set_margin_top(6);
-                del.set_margin_bottom(6);
-                del.set_margin_start(6);
-                del.set_margin_end(6);
-                del.set_tooltip_text(Some(
-                    "Deletes your copy only — the other machine keeps theirs",
-                ));
-                pop.set_child(Some(&del));
-                more.set_popover(Some(&pop));
-                head_row.append(&more);
-
-                let core = Arc::clone(&backend.core);
-                let msg_list = msg_list.clone();
-                let row_weak = row_box.downgrade();
-                let pop_close = pop.clone();
-                del.connect_clicked(move |_| {
-                    pop_close.popdown();
-                    core.delete_message(&mid);
-                    // ListBox wraps an appended widget in a row of its own,
-                    // so what has to go is the parent, not this box.
-                    if let Some(row) = row_weak.upgrade() {
-                        if let Some(parent) = row.parent() {
-                            msg_list.remove(&parent);
-                        }
-                    }
-                });
-            }
-
-            row_box.append(&head_row);
-            row_box.append(body);
-            msg_list.append(&row_box);
-            // Scroll to bottom after layout.
-            let adj = msg_scroll.vadjustment();
-            glib::idle_add_local_once(move || {
-                adj.set_value(adj.upper());
+        move || {
+            // A tick callback is `Fn`, so the frame counter needs a Cell.
+            let frames = std::cell::Cell::new(0u32);
+            msg_scroll.add_tick_callback(move |sw, _| {
+                let a = sw.vadjustment();
+                a.set_value(a.upper() - a.page_size());
+                frames.set(frames.get() + 1);
+                if frames.get() < 4 {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
             });
         }
     };
-    let append_text = {
-        let append_row = append_row.clone();
-        move |title: &str, text: &str, mid: Option<Uuid>| {
-            let lbl = gtk::Label::new(Some(text));
-            lbl.set_halign(gtk::Align::Start);
-            lbl.set_wrap(true);
-            lbl.set_selectable(true);
-            append_row(title, lbl.upcast_ref::<gtk::Widget>(), mid);
+
+    // One chat row: avatar and bubble, mirrored for our own messages.
+    let append_row = {
+        let msg_box = msg_box.clone();
+        let msg_scroll = msg_scroll.clone();
+        let pin_to_bottom = pin_to_bottom.clone();
+        move |outgoing: bool,
+              sender: &str,
+              key: &str,
+              ts: u64,
+              delivered: Option<bool>,
+              body: &gtk::Widget| {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_margin_top(4);
+            row.set_margin_bottom(4);
+
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 3);
+
+            // Meta line: who, when, and — for our own — whether it landed.
+            let meta = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            meta.add_css_class("lantern-meta");
+            let who = gtk::Label::new(Some(sender));
+            who.add_css_class("caption-heading");
+            let when = gtk::Label::new(Some(&fmt_time(ts)));
+            when.add_css_class("dim-label");
+            meta.append(&who);
+            meta.append(&when);
+            if let Some(delivered) = delivered {
+                let tick = gtk::Label::new(Some(if delivered { "✓✓" } else { "◷" }));
+                tick.add_css_class("dim-label");
+                tick.set_tooltip_text(Some(if delivered {
+                    "Delivered"
+                } else {
+                    "Sending…"
+                }));
+                meta.append(&tick);
+            }
+
+            body.add_css_class("lantern-bubble");
+            body.add_css_class(if outgoing {
+                "lantern-bubble-out"
+            } else {
+                "lantern-bubble-in"
+            });
+
+            if outgoing {
+                meta.set_halign(gtk::Align::End);
+                body.set_halign(gtk::Align::End);
+                column.set_halign(gtk::Align::End);
+                column.append(&meta);
+                column.append(body);
+                row.set_halign(gtk::Align::End);
+                row.append(&column);
+                row.append(&avatar(sender, key, 30));
+            } else {
+                meta.set_halign(gtk::Align::Start);
+                body.set_halign(gtk::Align::Start);
+                column.set_halign(gtk::Align::Start);
+                column.append(&meta);
+                column.append(body);
+                row.set_halign(gtk::Align::Start);
+                row.append(&avatar(sender, key, 30));
+                row.append(&column);
+            }
+
+            // Decide *before* appending. Afterwards the adjustment has
+            // already grown by a row, so the view always measures as "not at
+            // the bottom" and following would never happen — which is
+            // precisely how this broke before.
+            let adj = msg_scroll.vadjustment();
+            let was_at_bottom = adj.value() >= adj.upper() - adj.page_size() - 24.0;
+
+            msg_box.append(&row);
+
+            // Someone who scrolled up to read history stays where they are.
+            if was_at_bottom {
+                pin_to_bottom();
+            }
         }
     };
+
+    let append_text = {
+        let append_row = append_row.clone();
+        move |outgoing: bool, sender: &str, key: &str, ts: u64, delivered: Option<bool>, text: &str| {
+            let lbl = gtk::Label::new(Some(text));
+            lbl.set_wrap(true);
+            lbl.set_selectable(true);
+            lbl.set_xalign(0.0);
+            // Keep a long message from stretching edge to edge; a bubble that
+            // spans the whole window reads as a wall, not a message.
+            lbl.set_max_width_chars(46);
+            append_row(
+                outgoing,
+                sender,
+                key,
+                ts,
+                delivered,
+                lbl.upcast_ref::<gtk::Widget>(),
+            );
+        }
+    };
+
     let append_file = {
         let append_row = append_row.clone();
         let state = Rc::clone(&state);
-        move |title: &str, xid: &str, name: &str, status: &str| {
-            let boxx = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let icon = gtk::Image::from_icon_name("text-x-generic-symbolic");
+        move |outgoing: bool,
+              sender: &str,
+              key: &str,
+              ts: u64,
+              xid: &str,
+              name: &str,
+              size: u64,
+              status: &str| {
+            let card = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            card.add_css_class("lantern-filecard");
+            let icon = gtk::Image::from_icon_name("document-send-symbolic");
+            icon.set_pixel_size(28);
             let v = gtk::Box::new(gtk::Orientation::Vertical, 1);
             let n = gtk::Label::new(Some(name));
             n.set_halign(gtk::Align::Start);
-            let s = gtk::Label::new(Some(status));
+            n.set_wrap(true);
+            n.set_max_width_chars(32);
+            let s = gtk::Label::new(Some(&format!("{} · {status}", fmt_size(size))));
             s.set_halign(gtk::Align::Start);
             s.add_css_class("dim-label");
+            s.add_css_class("lantern-meta");
             v.append(&n);
             v.append(&s);
-            boxx.append(&icon);
-            boxx.append(&v);
-            state
-                .borrow_mut()
-                .file_rows
-                .insert(xid.to_string(), s.clone());
-            // A transfer is not a message in the log, so no delete menu.
-            append_row(title, boxx.upcast_ref::<gtk::Widget>(), None);
+            card.append(&icon);
+            card.append(&v);
+            state.borrow_mut().file_rows.insert(
+                xid.to_string(),
+                FileRow {
+                    status: s.clone(),
+                    icon: icon.clone(),
+                    size,
+                    last: None,
+                    rate: 0.0,
+                },
+            );
+            append_row(
+                outgoing,
+                sender,
+                key,
+                ts,
+                None,
+                card.upcast_ref::<gtk::Widget>(),
+            );
+        }
+    };
+
+    // Update a file card in place. The size comes from the row rather than
+    // being re-parsed out of the label, which the live rate keeps rewriting.
+    let set_file_state = {
+        let state = Rc::clone(&state);
+        move |xid: &str, status: &str, icon_name: &str| {
+            if let Some(row) = state.borrow().file_rows.get(xid) {
+                row.status
+                    .set_text(&format!("{} · {status}", fmt_size(row.size)));
+                row.icon.set_icon_name(Some(icon_name));
+            }
+        }
+    };
+
+    // Live progress → "12.3 MB of 50.0 MB · 8.4 MB/s".
+    //
+    // Repaints are throttled: chunks land far faster than anyone can read,
+    // and a number that changes every few milliseconds is unreadable anyway.
+    // The gap between repaints doubles as the interval the rate is measured
+    // over, which is why it is not simply "one chunk / one event".
+    let set_file_progress = {
+        let state = Rc::clone(&state);
+        move |xid: &str, bytes: u64, total: u64| {
+            let mut st = state.borrow_mut();
+            let Some(row) = st.file_rows.get_mut(xid) else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            let Some((prev_bytes, prev_at)) = row.last else {
+                row.last = Some((bytes, now));
+                return;
+            };
+            let dt = now.duration_since(prev_at).as_secs_f64();
+            if dt < 0.25 {
+                return;
+            }
+            let instant = bytes.saturating_sub(prev_bytes) as f64 / dt;
+            row.rate = if row.rate == 0.0 {
+                instant
+            } else {
+                row.rate * 0.7 + instant * 0.3
+            };
+            row.last = Some((bytes, now));
+            row.status.set_text(&format!(
+                "{} of {} · {}/s",
+                fmt_size(bytes),
+                fmt_size(total),
+                fmt_size(row.rate as u64)
+            ));
         }
     };
 
@@ -402,44 +707,45 @@ fn build_ui(
             // lands and restore it below — otherwise every beacon that
             // refreshes the roster would drop the open conversation.
             let mut selected_at = None;
-            for (i, (id, name, host)) in st.peers.iter().enumerate() {
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            for (i, p) in st.peers.iter().enumerate() {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
                 row.set_margin_top(6);
                 row.set_margin_bottom(6);
                 row.set_margin_start(10);
                 row.set_margin_end(8);
+                row.append(&avatar(&p.name, &hex::encode(p.id), 34));
 
                 let text_col = gtk::Box::new(gtk::Orientation::Vertical, 1);
                 text_col.set_hexpand(true);
+                text_col.set_valign(gtk::Align::Center);
                 let n = gtk::Label::new(None);
                 n.set_halign(gtk::Align::Start);
                 // The tick means an out-of-band safety-word comparison
                 // happened — never that the transport is merely encrypted.
-                if backend.core.is_verified(id) {
-                    n.set_text(&format!("{name} ✓"));
+                if backend.core.is_verified(&p.id) {
+                    n.set_text(&format!("{} ✓", p.name));
                     n.set_tooltip_text(Some("Verified — safety words matched"));
                 } else {
-                    n.set_text(name);
+                    n.set_text(&p.name);
                 }
-                let h = gtk::Label::new(Some(host));
+                let h = gtk::Label::new(Some(&p.host));
                 h.set_halign(gtk::Align::Start);
                 h.add_css_class("dim-label");
+                h.add_css_class("lantern-meta");
                 text_col.append(&n);
                 text_col.append(&h);
                 row.append(&text_col);
 
-                if let Some(count) = st.unread.get(id).copied().filter(|c| *c > 0) {
+                if let Some(count) = st.unread.get(&p.id).copied().filter(|c| *c > 0) {
                     let badge = gtk::Label::new(Some(&count.to_string()));
                     badge.add_css_class("lantern-unread");
                     badge.set_valign(gtk::Align::Center);
-                    badge.set_tooltip_text(Some(&format!(
-                        "{count} unread from {name}"
-                    )));
+                    badge.set_tooltip_text(Some(&format!("{count} unread from {}", p.name)));
                     row.append(&badge);
                 }
 
                 peer_list.append(&row);
-                if st.selected == Some(*id) {
+                if st.selected == Some(p.id) {
                     selected_at = Some(i as i32);
                 }
             }
@@ -457,11 +763,16 @@ fn build_ui(
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
         let conv_title = conv_title.clone();
+        let conv_sub = conv_sub.clone();
+        let head_avatar = head_avatar.clone();
         let verify_btn = verify_btn.clone();
+        let msg_box = msg_box.clone();
+        let stack = stack.clone();
+        let entry = entry.clone();
         let clear_btn = clear_btn.clone();
-        let msg_list = msg_list.clone();
         let append_text = append_text.clone();
         let refresh_peers = refresh_peers.clone();
+        let pin_to_bottom = pin_to_bottom.clone();
         peer_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             let idx = row.index();
@@ -469,48 +780,85 @@ fn build_ui(
                 let st = state.borrow();
                 st.peers.get(idx as usize).cloned()
             };
-            let Some((id, name, _host)) = peer else { return };
+            let Some(peer) = peer else { return };
             // refresh_peers() restores this selection after every rebuild.
             // Without this guard each beacon would reload the same history,
             // flickering the conversation and resetting the scroll.
-            let already_open = state.borrow().selected == Some(id);
+            let already_open = state.borrow().selected == Some(peer.id);
             if already_open {
                 return;
             }
             {
                 let mut st = state.borrow_mut();
-                st.selected = Some(id);
-                st.unread.remove(&id);
+                st.selected = Some(peer.id);
+                st.unread.remove(&peer.id);
+                st.file_rows.clear();
             }
             // Clear the badge on the next loop turn — refresh_peers() rebuilds
             // the very ListBox currently emitting this signal.
-            {
-                glib::idle_add_local_once(refresh_peers.clone());
+            glib::idle_add_local_once(refresh_peers.clone());
+
+            conv_title.set_text(&peer.name);
+            conv_sub.set_text(&format!("{} · {}", peer.host, peer.addr));
+            while let Some(c) = head_avatar.first_child() {
+                head_avatar.remove(&c);
             }
-            conv_title.set_text(&name);
+            head_avatar.append(&avatar(&peer.name, &hex::encode(peer.id), 32));
+
+            let verified = backend.core.is_verified(&peer.id);
+            verify_btn.set_label(if verified { "Verified ✓" } else { "Verify identity" });
             verify_btn.set_sensitive(true);
             clear_btn.set_sensitive(true);
-            while let Some(child) = msg_list.first_child() {
-                msg_list.remove(&child);
+            entry.set_placeholder_text(Some(&format!(
+                "Message {}…  (or drop files here)",
+                peer.name
+            )));
+
+            while let Some(child) = msg_box.first_child() {
+                msg_box.remove(&child);
             }
-            let my_name = "You";
-            for m in backend.core.history(&id, 200) {
-                let title = if m.outgoing {
-                    format!("{my_name} · {}", if m.state >= 1 { "✓✓" } else { "◷" })
+            stack.set_visible_child_name("messages");
+            for m in backend.core.history(&peer.id, 200) {
+                if m.outgoing {
+                    append_text(
+                        true,
+                        &backend.my_name,
+                        "me-self",
+                        m.ts,
+                        Some(m.state >= 1),
+                        &m.text,
+                    );
                 } else {
-                    name.clone()
-                };
-                append_text(&title, &m.text, Some(m.mid));
+                    append_text(
+                        false,
+                        &peer.name,
+                        &hex::encode(peer.id),
+                        m.ts,
+                        None,
+                        &m.text,
+                    );
+                }
             }
+            // Open a conversation at its newest message, not its oldest.
+            pin_to_bottom();
         });
     }
 
     // ---- send message ---------------------------------------------------
+    {
+        let entry = entry.clone();
+        let send_btn = send_btn.clone();
+        entry.connect_changed(move |e| {
+            send_btn.set_sensitive(!e.text().trim().is_empty());
+        });
+    }
     let do_send = {
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
         let entry = entry.clone();
         let append_text = append_text.clone();
+        let flash = flash.clone();
+        let pin_to_bottom = pin_to_bottom.clone();
         move || {
             let text = entry.text().to_string();
             let text = text.trim().to_string();
@@ -521,14 +869,21 @@ fn build_ui(
                 return;
             };
             entry.set_text("");
-// The mid only exists once the core has accepted the message, and
-            // this row goes up before that so typing feels instant — so a
-            // just-sent line gets its delete menu when the conversation is
-            // next opened, from history.
-            append_text("You · ◷", &text, None);
+            let now = glib::real_time() as u64 / 1000;
+            append_text(true, &backend.my_name, "me-self", now, Some(false), &text);
+            // Sending always follows, even if we were reading history.
+            pin_to_bottom();
             let core = Arc::clone(&backend.core);
+            let (tx, rx) = async_channel::bounded::<Option<String>>(1);
             backend.rt.spawn(async move {
-                let _ = core.send_message(peer, &text).await;
+                let err = core.send_message(peer, &text).await.err().map(|e| e.to_string());
+                let _ = tx.send(err).await;
+            });
+            let flash = flash.clone();
+            glib::MainContext::default().spawn_local(async move {
+                if let Ok(Some(err)) = rx.recv().await {
+                    flash(&format!("Message didn't send — {err}"));
+                }
             });
         }
     };
@@ -536,7 +891,10 @@ fn build_ui(
         let do_send = do_send.clone();
         entry.connect_activate(move |_| do_send());
     }
-    send_btn.connect_clicked(move |_| do_send());
+    {
+        let do_send = do_send.clone();
+        send_btn.connect_clicked(move |_| do_send());
+    }
 
     // ---- send file ------------------------------------------------------
     // One path in, one transfer out. The paperclip and the drop target both
@@ -545,6 +903,7 @@ fn build_ui(
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
         let append_file = append_file.clone();
+        let flash = flash.clone();
         move |path: std::path::PathBuf| {
             let Some(peer) = state.borrow().selected else {
                 return;
@@ -553,20 +912,35 @@ fn build_ui(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // Fire and let events update the row (keyed by xid); we don't
-            // know the xid until send_file returns, so the row is appended
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            // Fire and let events update the card (keyed by xid); we don't
+            // know the xid until send_file returns, so the card is appended
             // once a oneshot hands it back.
             let core = Arc::clone(&backend.core);
-            let (tx, rx) = async_channel::bounded::<String>(1);
+            let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
             backend.rt.spawn(async move {
-                if let Ok(xid) = core.send_file(peer, &path).await {
-                    let _ = tx.send(xid.to_string()).await;
-                }
+                let r = core
+                    .send_file(peer, &path)
+                    .await
+                    .map(|x| x.to_string())
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(r).await;
             });
             let append_file = append_file.clone();
+            let flash = flash.clone();
+            let pin_to_bottom = pin_to_bottom.clone();
+            let my_name = backend.my_name.clone();
             glib::MainContext::default().spawn_local(async move {
-                if let Ok(xid) = rx.recv().await {
-                    append_file("You", &xid, &name, "sending…");
+                match rx.recv().await {
+                    Ok(Ok(xid)) => {
+                        let now = glib::real_time() as u64 / 1000;
+                        append_file(
+                            true, &my_name, "me-self", now, &xid, &name, size, "sending…",
+                        );
+                        pin_to_bottom();
+                    }
+                    Ok(Err(e)) => flash(&format!("Couldn't send {name} — {e}")),
+                    Err(_) => {}
                 }
             });
         }
@@ -599,6 +973,7 @@ fn build_ui(
     {
         let state = Rc::clone(&state);
         let send_path = send_path.clone();
+        let flash = flash.clone();
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         drop.set_types(&[gdk::FileList::static_type(), gio::File::static_type()]);
 
@@ -616,6 +991,7 @@ fn build_ui(
         drop.connect_drop(move |_, value, _, _| {
             scroll_drop.remove_css_class("lantern-drop-active");
             if state.borrow().selected.is_none() {
+                flash("Pick a person first, then drop the file.");
                 return false;
             }
             // A multi-file drag arrives as one FileList, a single file as
@@ -641,12 +1017,90 @@ fn build_ui(
         msg_scroll.add_controller(drop);
     }
 
+    // ---- refresh --------------------------------------------------------
+    {
+        let backend = Rc::clone(&backend);
+        let flash = flash.clone();
+        refresh_btn.connect_clicked(move |btn| {
+            let core = Arc::clone(&backend.core);
+            backend.rt.spawn(async move {
+                core.refresh().await;
+            });
+            flash("Asked everyone on this network to check in…");
+            // Replies arrive over the network, not on a schedule we control,
+            // so the button goes quiet briefly rather than pretending to know
+            // when the answers are all in.
+            btn.set_sensitive(false);
+            let btn = btn.clone();
+            glib::timeout_add_seconds_local_once(2, move || btn.set_sensitive(true));
+        });
+    }
+
+    // ---- clear conversation ---------------------------------------------
+    // Local only. The wording says so plainly: a "clear" that quietly leaves
+    // the other side's copy intact, while looking like a recall, is the kind
+    // of thing someone makes a real decision on.
+    {
+        let state = Rc::clone(&state);
+        let backend = Rc::clone(&backend);
+        let window_weak = window.downgrade();
+        let msg_box = msg_box.clone();
+        let flash = flash.clone();
+        clear_btn.connect_clicked(move |_| {
+            let Some(peer) = state.borrow().selected else {
+                return;
+            };
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
+            let peer_name = {
+                let st = state.borrow();
+                st.peers
+                    .iter()
+                    .find(|p| p.id == peer)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "this peer".into())
+            };
+            let dialog = gtk::AlertDialog::builder()
+                .modal(true)
+                .message(format!("Clear your conversation with {peer_name}?"))
+                .detail(
+                    "This deletes your copy of these messages and cannot be \
+                     undone.\n\nIt does not remove anything from their \
+                     machine — they keep their copy, and they are not told.",
+                )
+                .buttons(["Cancel", "Clear"])
+                .cancel_button(0)
+                .default_button(0)
+                .build();
+
+            let backend = Rc::clone(&backend);
+            let msg_box = msg_box.clone();
+            let flash = flash.clone();
+            dialog.choose(Some(&window), None::<&gio::Cancellable>, move |answer| {
+                if answer != Ok(1) {
+                    return;
+                }
+                let n = backend.core.clear_history(&peer);
+                while let Some(child) = msg_box.first_child() {
+                    msg_box.remove(&child);
+                }
+                flash(&match n {
+                    0 => "Nothing to clear.".to_string(),
+                    1 => "Cleared 1 message from this machine.".to_string(),
+                    n => format!("Cleared {n} messages from this machine."),
+                });
+            });
+        });
+    }
+
     // ---- verify dialog --------------------------------------------------
     {
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
         let window_weak = window.downgrade();
         let refresh_peers = refresh_peers.clone();
+        let verify_btn2 = verify_btn.clone();
         verify_btn.connect_clicked(move |_| {
             let Some(peer) = state.borrow().selected else {
                 return;
@@ -654,38 +1108,79 @@ fn build_ui(
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
-            let words = Core::words_for(&peer).join("  ·  ");
+            let peer_name = {
+                let st = state.borrow();
+                st.peers
+                    .iter()
+                    .find(|p| p.id == peer)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "identity".into())
+            };
             let dlg = gtk::Window::builder()
                 .transient_for(&window)
                 .modal(true)
                 .title("Verify identity")
-                .default_width(420)
+                .default_width(430)
                 .build();
             let v = gtk::Box::new(gtk::Orientation::Vertical, 12);
             v.set_margin_top(18);
             v.set_margin_bottom(18);
             v.set_margin_start(18);
             v.set_margin_end(18);
-            let info = gtk::Label::new(Some(
+            let heading = gtk::Label::new(Some(&format!("Verify {peer_name}")));
+            heading.add_css_class("title-3");
+            heading.set_halign(gtk::Align::Start);
+            let info = gtk::Label::new(Some(&format!(
                 "Read these words aloud to each other. If they match what \
-                 the other person sees for themselves, this connection \
-                 cannot be an impostor's.",
-            ));
+                 {peer_name} sees for themselves, this connection cannot be \
+                 an impostor's."
+            )));
             info.set_wrap(true);
-            let wl = gtk::Label::new(Some(&words));
-            wl.set_wrap(true);
-            wl.add_css_class("title-4");
+            info.set_xalign(0.0);
+            info.add_css_class("dim-label");
+
+            // Numbered, two columns, monospaced — same shape as the macOS
+            // sheet, so two people reading to each other stay in step.
+            let grid = gtk::Grid::new();
+            grid.set_row_spacing(6);
+            grid.set_column_spacing(18);
+            grid.add_css_class("lantern-filecard");
+            let words = Core::words_for(&peer);
+            for (i, w) in words.iter().enumerate() {
+                let lbl = gtk::Label::new(Some(&format!("{}  {w}", i + 1)));
+                lbl.set_halign(gtk::Align::Start);
+                lbl.add_css_class("monospace");
+                grid.attach(&lbl, (i % 2) as i32, (i / 2) as i32, 1, 1);
+            }
+
             let trust = gtk::Button::with_label("They match — mark verified");
             trust.add_css_class("suggested-action");
+            let close = gtk::Button::with_label("Close");
+            let btns = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            btns.set_halign(gtk::Align::End);
+            btns.append(&close);
+            btns.append(&trust);
+
+            v.append(&heading);
             v.append(&info);
-            v.append(&wl);
-            v.append(&trust);
+            v.append(&grid);
+            v.append(&btns);
             dlg.set_child(Some(&v));
+
+            let dlg_close = dlg.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(d) = dlg_close.upgrade() {
+                    d.close();
+                }
+            });
+
             let backend2 = Rc::clone(&backend);
             let dlg_weak = dlg.downgrade();
             let refresh_peers = refresh_peers.clone();
+            let verify_btn2 = verify_btn2.clone();
             trust.connect_clicked(move |_| {
                 backend2.core.set_verified(&peer, true);
+                verify_btn2.set_label("Verified ✓");
                 refresh_peers();
                 if let Some(d) = dlg_weak.upgrade() {
                     d.close();
@@ -695,353 +1190,118 @@ fn build_ui(
         });
     }
 
-    // ---- look again now --------------------------------------------------
-    // A HELLO beacon; peers answer with their own, which arrive as PeerSeen
-    // and rebuild the roster through the usual path. Nothing to poll here.
-    {
-        let backend = Rc::clone(&backend);
-        refresh_btn.connect_clicked(move |_| {
-            let core = Arc::clone(&backend.core);
-            backend.rt.spawn(async move {
-                core.announce().await;
-            });
-        });
-    }
-
-    // ---- clear conversation ---------------------------------------------
-    // Asks first, because there is no undo: the engine zeroes the pages it
-    // frees and checkpoints the log. Every word here is careful to promise
-    // only what happens — this machine's copy, nobody else's.
-    {
-        let state = Rc::clone(&state);
-        let backend = Rc::clone(&backend);
-        let window_weak = window.downgrade();
-        let msg_list = msg_list.clone();
-        let append_text = append_text.clone();
-        clear_btn.connect_clicked(move |_| {
-            let Some(peer) = state.borrow().selected else {
-                return;
-            };
-            let name = state
-                .borrow()
-                .peers
-                .iter()
-                .find(|(id, ..)| *id == peer)
-                .map(|(_, n, _)| n.clone())
-                .unwrap_or_else(|| "them".into());
-            let Some(window) = window_weak.upgrade() else {
-                return;
-            };
-            let dlg = gtk::Window::builder()
-                .transient_for(&window)
-                .modal(true)
-                .title("Clear chat")
-                .default_width(420)
-                .build();
-            let v = gtk::Box::new(gtk::Orientation::Vertical, 12);
-            v.set_margin_top(18);
-            v.set_margin_bottom(18);
-            v.set_margin_start(18);
-            v.set_margin_end(18);
-            let info = gtk::Label::new(Some(&format!(
-                "Delete every message with {name} from this machine?\n\n\
-                 This can't be undone. {name} keeps their own copy — Lantern \
-                 can only delete what's stored here. Files you've already \
-                 sent or received stay on disk."
-            )));
-            info.set_wrap(true);
-            info.set_xalign(0.0);
-            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            buttons.set_halign(gtk::Align::End);
-            let cancel = gtk::Button::with_label("Cancel");
-            let delete = gtk::Button::with_label("Delete on this machine");
-            delete.add_css_class("destructive-action");
-            buttons.append(&cancel);
-            buttons.append(&delete);
-            v.append(&info);
-            v.append(&buttons);
-            dlg.set_child(Some(&v));
-
-            {
-                let dlg_weak = dlg.downgrade();
-                cancel.connect_clicked(move |_| {
-                    if let Some(d) = dlg_weak.upgrade() {
-                        d.close();
-                    }
-                });
-            }
-            let backend = Rc::clone(&backend);
-            let msg_list = msg_list.clone();
-            let append_text = append_text.clone();
-            let dlg_weak = dlg.downgrade();
-            delete.connect_clicked(move |_| {
-                let n = backend.core.clear_history(&peer);
-                while let Some(child) = msg_list.first_child() {
-                    msg_list.remove(&child);
-                }
-                // Say what happened where the conversation used to be —
-                // an empty pane alone doesn't tell you it worked.
-                append_text(
-                    "Lantern",
-                    &if n == 0 {
-                        format!("Nothing was stored for {name} — already empty here.")
-                    } else {
-                        format!(
-                            "Deleted {n} message{} from this machine. \
-                             {name} still has their copy.",
-                            if n == 1 { "" } else { "s" }
-                        )
-                    },
-                    None,
-                );
-                if let Some(d) = dlg_weak.upgrade() {
-                    d.close();
-                }
-            });
-            dlg.present();
-        });
-    }
-
-    // ---- updates ---------------------------------------------------------
-    // Same mechanism as the macOS shell, because it's the same core: fetch,
-    // fast-forward, install.sh, reopen — refused outright if the checkout has
-    // uncommitted work in it. The app has to quit for the install to replace
-    // the binary it's running from, so this hands off and closes.
-    {
-        let backend = Rc::clone(&backend);
-        let window_weak = window.downgrade();
-        let app = app.clone();
-        update_btn.connect_clicked(move |_| {
-            let Some(window) = window_weak.upgrade() else {
-                return;
-            };
-            let build = lantern_core::update::BuildInfo::current();
-            let dlg = gtk::Window::builder()
-                .transient_for(&window)
-                .modal(true)
-                .title("Lantern updates")
-                .default_width(460)
-                .build();
-            let v = gtk::Box::new(gtk::Orientation::Vertical, 12);
-            v.set_margin_top(18);
-            v.set_margin_bottom(18);
-            v.set_margin_start(18);
-            v.set_margin_end(18);
-            let build_lbl = gtk::Label::new(Some(&format!(
-                "Build {} · {}{}",
-                build.commit,
-                build.date,
-                match &build.repo {
-                    Some(p) => format!(" · built from {}", p.display()),
-                    None => String::new(),
-                }
-            )));
-            build_lbl.set_wrap(true);
-            build_lbl.set_xalign(0.0);
-            build_lbl.add_css_class("dim-label");
-            let status = gtk::Label::new(Some("Asking GitHub…"));
-            status.set_wrap(true);
-            status.set_xalign(0.0);
-            let commits = gtk::Label::new(None);
-            commits.set_wrap(true);
-            commits.set_xalign(0.0);
-            commits.add_css_class("dim-label");
-            commits.set_visible(false);
-            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            buttons.set_halign(gtk::Align::End);
-            let close = gtk::Button::with_label("Close");
-            let apply = gtk::Button::with_label("Update and reopen");
-            apply.add_css_class("suggested-action");
-            apply.set_visible(false);
-            buttons.append(&close);
-            buttons.append(&apply);
-            v.append(&build_lbl);
-            v.append(&status);
-            v.append(&commits);
-            v.append(&buttons);
-            dlg.set_child(Some(&v));
-
-            {
-                let dlg_weak = dlg.downgrade();
-                close.connect_clicked(move |_| {
-                    if let Some(d) = dlg_weak.upgrade() {
-                        d.close();
-                    }
-                });
-            }
-
-            // The check does network I/O; run it on the runtime and bring the
-            // answer back to the main context.
-            let core = Arc::clone(&backend.core);
-            let (tx, rx) = async_channel::bounded::<(String, bool, Vec<String>)>(1);
-            backend.rt.spawn(async move {
-                let c = core.check_update().await;
-                let _ = tx.send((c.summary(), c.can_update(), c.commits)).await;
-            });
-            {
-                let status = status.clone();
-                let commits_lbl = commits.clone();
-                let apply = apply.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok((summary, can_update, lines)) = rx.recv().await {
-                        status.set_text(&summary);
-                        if !lines.is_empty() {
-                            commits_lbl.set_text(&lines.join("\n"));
-                            commits_lbl.set_visible(true);
-                        }
-                        apply.set_visible(can_update);
-                    }
-                });
-            }
-
-            let backend = Rc::clone(&backend);
-            let app = app.clone();
-            let status_for_apply = status.clone();
-            let commits_for_apply = commits.clone();
-            apply.connect_clicked(move |apply| {
-                match backend.core.start_update() {
-                    Ok(()) => {
-                        apply.set_visible(false);
-                        commits_for_apply.set_visible(false);
-                        status_for_apply.set_text(
-                            "Updating. Lantern will close, rebuild itself from \
-                             GitHub, and reopen — a few minutes. Progress is in \
-                             ~/.lantern/update.log.",
-                        );
-                        // Out of the updater's way: it can't replace a running
-                        // binary, and on Linux the OS refuses outright.
-                        let app = app.clone();
-                        glib::timeout_add_seconds_local_once(3, move || app.quit());
-                    }
-                    Err(reason) => status_for_apply.set_text(&reason),
-                }
-            });
-            dlg.present();
-        });
-    }
-
-    // ---- how the last update went ---------------------------------------
-    // The app that asked for an update is never the app that sees it finish,
-    // so this run reports it — once.
-    if let Some(last) = lantern_core::update::take_unseen_result(backend.core.data_dir()) {
-        let banner = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        banner.set_margin_top(8);
-        banner.set_margin_bottom(8);
-        banner.set_margin_start(12);
-        banner.set_margin_end(12);
-        let text = if last.succeeded() {
-            format!("✓ {}", last.message)
-        } else {
-            format!(
-                "⚠ The last update didn't finish: {} Your previous Lantern is \
-                 what's running. Details in ~/.lantern/update.log.",
-                last.message
-            )
-        };
-        let lbl = gtk::Label::new(Some(&text));
-        lbl.set_wrap(true);
-        lbl.set_xalign(0.0);
-        lbl.set_hexpand(true);
-        let dismiss = gtk::Button::from_icon_name("window-close-symbolic");
-        dismiss.add_css_class("flat");
-        dismiss.set_tooltip_text(Some("Dismiss"));
-        banner.append(&lbl);
-        banner.append(&dismiss);
-        let banner_weak = banner.downgrade();
-        let right_weak = right.downgrade();
-        dismiss.connect_clicked(move |_| {
-            if let (Some(b), Some(r)) = (banner_weak.upgrade(), right_weak.upgrade()) {
-                r.remove(&b);
-            }
-        });
-        right.prepend(&banner);
-    }
-
     // ---- core events → UI ----------------------------------------------
     if let Some(rx) = event_rx {
         let state = Rc::clone(&state);
         let refresh_peers = refresh_peers.clone();
         let append_text = append_text.clone();
         let append_file = append_file.clone();
+        let set_file_state = set_file_state.clone();
+        let set_file_progress = set_file_progress.clone();
+        let app = app.clone();
+        let window = window.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(ev) = rx.recv().await {
                 match ev {
-                    CoreEvent::PeerSeen { id, name, host, .. } => {
+                    CoreEvent::PeerSeen { id, name, host, addr, .. } => {
                         let mut st = state.borrow_mut();
-                        if let Some(p) = st.peers.iter_mut().find(|(pid, ..)| *pid == id) {
-                            p.1 = name;
-                            p.2 = host;
+                        if let Some(p) = st.peers.iter_mut().find(|p| p.id == id) {
+                            p.name = name;
+                            p.host = host;
+                            p.addr = addr.to_string();
                         } else {
-                            st.peers.push((id, name, host));
-                            st.peers.sort_by(|a, b| a.1.cmp(&b.1));
+                            st.peers.push(PeerRow {
+                                id,
+                                name,
+                                host,
+                                addr: addr.to_string(),
+                            });
+                            st.peers.sort_by(|a, b| a.name.cmp(&b.name));
                         }
                         drop(st);
                         refresh_peers();
                     }
-                    CoreEvent::MessageReceived { peer, peer_name, text, mid, .. } => {
+                    CoreEvent::MessageReceived { peer, peer_name, text, ts, .. } => {
                         let open = state.borrow().selected == Some(peer);
                         if open {
-                            append_text(&peer_name, &text, Some(mid));
+                            append_text(false, &peer_name, &hex::encode(peer), ts, None, &text);
                         } else {
                             *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
                             refresh_peers();
+                            // The macOS shell badges the dock; the desktop
+                            // equivalent is a notification, and only when the
+                            // window is not already in front of the user.
+                            if !window.is_active() {
+                                let n = gio::Notification::new(&peer_name);
+                                n.set_body(Some(&text));
+                                app.send_notification(Some("lantern-message"), &n);
+                            }
                         }
                     }
-                    CoreEvent::FileOffered { peer, peer_name, xid, name, .. } => {
+                    CoreEvent::MessageDelivered { .. } => {}
+                    CoreEvent::FileOffered { peer, peer_name, xid, name, size } => {
                         let open = state.borrow().selected == Some(peer);
                         if open {
-                            append_file(&peer_name, &xid.to_string(), &name, "receiving…");
+                            let now = glib::real_time() as u64 / 1000;
+                            append_file(
+                                false,
+                                &peer_name,
+                                &hex::encode(peer),
+                                now,
+                                &xid.to_string(),
+                                &name,
+                                size,
+                                "receiving…",
+                            );
                         } else {
                             *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
                             refresh_peers();
                         }
                     }
                     CoreEvent::FileReceived { xid, path, .. } => {
-                        if let Some(lbl) =
-                            state.borrow().file_rows.get(&xid.to_string())
-                        {
-                            // Report where it actually went, rather than a
-                            // literal that goes stale the moment the
-                            // download directory is configurable.
-                            let dir = path
-                                .parent()
-                                .map(abbreviate_home)
-                                .unwrap_or_else(|| "the download folder".into());
-                            lbl.set_text(&format!("✓ saved to {dir}"));
-                        }
+                        // Report where it actually went, rather than a
+                        // literal that goes stale the moment the download
+                        // directory is configurable.
+                        let dir = path
+                            .parent()
+                            .map(abbreviate_home)
+                            .unwrap_or_else(|| "the download folder".into());
+                        set_file_state(
+                            &xid.to_string(),
+                            &format!("saved to {dir}"),
+                            "document-save-symbolic",
+                        );
                     }
-                    CoreEvent::TransferProgress {
-                        xid, done, total, bps, eta_s, ..
-                    } => {
-                        if let Some(lbl) = state.borrow().file_rows.get(&xid.to_string()) {
-                            lbl.set_text(&progress_line(done, total, bps, eta_s));
-                        }
+                    CoreEvent::TransferProgress { xid, bytes, total, .. } => {
+                        set_file_progress(&xid.to_string(), bytes, total);
                     }
                     CoreEvent::ChunksSent { xid, sent, total } => {
-                        if let Some(lbl) =
-                            state.borrow().file_rows.get(&xid.to_string())
-                        {
-                            if sent < total {
-                                lbl.set_text(&format!(
-                                    "resume — only {sent} of {total} chunks needed"
-                                ));
-                            }
+                        if sent < total {
+                            set_file_state(
+                                &xid.to_string(),
+                                &format!("resume — only {sent} of {total} chunks needed"),
+                                "document-send-symbolic",
+                            );
                         }
                     }
                     CoreEvent::FileSent { xid, ok, err } => {
-                        if let Some(lbl) =
-                            state.borrow().file_rows.get(&xid.to_string())
-                        {
-                            let text = if ok {
-                                "✓ delivered & verified".to_string()
-                            } else {
-                                format!("✗ {}", err.unwrap_or_default())
-                            };
-                            lbl.set_text(&text);
+                        if ok {
+                            set_file_state(
+                                &xid.to_string(),
+                                "delivered & verified",
+                                "emblem-ok-symbolic",
+                            );
+                        } else {
+                            set_file_state(
+                                &xid.to_string(),
+                                &err.unwrap_or_else(|| "failed".into()),
+                                "dialog-error-symbolic",
+                            );
                         }
                     }
                     CoreEvent::TrustWarning { detail, .. } => {
-                        append_text("⚠ Trust warning", &detail, None);
+                        let now = glib::real_time() as u64 / 1000;
+                        append_text(false, "⚠ Trust warning", "warn", now, None, &detail);
                     }
                     _ => {}
                 }
@@ -1051,49 +1311,6 @@ fn build_ui(
 
     window.set_icon_name(Some("lantern"));
     window.present();
-}
-
-/// "12.0 MB of 40.0 MB · 8.4 MB/s · 3 s left" — speed and time left are
-/// dropped rather than guessed when the engine hasn't measured them yet.
-fn progress_line(done: u64, total: u64, bps: Option<u64>, eta_s: Option<u64>) -> String {
-    let mut line = format!("{} of {}", human_size(done), human_size(total));
-    if let Some(b) = bps.filter(|b| *b > 0) {
-        line.push_str(&format!(" · {}/s", human_size(b)));
-    }
-    if let Some(s) = eta_s.filter(|s| *s > 0) {
-        line.push_str(&if s < 60 {
-            format!(" · {s} s left")
-        } else {
-            format!(" · {} min left", s / 60)
-        });
-    }
-    line
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
-
-/// `/home/u/Downloads` → `~/Downloads`, so a status line stays readable.
-fn abbreviate_home(path: &std::path::Path) -> String {
-    let Some(home) = std::env::var_os("HOME") else {
-        return path.display().to_string();
-    };
-    match path.strip_prefix(std::path::PathBuf::from(home)) {
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
-    }
 }
 
 /// The core's identity fingerprint (helper — core exposes id bytes).

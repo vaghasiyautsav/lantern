@@ -31,6 +31,38 @@ private, change it in the repo settings and correct this paragraph.
 - Claude project docs (cloud sessions): `claude/lantern-design.md`,
   `claude/lantern-build-status.md`.
 
+## Two machines, one repo — read before you touch anything
+
+Lantern is built from **both** working copies: this Mac and the Ubuntu box.
+Another agent may be editing the same files right now. On 18 Aug 2026 two
+sessions independently built a refresh button, a clear-conversation flow, a
+transfer-rate readout and an updater the same afternoon; reconciling that
+cost more than the features did. So:
+
+1. **Fetch before you write, not just before you push.**
+   `git fetch origin && git status -sb`. If you are behind, fast-forward
+   first (`git merge --ff-only origin/main`) so you are writing against
+   what's real. Read `git log --oneline HEAD..origin/main` — that list is the
+   other machine telling you what it just did.
+2. **Fetch again immediately before pushing.** If origin moved while you
+   worked, merge it, re-run the gate (`cargo test --workspace --exclude
+   lantern-gtk`, `cargo clippy`, plus the shell you touched), and only then
+   push. A rejected push means somebody else's work is sitting there — never
+   `--force`.
+3. **Prefer your own platform's shell.** A Mac session owns
+   `apps/macos-native`; a Linux session owns `apps/linux-native`. Neither can
+   compile the other's (no GTK4 on macOS, no swiftc on Linux), so a shell
+   edited blind is a guess. If both sides did edit one, **the version that
+   was actually built and run on that platform wins** — that is how the
+   18 Aug collision was settled.
+4. **Put shared behaviour in `lantern-core`, once.** Two shells solving the
+   same problem separately is the collision above in miniature. Core is also
+   the only place both machines can test.
+5. **Commit and push in small pieces.** Every hour of unpushed work raises
+   the odds of a conflict in exactly the file the other agent is in.
+6. **Say what you are mid-way through** in the Status section below before
+   you stop. That is the only channel between the two machines.
+
 ## Status (last update: 18 Aug 2026)
 
 **Working, tested:** engine — signed-beacon discovery (see the 17 Aug fix
@@ -41,8 +73,9 @@ kill -9), TOFU trust with safety words, SQLite history, **presence**
 **history deletion** (per message or whole conversation, local only, WAL
 checkpointed), **live transfer speed + ETA** (`CoreEvent::TransferProgress`,
 `core::rate`), **update from GitHub** (`core::update` +
-`packaging/update.sh`), **look-again** (`POST /api/announce` /
-`core.announce()` behind a refresh button). 39 tests workspace-wide, clippy
+`packaging/update.sh`, also the standalone `lantern-update`), **look-again**
+(`BeaconType::Ping` via `core.refresh()` / `POST /api/refresh`, behind a
+refresh button in every shell). 39 tests workspace-wide, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
@@ -78,11 +111,14 @@ queue); (3) shell parity screens (transfer center, log viewer, palette —
 DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start with a packet
 capture session).
 
-**Unverified on Linux:** the GTK shell's own delete / speed / update /
-refresh wiring (18 Aug) was written on the Mac, where GTK4 can't be
-compiled — `cargo build -p lantern-gtk` on the Ubuntu box is what confirms
-it. The engine-level features behind it are tested and platform-neutral, so
-the CLI and web GUI already have all four on Linux either way.
+**GTK shell, still to do** (18 Aug — two agents converged on this file the
+same day; the Linux-built version won, and these are what it doesn't have
+yet): **per-message delete** (`core.delete_message`, the macOS ⋯ menu's
+equivalent) and the **update panel** (`core::update` + `check_update` /
+`start_update` / `take_unseen_result`, which reports how the last update
+went — the app that starts one never sees it finish). Everything else is
+there: refresh, clear conversation, live transfer rate. A Mac session cannot
+compile this crate (no GTK4), so write it on Linux or expect a fixup pass.
 
 *(GTK app polish — unread badges, verified badge, drag-drop — was item 2 and
 is done; see below.)*
@@ -130,8 +166,21 @@ review. `design/DESIGN.md` §11 has the full reasoning.
    A `Hello` disagreeing with the cert must close the connection.
 6. Beacons go to **every interface's directed broadcast**, not only
    `255.255.255.255`. See `lantern-discovery/src/net.rs`.
-7. Nothing connects off the local link — no update check, no telemetry, no
-   remote resource fetched by the message renderer.
+7. Nothing connects off the local link **on its own**. No check at launch, no
+   polling, no telemetry, no remote resource fetched by the message renderer.
+   The single exception is an update a person explicitly asks for — by
+   clicking Update and confirming, or by running `lantern-update` — and even
+   then the network step happens in `packaging/update.sh`, not in the app's
+   own code. Nothing schedules that. Do not answer "how do I ship updates?"
+   with a background checker, and do not add a second network path.
+
+**Amended 18 Aug 2026** (owner asked for an in-app updater; original wording
+allowed no update path inside the app at all). What the wording protects is
+unchanged: Lantern must never reveal who is running it, from where, or how
+often, to anyone the user didn't decide to talk to. A fetch that happens only
+when someone clicks a button, in a script the app hands off to, keeps that.
+An automatic one wouldn't — so if a future session is tempted by "just check
+once a day in the background", the answer is still no.
 8. Received paths are normalized and confined to the destination root.
 
 ## Fixed 17 Aug 2026 — LAN discovery never left the machine
@@ -173,10 +222,12 @@ QUIC.
 Run `lantern-doctor` yourself for the live numbers; they are deliberately
 not pasted here, because this repo is public.
 
-**Still not verified:** the real Linux ↔ macOS pair — the Mac was not on the
-network during this session. The Linux half is now known good, so if the
-pair still fails, suspect the Mac or the access point (see the doctor's own
-summary list), not the interface enumeration.
+**Linux ↔ macOS confirmed, both directions, 17 Aug 2026.** The Mac came onto
+the network later the same evening and the pair worked without further
+changes: the Mac's roster picked up the Linux instances, and `lantern-doctor`
+on the Linux box heard both Mac instances (the Mac was running two, on 3939
+and 3940). The doctor's own verdict — "This machine hears other Lantern
+nodes. Discovery works here." The long-standing gate on this fix is closed.
 
 **Changing discovery or transport? The failure mode is silence, not an
 error.** Tests will not tell you it works — run `lantern-doctor` on two
@@ -209,6 +260,71 @@ Roadmap item 2 (GTK polish) is done:
 - **Drag-drop.** A `DropTarget` on the conversation accepts `FileList` and
   `File` and routes to the same `send_path` the paperclip uses, so a dropped
   file and a picked file take one code path. Local paths only — invariant 7.
+
+### Conversation UI — 18 Aug 2026
+
+The thread is now **two-sided**: our own messages sit right with a stronger
+bubble tint, the peer's sit left, each with a coloured initials avatar, the
+time, and — on ours — a delivery tick. Both bubble tints derive from the
+theme's own foreground via `alpha(currentColor, …)`, so they track light and
+dark without a hardcoded palette, and laltain green stays reserved for the
+mark.
+
+**Note for whoever does the macOS side:** the SwiftUI shell is *not*
+two-sided. `MessageRow` gives every message an avatar and a trailing
+`Spacer()`, so incoming and outgoing both sit left, Slack-style. The shells
+genuinely differ here now. Bringing the Mac across is a straight port of the
+layout below; the avatar colour and initials helpers were written to match
+`Lantern.swift` exactly (same six colours, same first-four-character sum) so
+one peer looks identical on both.
+
+Also carried over from the Mac shell: avatars in the roster, the peer's
+`host · addr` in the conversation header, the verify button reflecting
+verified state, the numbered two-column safety-word grid, a proper empty
+state, a transient error banner (`flash`), and a desktop notification in
+place of the Mac's dock badge — sent only when the window is not already
+focused.
+
+**Transfer speed.** `CoreEvent::TransferProgress { xid, outgoing, bytes,
+total }` is emitted per chunk in both directions; the file card reads
+"12.3 MB of 50.0 MB · 8.4 MB/s". The event deliberately carries **no rate** —
+the shell knows when it last painted and the core does not, so the shell
+divides. Repaints are throttled to 250 ms, which doubles as the interval the
+rate is measured over; the smoothing is a 0.7/0.3 EMA because raw per-chunk
+deltas are unreadable. On the receive side progress counts *verified* bytes,
+so it can only advance on data that passed its hash.
+
+**Refresh — `BeaconType::Ping` is now implemented.** It had a slot in the
+wire format and the DESIGN §4.2 table from the start, and nothing ever sent
+one. It matters because a peer only answers a beacon from someone *new* to
+it, and the roster is in-memory: re-announcing at a node that already knows
+us gets no reply, so "look for devices now" via `announce()` would do
+nothing for exactly the peers you can already see. `Core::refresh()` sends a
+Ping; a node receiving one answers with its Hello. Exposed as the header-bar
+refresh button and the CLI's `/refresh`.
+
+**Ping replies are rate limited to one per two seconds, and must stay that
+way.** One broadcast Ping draws a reply from every node on the link, so
+without a limit an attacker spends one packet to cost the link N — a cheap
+amplifier. Signing does not help, since anyone can mint an identity.
+
+**Clear conversation** (`Store::clear_messages` / `Core::clear_history`)
+deletes one peer's messages and returns the count. **The peer row
+deliberately survives**: it holds the pinned key and the verified flag, and
+dropping it would silently downgrade a verified contact to first-contact
+trust, so the next connection would be accepted as new rather than checked
+against what we pinned. A store test covers that. The confirmation text says
+plainly that this is local only and the peer keeps their copy — a "clear"
+that reads like a recall but is not would be the wrong thing to be vague
+about. Neither the SwiftUI shell nor the web GUI has this yet.
+
+**App icon.** A GNOME/Wayland window is matched to its launcher by
+`app_id`, and the icon comes from `<app_id>.desktop`. The app announces
+`local.lantern.gtk` but `install.sh` wrote `lantern.desktop`, so the running
+app got a generic fallback icon while search — which reads the file directly
+— showed the right one. The file is now named for the app id, with
+`StartupWMClass` covering X11. **If `APP_ID` ever changes, rename the desktop
+file with it.**
 
 Two things had to be fixed to make that work:
 
@@ -255,9 +371,40 @@ Invariant 8 is unaffected: `sanitize_filename` strips separators and rejects
 `..`, so the received name is still confined to the destination root
 whatever that root is.
 
+## Updating — `lantern-update`, never the app
+
+`update.sh` is installed as `~/.lantern/bin/lantern-update`, with the source
+checkout baked in at install time. It fetches, fast-forwards, reruns
+`install.sh`, and tells you to restart. `--check` reports without changing
+anything.
+
+It exists as a separate tool because invariant 7 names update checks
+specifically: an app that polls GitHub at launch tells a third party who runs
+Lantern, from where, and how often — the one thing the product promises it
+does not do. Putting the network access in a command a person runs
+deliberately keeps the app binary honest and the README's "no accounts, no
+cloud, no server" true. This was a considered decision (17 Aug 2026), not an
+oversight.
+
+Two guards worth keeping: it refuses to run with a dirty working tree
+(rebasing over someone's edits loses work), and it only fast-forwards (a
+merge commit made behind your back is a surprise; diverged history is a
+person's problem).
+
+`install.sh` unlinks each binary before copying it. Overwriting a *running*
+executable fails with `ETXTBSY`, and since the updater normally runs while
+Lantern is open, that was a guaranteed failure on the common path.
+
 ## Open defects
 
-1. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
+1. **Every macOS peer shows `host = unknown`.** `hostname()` in
+   `lantern-core` tries `$HOME`-style env (`HOSTNAME`) then `/etc/hostname`.
+   macOS has neither — no `/etc/hostname`, and `HOSTNAME` is not exported to
+   GUI-launched apps — so it falls through to the literal "unknown", which is
+   what every Linux peer then displays for the Mac. Linux only works by
+   landing on `/etc/hostname`. Fix with `gethostname(3)` rather than guessing
+   at env vars and files. Confirmed on a real pair, 17 Aug 2026.
+2. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
    position then does `idx % 1024`, discarding the top bit of each group; two
    fingerprints differing only in those 8 bits render identically. DESIGN
    §3.2 is itself inconsistent ("2048-word list … two 1024-word halves" *and*
@@ -265,11 +412,11 @@ whatever that root is.
    one: shrink the claim to 80, or grow the list to 4096 words in two
    2048-word halves. Changes every displayed fingerprint, so it is a product
    decision.
-2. **Wordlist is a procedural CVCV placeholder**, not screened for
+3. **Wordlist is a procedural CVCV placeholder**, not screened for
    near-homophones. DESIGN §3.2 requires a curated list before real use.
-3. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
+4. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
    unimplemented. Two VLANs will never see each other.
-4. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
+5. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
 
 ## Conventions (non-negotiable)
 

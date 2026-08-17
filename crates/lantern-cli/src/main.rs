@@ -6,7 +6,7 @@
 //! lantern run --name Mira --data-dir /tmp/mira \
 //!     --discovery-port 4001 --targets 4001,4002
 //! ```
-//! Commands on stdin: /peers · /msg <name-prefix> <text> ·
+//! Commands on stdin: /peers · /msg <name-prefix> <text> · /refresh ·
 //! /clear <name-prefix> (delete this machine's history with them) ·
 //! /whoami · /quit
 
@@ -147,10 +147,10 @@ async fn main() -> anyhow::Result<()> {
                         println!("  streaming {total} chunks…");
                     }
                 }
-                CoreEvent::TransferProgress { xid, outgoing, done, total, bps, eta_s } => {
+                CoreEvent::TransferProgress { xid, outgoing, bytes, total, bps, eta_s } => {
                     if script {
                         println!(
-                            "EVENT progress {xid} {} {done} {total} {}",
+                            "EVENT progress {xid} {} {bytes} {total} {}",
                             if outgoing { "out" } else { "in" },
                             bps.unwrap_or(0)
                         );
@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
                         print!(
                             "\r  {} {} / {}{}{}   ",
                             if outgoing { "↑" } else { "↓" },
-                            human_size(done),
+                            human_size(bytes),
                             human_size(total),
                             bps.map(|b| format!(" · {}/s", human_size(b)))
                                 .unwrap_or_default(),
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                                 })
                                 .unwrap_or_default(),
                         );
-                        if done >= total {
+                        if bytes >= total {
                             println!();
                         }
                     }
@@ -294,14 +294,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 other => other.report(target.trim()),
             }
-        } else if line == "/refresh" {
-            // Peers answer a HELLO with their own beacon, so one announce
-            // refills the roster without waiting for the next heartbeat.
-            core.announce().await;
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-            let peers = core.peers().await;
-            let online = peers.iter().filter(|p| p.online).count();
-            println!("said hello — {} peer(s), {online} online", peers.len());
         } else if line == "/update" || line == "/update now" {
             let check = core.check_update().await;
             println!("{}", check.summary());
@@ -357,6 +349,12 @@ async fn main() -> anyhow::Result<()> {
                     p.quic_addr
                 );
             }
+        } else if line == "/refresh" {
+            // Ping, not Hello: a peer only answers a beacon from someone new
+            // to it, so re-announcing to a node that already knows us gets
+            // nothing back. Ping is the "everyone speak up".
+            core.refresh().await;
+            println!("asked everyone on this network to check in…");
         } else if line == "/whoami" {
             println!("{} · {}", args.name, hex::encode(core.identity_id()));
             println!("safety words: {}", core.fingerprint_words().join(" · "));

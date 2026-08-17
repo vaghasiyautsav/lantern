@@ -514,7 +514,7 @@ final class Model: ObservableObject {
         }
     }
 
-    /// Say hello to the network again and reload the roster.
+    /// Ask everyone on the link to check in, then reload the roster.
     ///
     /// Discovery already runs on its own; this is for the case where someone
     /// has just opened Lantern on the other machine, or the network moved
@@ -525,10 +525,10 @@ final class Model: ObservableObject {
         Task {
             // The engine waits for beacon replies before answering, so by the
             // time this returns the roster is the refreshed one.
-            let r = await postJSON("/api/announce", [:])
+            let r = await postJSON("/api/refresh", [:])
             await refreshPeers()
             refreshing = false
-            guard let r, r["announced"] as? Bool == true else {
+            guard let r, r["asked"] as? Bool == true else {
                 flash("Couldn't reach the engine to look again.")
                 return
             }
@@ -679,7 +679,7 @@ final class Model: ObservableObject {
 
         case "progress":
             guard let xid = ev["xid"] as? String, let meta = fileMeta[xid],
-                  let done = (ev["done"] as? NSNumber)?.uint64Value,
+                  let done = (ev["bytes"] as? NSNumber)?.uint64Value,
                   let total = (ev["total"] as? NSNumber)?.uint64Value,
                   total > 0
             else { break }

@@ -260,7 +260,7 @@ pub fn start(data_dir: &Path) -> Result<(), String> {
     // to this process going away moments later.
     let status = Command::new("sh")
         .arg("-c")
-        .arg(r#"nohup bash "$1" "$2" "$3" >> "$4" 2>&1 & exit 0"#)
+        .arg(r#"nohup bash "$1" --handoff "$2" "$3" >> "$4" 2>&1 & exit 0"#)
         .arg("sh")
         .arg(&script)
         .arg(&repo)

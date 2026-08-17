@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/filepath", post(send_filepath))
         .route("/api/trust", post(trust))
-        .route("/api/announce", post(announce))
+        .route("/api/refresh", post(refresh))
         .route("/api/version", get(version))
         // A check fetches from GitHub — a side effect, so it's a POST.
         .route("/api/update/check", post(update_check))
@@ -184,9 +184,9 @@ fn event_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::ChunksSent { xid, sent, total } => json!({
             "type": "chunks-sent", "xid": xid.to_string(), "sent": sent, "total": total
         }),
-        CoreEvent::TransferProgress { xid, outgoing, done, total, bps, eta_s } => json!({
+        CoreEvent::TransferProgress { xid, outgoing, bytes, total, bps, eta_s } => json!({
             "type": "progress", "xid": xid.to_string(), "outgoing": outgoing,
-            "done": done, "total": total, "bps": bps, "eta_s": eta_s
+            "bytes": bytes, "total": total, "bps": bps, "eta_s": eta_s
         }),
     }
 }
@@ -410,23 +410,25 @@ async fn trust(
     Json(json!({"ok": true})).into_response()
 }
 
-/// Say hello again, now, and answer with the roster as it stands.
+/// Ask everyone on the link to check in, then answer with the roster.
 ///
 /// Discovery is already automatic — beacons go out on a heartbeat and peers
 /// appear on their own. This is for the moment when someone has just started
-/// Lantern on the other machine and doesn't want to wait out a heartbeat, or
-/// when the network changed under them (VPN up, Wi-Fi switched) and they want
-/// to know rather than wonder. Peers answer a HELLO with their own beacon, so
-/// one announce refills the roster.
-async fn announce(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
-    app.core.announce().await;
+/// Lantern on the other machine, or the network moved underneath (VPN up,
+/// Wi-Fi switched), and waiting out a heartbeat feels like being stuck.
+///
+/// `refresh` sends a Ping, not a Hello: a peer only answers a beacon from an
+/// identity that is new to it, so re-announcing at a node that already knows
+/// us gets nothing back. Ping is the "everyone speak up".
+async fn refresh(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    app.core.refresh().await;
     // A beacon is UDP: the replies land in the next few hundred milliseconds,
     // not instantly. Wait briefly so the roster in this reply is the refreshed
     // one — otherwise the button looks like it did nothing.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     let peers = app.core.peers().await;
     Json(json!({
-        "announced": true,
+        "asked": true,
         "peers": peers.len(),
         "online": peers.iter().filter(|p| p.online).count(),
     }))
