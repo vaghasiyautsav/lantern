@@ -59,11 +59,29 @@ fi
 # 4. Install ------------------------------------------------------------------
 bold "Step 4: installing…"
 mkdir -p "$HOME/.lantern/bin"
-cp target/release/lantern-gui "$HOME/.lantern/bin/"
-cp target/release/lantern "$HOME/.lantern/bin/"
-cp target/release/lantern-doctor "$HOME/.lantern/bin/"
+
+# Unlink before copying. Writing over a running executable fails with
+# ETXTBSY ("Text file busy"), and updating while Lantern is open is the
+# normal case, not the exception. Removing the directory entry first leaves
+# the running process happily on its old inode and gives the new build a
+# fresh one — the running app keeps working until it is restarted.
+install_bin() {
+    rm -f "$HOME/.lantern/bin/$1"
+    cp "target/release/$1" "$HOME/.lantern/bin/$1"
+}
+install_bin lantern-gui
+install_bin lantern
+install_bin lantern-doctor
 if [ "${BUILD_GTK:-0}" = "1" ] && [ -f target/release/lantern-gtk ]; then
-    cp target/release/lantern-gtk "$HOME/.lantern/bin/"
+    install_bin lantern-gtk
+fi
+
+# The updater is a separate tool on purpose — invariant 7 keeps the app off
+# the network, so the fetching lives in something a person runs deliberately.
+# Bake in this checkout so it knows what to pull.
+if [ -f update.sh ]; then
+    sed "s|__REPO__|$(pwd)|" update.sh > "$HOME/.lantern/bin/lantern-update"
+    chmod +x "$HOME/.lantern/bin/lantern-update"
 fi
 
 # Linux: desktop entry + icon so Lantern appears in the app launcher.
@@ -79,7 +97,13 @@ if [ "$(uname)" = "Linux" ]; then
     else
         LAUNCH_EXEC="sh -c '$HOME/.lantern/bin/lantern-gui & sleep 1; xdg-open http://localhost:3999'"
     fi
-    cat > "$HOME/.local/share/applications/lantern.desktop" <<EOF
+    # The filename must equal the GTK application id. A Wayland compositor
+    # only knows a window by its app_id, and finds its icon by looking for
+    # <app_id>.desktop — so a file named lantern.desktop leaves the running
+    # app with a generic fallback icon even though search finds it fine.
+    # StartupWMClass covers the same match on X11.
+    rm -f "$HOME/.local/share/applications/lantern.desktop"
+    cat > "$HOME/.local/share/applications/local.lantern.gtk.desktop" <<EOF
 [Desktop Entry]
 Name=Lantern
 Comment=Serverless LAN messenger
@@ -88,7 +112,9 @@ Terminal=false
 Icon=lantern
 Type=Application
 Categories=Network;InstantMessaging;
+StartupWMClass=local.lantern.gtk
 EOF
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
     echo "Added Lantern to your application launcher."
 fi
 

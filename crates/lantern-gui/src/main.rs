@@ -167,6 +167,10 @@ fn event_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::ChunksSent { xid, sent, total } => json!({
             "type": "chunks-sent", "xid": xid.to_string(), "sent": sent, "total": total
         }),
+        CoreEvent::TransferProgress { xid, outgoing, bytes, total } => json!({
+            "type": "transfer-progress", "xid": xid.to_string(),
+            "outgoing": outgoing, "bytes": bytes, "total": total
+        }),
     }
 }
 

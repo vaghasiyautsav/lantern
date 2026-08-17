@@ -36,7 +36,7 @@ private, change it in the repo settings and correct this paragraph.
 **Working, tested:** engine — signed-beacon discovery (see the 17 Aug fix
 below — cross-machine discovery was broken until then), identity-pinned
 QUIC/TLS 1.3 sessions, chunked resumable BLAKE3-verified transfer (survives
-kill -9), TOFU trust with safety words, SQLite history. 21 tests, clippy
+kill -9), TOFU trust with safety words, SQLite history. 26 tests, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
@@ -100,7 +100,9 @@ review. `design/DESIGN.md` §11 has the full reasoning.
 6. Beacons go to **every interface's directed broadcast**, not only
    `255.255.255.255`. See `lantern-discovery/src/net.rs`.
 7. Nothing connects off the local link — no update check, no telemetry, no
-   remote resource fetched by the message renderer.
+   remote resource fetched by the message renderer. Updating is a real need
+   and it is met *outside* the app, by `lantern-update`; see below. Do not
+   answer "how do I ship updates?" by putting a fetch back in the binary.
 8. Received paths are normalized and confined to the destination root.
 
 ## Fixed 17 Aug 2026 — LAN discovery never left the machine
@@ -142,10 +144,12 @@ QUIC.
 Run `lantern-doctor` yourself for the live numbers; they are deliberately
 not pasted here, because this repo is public.
 
-**Still not verified:** the real Linux ↔ macOS pair — the Mac was not on the
-network during this session. The Linux half is now known good, so if the
-pair still fails, suspect the Mac or the access point (see the doctor's own
-summary list), not the interface enumeration.
+**Linux ↔ macOS confirmed, both directions, 17 Aug 2026.** The Mac came onto
+the network later the same evening and the pair worked without further
+changes: the Mac's roster picked up the Linux instances, and `lantern-doctor`
+on the Linux box heard both Mac instances (the Mac was running two, on 3939
+and 3940). The doctor's own verdict — "This machine hears other Lantern
+nodes. Discovery works here." The long-standing gate on this fix is closed.
 
 **Changing discovery or transport? The failure mode is silence, not an
 error.** Tests will not tell you it works — run `lantern-doctor` on two
@@ -178,6 +182,47 @@ Roadmap item 2 (GTK polish) is done:
 - **Drag-drop.** A `DropTarget` on the conversation accepts `FileList` and
   `File` and routes to the same `send_path` the paperclip uses, so a dropped
   file and a picked file take one code path. Local paths only — invariant 7.
+
+### Conversation UI — 18 Aug 2026
+
+The thread is now **two-sided**: our own messages sit right with a stronger
+bubble tint, the peer's sit left, each with a coloured initials avatar, the
+time, and — on ours — a delivery tick. Both bubble tints derive from the
+theme's own foreground via `alpha(currentColor, …)`, so they track light and
+dark without a hardcoded palette, and laltain green stays reserved for the
+mark.
+
+**Note for whoever does the macOS side:** the SwiftUI shell is *not*
+two-sided. `MessageRow` gives every message an avatar and a trailing
+`Spacer()`, so incoming and outgoing both sit left, Slack-style. The shells
+genuinely differ here now. Bringing the Mac across is a straight port of the
+layout below; the avatar colour and initials helpers were written to match
+`Lantern.swift` exactly (same six colours, same first-four-character sum) so
+one peer looks identical on both.
+
+Also carried over from the Mac shell: avatars in the roster, the peer's
+`host · addr` in the conversation header, the verify button reflecting
+verified state, the numbered two-column safety-word grid, a proper empty
+state, a transient error banner (`flash`), and a desktop notification in
+place of the Mac's dock badge — sent only when the window is not already
+focused.
+
+**Transfer speed.** `CoreEvent::TransferProgress { xid, outgoing, bytes,
+total }` is emitted per chunk in both directions; the file card reads
+"12.3 MB of 50.0 MB · 8.4 MB/s". The event deliberately carries **no rate** —
+the shell knows when it last painted and the core does not, so the shell
+divides. Repaints are throttled to 250 ms, which doubles as the interval the
+rate is measured over; the smoothing is a 0.7/0.3 EMA because raw per-chunk
+deltas are unreadable. On the receive side progress counts *verified* bytes,
+so it can only advance on data that passed its hash.
+
+**App icon.** A GNOME/Wayland window is matched to its launcher by
+`app_id`, and the icon comes from `<app_id>.desktop`. The app announces
+`local.lantern.gtk` but `install.sh` wrote `lantern.desktop`, so the running
+app got a generic fallback icon while search — which reads the file directly
+— showed the right one. The file is now named for the app id, with
+`StartupWMClass` covering X11. **If `APP_ID` ever changes, rename the desktop
+file with it.**
 
 Two things had to be fixed to make that work:
 
@@ -224,9 +269,40 @@ Invariant 8 is unaffected: `sanitize_filename` strips separators and rejects
 `..`, so the received name is still confined to the destination root
 whatever that root is.
 
+## Updating — `lantern-update`, never the app
+
+`update.sh` is installed as `~/.lantern/bin/lantern-update`, with the source
+checkout baked in at install time. It fetches, fast-forwards, reruns
+`install.sh`, and tells you to restart. `--check` reports without changing
+anything.
+
+It exists as a separate tool because invariant 7 names update checks
+specifically: an app that polls GitHub at launch tells a third party who runs
+Lantern, from where, and how often — the one thing the product promises it
+does not do. Putting the network access in a command a person runs
+deliberately keeps the app binary honest and the README's "no accounts, no
+cloud, no server" true. This was a considered decision (17 Aug 2026), not an
+oversight.
+
+Two guards worth keeping: it refuses to run with a dirty working tree
+(rebasing over someone's edits loses work), and it only fast-forwards (a
+merge commit made behind your back is a surprise; diverged history is a
+person's problem).
+
+`install.sh` unlinks each binary before copying it. Overwriting a *running*
+executable fails with `ETXTBSY`, and since the updater normally runs while
+Lantern is open, that was a guaranteed failure on the common path.
+
 ## Open defects
 
-1. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
+1. **Every macOS peer shows `host = unknown`.** `hostname()` in
+   `lantern-core` tries `$HOME`-style env (`HOSTNAME`) then `/etc/hostname`.
+   macOS has neither — no `/etc/hostname`, and `HOSTNAME` is not exported to
+   GUI-launched apps — so it falls through to the literal "unknown", which is
+   what every Linux peer then displays for the Mac. Linux only works by
+   landing on `/etc/hostname`. Fix with `gethostname(3)` rather than guessing
+   at env vars and files. Confirmed on a real pair, 17 Aug 2026.
+2. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
    position then does `idx % 1024`, discarding the top bit of each group; two
    fingerprints differing only in those 8 bits render identically. DESIGN
    §3.2 is itself inconsistent ("2048-word list … two 1024-word halves" *and*
@@ -234,11 +310,11 @@ whatever that root is.
    one: shrink the claim to 80, or grow the list to 4096 words in two
    2048-word halves. Changes every displayed fingerprint, so it is a product
    decision.
-2. **Wordlist is a procedural CVCV placeholder**, not screened for
+3. **Wordlist is a procedural CVCV placeholder**, not screened for
    near-homophones. DESIGN §3.2 requires a curated list before real use.
-3. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
+4. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
    unimplemented. Two VLANs will never see each other.
-4. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
+5. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
 
 ## Conventions (non-negotiable)
 

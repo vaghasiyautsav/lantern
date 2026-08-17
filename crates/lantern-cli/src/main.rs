@@ -136,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
                         println!("✓ received {name} ({}) → {}", human_size(size), path.display());
                     }
                 }
+                // Per-chunk and far too noisy for a terminal log; the CLI
+                // reports the summary lines instead.
+                CoreEvent::TransferProgress { .. } => {}
                 CoreEvent::ChunksSent { xid, sent, total } => {
                     if script {
                         println!("EVENT chunks-sent {xid} {sent} {total}");

@@ -71,6 +71,19 @@ pub enum CoreEvent {
     /// Sender-side stats after streaming: how many chunks the peer actually
     /// needed. `sent < total` is a resume in action.
     ChunksSent { xid: Uuid, sent: u32, total: u32 },
+    /// Live progress, emitted once per chunk in both directions. `bytes` of
+    /// `total` of the file are in place — on a resume that starts partway up,
+    /// because chunks already held count toward it.
+    ///
+    /// Deliberately carries no rate: a shell knows when it painted the last
+    /// frame and the core does not, so the shell divides. Anything else
+    /// reports a speed that lags whatever the user is actually looking at.
+    TransferProgress {
+        xid: Uuid,
+        outgoing: bool,
+        bytes: u64,
+        total: u64,
+    },
 }
 
 pub const CHUNK_SIZE: u32 = 1024 * 1024;
@@ -489,6 +502,11 @@ impl Core {
             let mut file = tokio::fs::File::open(path).await?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut buf = vec![0u8; CHUNK_SIZE as usize];
+            // Chunks the peer already had count as done, so a resumed
+            // transfer's progress starts where it left off instead of at zero.
+            let already = (total as u64).saturating_sub(need.len() as u64)
+                * CHUNK_SIZE as u64;
+            let mut moved = 0u64;
             for idx in &need {
                 if *idx >= total {
                     continue; // hostile need-list; skip out-of-range
@@ -501,6 +519,16 @@ impl Core {
                 uni.write_all(&idx.to_be_bytes()).await?;
                 uni.write_all(&(len as u32).to_be_bytes()).await?;
                 uni.write_all(&buf[..len]).await?;
+                moved += len as u64;
+                let _ = self
+                    .events
+                    .send(CoreEvent::TransferProgress {
+                        xid,
+                        outgoing: true,
+                        bytes: (already + moved).min(size),
+                        total: size,
+                    })
+                    .await;
             }
             uni.finish()?;
         }
@@ -883,6 +911,18 @@ impl Core {
                                 break;
                             }
                         };
+
+                        // Verified bytes, not received bytes: a chunk that
+                        // failed its hash never lands, so progress can only
+                        // move on data that is actually good.
+                        let _ = events
+                            .send(CoreEvent::TransferProgress {
+                                xid,
+                                outgoing: false,
+                                bytes: (verified_count as u64 * m.chunk_size as u64).min(m.size),
+                                total: m.size,
+                            })
+                            .await;
 
                         if verified_count as u32 == m.chunk_count() {
                             // Complete: finalize off the async path.
