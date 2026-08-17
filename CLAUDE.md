@@ -47,11 +47,36 @@ Icon: the **laltain** (final, user-approved — do NOT redesign unasked).
 box), not just a build target — engine, CLI, doctor and the GTK app all
 build and run there.
 
-**Next, in order:** (1) GitHub Actions CI → .dmg / .deb / Windows .exe —
-closes the Windows gap; (2) Phase 4 core depth (FTS search, durable offline
-queue); (3) shell parity screens (transfer center, log viewer, palette —
-DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start with a packet
-capture session).
+**Next, in order:** (1) Phase 4 core depth (FTS search, durable offline
+queue); (2) shell parity screens (transfer center, log viewer, palette —
+DESIGN §5.3); (3) ipmsg compat bridge (Phase 7 — start with a packet
+capture session); (4) a native Windows shell, if the .exe proves useful.
+
+## CI — `.github/workflows/ci.yml` (18 Aug 2026)
+
+Four jobs: `check` (test + clippy, the CLAUDE.md bar, with `-D warnings` on
+the clippy invocation only — putting it in `RUSTFLAGS` would fail the build
+on a *dependency's* warning), `linux` → `.deb`, `macos` → `.dmg`, `windows` →
+`.exe`. Tagging `v*` publishes all three to a GitHub release via the
+preinstalled `gh`, so no third-party release action and no extra token.
+
+**Windows had never been compiled before this.** There is no native Windows
+shell, so that job builds the engine, CLI, doctor and web interface, and not
+`lantern-gtk` (GTK4 on Windows needs msys2/vcpkg — separate work). Three
+things were fixed to give it a chance:
+
+- `hostname()` now reads `COMPUTERNAME` on Windows. `HOSTNAME` is a Unix
+  shell variable, so Windows would otherwise have shipped the exact
+  "unknown" bug just fixed for macOS.
+- `user_download_dir()` uses `USERPROFILE`; Windows has no `HOME`, so the
+  function returned `None` and files would have gone to the data directory.
+- `SO_REUSEPORT` was already cfg-gated in `lantern-discovery`, and
+  `lantern-discovery` cross-checks clean for `x86_64-pc-windows-gnu`.
+
+`rusqlite` is vendored and builds SQLite from source under MSVC, so no
+system SQLite is needed. Whether it links and runs is what the first CI run
+answers — until it is green, "the engine is portable Rust" is a claim, not a
+result.
 
 *(GTK app polish — unread badges, verified badge, drag-drop — was item 2 and
 is done; see below.)*

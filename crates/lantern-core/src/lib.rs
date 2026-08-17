@@ -1238,27 +1238,37 @@ fn sanitize_filename(name: &str) -> anyhow::Result<String> {
 /// `None` means "no sensible answer" (no `HOME`), and the caller should fall
 /// back to the data directory rather than guessing.
 pub fn user_download_dir() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-
-    if cfg!(target_os = "macos") {
-        return Some(home.join("Downloads"));
+    // Windows has no HOME; the profile directory is USERPROFILE, and the
+    // folder is not localised on disk the way XDG's is.
+    #[cfg(windows)]
+    {
+        let profile = std::env::var_os("USERPROFILE")?;
+        return Some(PathBuf::from(profile).join("Downloads"));
     }
+    #[cfg(not(windows))]
+    {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
 
-    // An explicit environment override beats the config file.
-    if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR").map(PathBuf::from) {
-        if dir.is_absolute() {
+        if cfg!(target_os = "macos") {
+            return Some(home.join("Downloads"));
+        }
+
+        // An explicit environment override beats the config file.
+        if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR").map(PathBuf::from) {
+            if dir.is_absolute() {
+                return Some(dir);
+            }
+        }
+
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        if let Some(dir) = xdg_download_dir_from(&config_home.join("user-dirs.dirs"), &home) {
             return Some(dir);
         }
-    }
 
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    if let Some(dir) = xdg_download_dir_from(&config_home.join("user-dirs.dirs"), &home) {
-        return Some(dir);
+        Some(home.join("Downloads"))
     }
-
-    Some(home.join("Downloads"))
 }
 
 /// Read `XDG_DOWNLOAD_DIR` out of a `user-dirs.dirs` file, whose lines look
@@ -1321,6 +1331,14 @@ pub fn hostname() -> String {
                 }
             }
         }
+    }
+    // Windows has no gethostname(3) outside winsock, but it does set
+    // COMPUTERNAME in the environment for every process — unlike HOSTNAME,
+    // which is a Unix *shell* variable and the reason this was broken on
+    // macOS. Without this branch, Windows would ship the same "unknown".
+    #[cfg(windows)]
+    if let Some(name) = std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()) {
+        return name;
     }
     std::fs::read_to_string("/etc/hostname")
         .ok()

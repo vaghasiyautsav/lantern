@@ -1,0 +1,121 @@
+name: CI
+
+# Builds the three platform artifacts and enforces the quality bar from
+# CLAUDE.md: cargo test green, cargo clippy clean.
+#
+# The Windows job is the interesting one. Nobody has ever built Lantern for
+# Windows — there is no native Windows shell, so it builds the engine, the
+# CLI, the doctor and the localhost web interface, and not lantern-gtk (GTK4
+# on Windows needs msys2/vcpkg and is a separate piece of work). Treat the
+# first green run as the evidence that the engine is portable; until then the
+# claim in the README is untested.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Note: deliberately no global RUSTFLAGS. `-D warnings` there applies to
+  # dependencies as well, so an upstream crate's warning would fail our
+  # build; it also changes the cache key on every toolchain bump. The bar is
+  # enforced on the clippy invocation instead, where it belongs.
+
+jobs:
+  check:
+    name: test + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # 24.04 ships GTK 4.14. The Linux shell links it directly, so the
+      # workspace does not build without the dev package.
+      - name: GTK4 development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+      - run: cargo test --workspace
+      # CLAUDE.md's bar is "clippy clean", so a warning is a failure.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  linux:
+    name: linux (.deb)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: GTK4 development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+      - run: cargo build --release
+      - name: Package
+        run: bash packaging/make-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lantern-deb
+          path: "*.deb"
+          if-no-files-found: error
+
+  macos:
+    name: macos (.dmg)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # make-dmg.sh builds only lantern-gui and lantern-cli, then compiles
+      # the SwiftUI shell with the swiftc that ships in the runner's Xcode.
+      # It deliberately does not touch lantern-gtk.
+      - name: Build and package
+        run: bash packaging/make-dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lantern-dmg
+          path: "*.dmg"
+          if-no-files-found: error
+
+  windows:
+    name: windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # No lantern-gtk: there is no Windows shell yet. rusqlite is vendored
+      # and builds SQLite from source with MSVC, so no system SQLite is
+      # needed. SO_REUSEPORT is already cfg-gated away in lantern-discovery.
+      - run: cargo build --release -p lantern-cli -p lantern-gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lantern-windows
+          path: |
+            target/release/lantern.exe
+            target/release/lantern-doctor.exe
+            target/release/lantern-gui.exe
+          if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      # gh is preinstalled on the runner, so this needs no third-party
+      # release action and no token beyond the one GitHub already provides.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find artifacts -type f -print
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Lantern ${GITHUB_REF_NAME}" \
+            --notes "Unsigned builds. macOS: right-click → Open on first launch. See README." \
+            $(find artifacts -type f)
