@@ -1,105 +1,107 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    Lantern icon — "Kept Flame", Indian form.
+    A diya: the clay lamp lit at Diwali and kept in every home. One vessel,
+    one flame. Beneath it, a rangoli arc of dots — many small lights warmed
+    by one flame; the peers on the network. Nothing else.
+  -->
   <defs>
-    <!-- Night field: deep indigo, faintly lifted at the top -->
+    <!-- Night field -->
     <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"   stop-color="#232c4e"/>
-      <stop offset="0.5" stop-color="#181f3a"/>
-      <stop offset="1"   stop-color="#0e1226"/>
+      <stop offset="0"   stop-color="#20284a"/>
+      <stop offset="0.5" stop-color="#171e38"/>
+      <stop offset="1"   stop-color="#0d1124"/>
     </linearGradient>
 
-    <!-- Patient concentric glow: amber core through blue bridge to night -->
+    <!-- Patient radiance -->
     <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0"    stop-color="#ffd9a0" stop-opacity="0.55"/>
-      <stop offset="0.28" stop-color="#ffb454" stop-opacity="0.30"/>
-      <stop offset="0.55" stop-color="#8f7ce0" stop-opacity="0.10"/>
-      <stop offset="0.8"  stop-color="#4a5aa8" stop-opacity="0.04"/>
+      <stop offset="0"    stop-color="#ffd9a0" stop-opacity="0.50"/>
+      <stop offset="0.3"  stop-color="#ffb454" stop-opacity="0.26"/>
+      <stop offset="0.6"  stop-color="#8f7ce0" stop-opacity="0.08"/>
       <stop offset="1"    stop-color="#4a5aa8" stop-opacity="0"/>
     </radialGradient>
 
-    <!-- The flame core -->
-    <radialGradient id="core" cx="0.5" cy="0.42" r="0.65">
-      <stop offset="0"    stop-color="#fff3d8"/>
-      <stop offset="0.45" stop-color="#ffcf7d"/>
-      <stop offset="0.8"  stop-color="#ff9e3d"/>
-      <stop offset="1"    stop-color="#f27c2a"/>
+    <!-- Flame: white heart through gold to saffron -->
+    <linearGradient id="flame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"    stop-color="#ff9e3d"/>
+      <stop offset="0.35" stop-color="#ffc35e"/>
+      <stop offset="0.75" stop-color="#ffe9b0"/>
+      <stop offset="1"    stop-color="#fff6e0"/>
+    </linearGradient>
+    <radialGradient id="flameheart" cx="0.5" cy="0.72" r="0.5">
+      <stop offset="0"   stop-color="#fffdf5" stop-opacity="0.95"/>
+      <stop offset="1"   stop-color="#fffdf5" stop-opacity="0"/>
     </radialGradient>
 
-    <!-- Vessel body: warm-lit paper, darker at the hem -->
-    <linearGradient id="vessel" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"    stop-color="#3a4472"/>
-      <stop offset="0.45" stop-color="#333c68"/>
-      <stop offset="1"    stop-color="#262e52"/>
+    <!-- Terracotta vessel, lit from above by its own flame -->
+    <linearGradient id="clay" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"    stop-color="#a45238"/>
+      <stop offset="0.35" stop-color="#7e3a27"/>
+      <stop offset="1"    stop-color="#451f14"/>
     </linearGradient>
 
     <clipPath id="squircle">
       <rect x="0" y="0" width="1024" height="1024" rx="232" ry="232"/>
     </clipPath>
 
-    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="10"/>
-    </filter>
-    <filter id="soft2" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur stdDeviation="26"/>
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="24"/>
     </filter>
   </defs>
 
   <g clip-path="url(#squircle)">
-    <!-- night field -->
+    <!-- night -->
     <rect width="1024" height="1024" fill="url(#field)"/>
 
-    <!-- graduated radiance, optically centred (slightly above geometric) -->
-    <circle cx="512" cy="488" r="470" fill="url(#glow)"/>
+    <!-- radiance, centred on the flame -->
+    <circle cx="512" cy="452" r="480" fill="url(#glow)"/>
 
-    <!-- others warmed by the same light: felt before seen -->
-    <g stroke="#93a7ef" stroke-width="7" fill="none" stroke-linecap="round">
-      <path d="M 186 488 A 326 326 0 0 1 234 348" opacity="0.20"/>
-      <path d="M 838 488 A 326 326 0 0 0 790 348" opacity="0.20"/>
-      <path d="M 128 560 A 388 388 0 0 1 170 396" opacity="0.10"/>
-      <path d="M 896 560 A 388 388 0 0 0 854 396" opacity="0.10"/>
+    <!-- flame halo -->
+    <ellipse cx="512" cy="440" rx="150" ry="180" fill="#ff9e3d"
+             opacity="0.30" filter="url(#soft)"/>
+
+    <!-- the flame: a single almond, tip drawn upward -->
+    <path d="M 512 268
+             C 560 352 596 420 596 486
+             C 596 552 560 592 512 592
+             C 464 592 428 552 428 486
+             C 428 420 464 352 512 268 Z"
+          fill="url(#flame)"/>
+    <!-- white heart low in the flame, where the wick feeds it -->
+    <ellipse cx="512" cy="520" rx="58" ry="72" fill="url(#flameheart)"/>
+
+    <!-- wick -->
+    <rect x="504" y="586" width="16" height="30" rx="8" fill="#3a1c10"/>
+
+    <!-- the diya: shallow clay boat, tips gently upturned -->
+    <path d="M 232 614
+             C 260 600 330 622 512 622
+             C 694 622 764 600 792 614
+             C 788 640 756 690 700 722
+             C 646 752 576 766 512 766
+             C 448 766 378 752 324 722
+             C 268 690 236 640 232 614 Z"
+          fill="url(#clay)"/>
+    <!-- rim, lit by the flame -->
+    <path d="M 232 614
+             C 260 600 330 622 512 622
+             C 694 622 764 600 792 614"
+          fill="none" stroke="#e8945e" stroke-width="10"
+          stroke-linecap="round" opacity="0.85"/>
+    <!-- warm pool of light inside the bowl -->
+    <ellipse cx="512" cy="632" rx="180" ry="16" fill="#ffb454" opacity="0.35"/>
+
+    <!-- rangoli: many small lights warmed by one flame -->
+    <g fill="#e8b04b">
+      <circle cx="512" cy="852" r="11" opacity="0.55"/>
+      <circle cx="428" cy="846" r="7"  opacity="0.42"/>
+      <circle cx="596" cy="846" r="7"  opacity="0.42"/>
+      <circle cx="348" cy="830" r="9"  opacity="0.34"/>
+      <circle cx="676" cy="830" r="9"  opacity="0.34"/>
+      <circle cx="274" cy="804" r="6"  opacity="0.26"/>
+      <circle cx="750" cy="804" r="6"  opacity="0.26"/>
+      <circle cx="208" cy="770" r="8"  opacity="0.18"/>
+      <circle cx="816" cy="770" r="8"  opacity="0.18"/>
     </g>
-
-    <!-- hanging loop, seated into the cap -->
-    <path d="M 466 246 Q 512 190 558 246" fill="none"
-          stroke="#4d5788" stroke-width="26" stroke-linecap="round"/>
-
-    <!-- cap -->
-    <rect x="418" y="240" width="188" height="52" rx="26" fill="#4d5788"/>
-
-    <!-- vessel: superellipse silhouette -->
-    <path d="M 512 300
-             C 384 300 306 386 306 502
-             C 306 622 390 706 512 706
-             C 634 706 718 622 718 502
-             C 718 386 640 300 512 300 Z"
-          fill="url(#vessel)"/>
-
-    <!-- paper ribs: beneath the light, so the flame always wins -->
-    <g stroke="#141a33" stroke-width="14" fill="none" opacity="0.45"
-       stroke-linecap="round">
-      <path d="M 330 420 Q 512 386 694 420"/>
-      <path d="M 318 502 Q 512 472 706 502"/>
-      <path d="M 334 586 Q 512 560 690 586"/>
-    </g>
-
-    <!-- kept flame: halo then core, above everything the vessel holds -->
-    <circle cx="512" cy="496" r="150" fill="#ff9e3d" opacity="0.35" filter="url(#soft2)"/>
-    <circle cx="512" cy="496" r="122" fill="url(#core)"/>
-    <circle cx="512" cy="496" r="122" fill="none" stroke="#ffe9c2"
-            stroke-width="3" opacity="0.5"/>
-
-    <!-- rim light on the vessel from its own flame -->
-    <path d="M 512 300
-             C 384 300 306 386 306 502
-             C 306 622 390 706 512 706
-             C 634 706 718 622 718 502
-             C 718 386 640 300 512 300 Z"
-          fill="none" stroke="#8b96c9" stroke-width="6" opacity="0.55"/>
-
-    <!-- base -->
-    <rect x="446" y="712" width="132" height="44" rx="22" fill="#4d5788"/>
-
-    <!-- warm pool beneath -->
-    <ellipse cx="512" cy="800" rx="190" ry="26" fill="#ff9e3d"
-             opacity="0.14" filter="url(#soft)"/>
   </g>
 </svg>

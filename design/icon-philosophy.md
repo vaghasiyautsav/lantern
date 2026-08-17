@@ -44,3 +44,20 @@ than drawn, then polished for weeks. It should sit beside the great app
 marks without apology — crisp at every scale, luminous without glare,
 warm without kitsch. This is the discipline of Kept Flame: one light,
 kept close, made perfect.
+
+---
+
+## The Indian form: the diya
+
+The final mark realizes Kept Flame through the **diya** — the terracotta
+oil lamp lit at Diwali and kept, one small flame at a time, in every home.
+No form on earth says "a light that is owned, not rented" more plainly, or
+with fewer strokes: a shallow clay boat, a single almond of fire with its
+white heart low where the wick feeds it, a rim caught in its own light.
+
+Beneath it, an arc of small gold points — drawn from **rangoli**, the
+dot-patterns laid at thresholds to welcome. In this mark they carry the
+network's meaning: many small lights on the same floor, warmed by one
+flame. The nearest are brightest; they fade with distance, as peers do.
+Nothing else is permitted. Clay, fire, and welcome — the whole app,
+in three ideas older than writing.
