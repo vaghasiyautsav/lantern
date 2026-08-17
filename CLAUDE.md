@@ -529,3 +529,14 @@ invisible until the others list 3941 in `--targets`/`LANTERN_TARGETS` too.
   instead. If a pane ever renders empty, bisect the *other* pane.
 - `cargo test` at the workspace root fails on macOS because `lantern-gtk`
   needs pkg-config/GTK. Use `cargo test --workspace --exclude lantern-gtk`.
+
+## Pending: the Windows CI job should ship a package, not three .exes
+
+`packaging/make-windows.sh` stages `Start-Lantern.cmd` and a README beside
+the binaries; the `windows` job in `ci.yml` uploads the bare .exes. Without a
+launcher the first thing a Windows user meets is a console that appears to do
+nothing, so the job should build the same package the script does.
+
+Not done from the Mac: that machine's GitHub token has no `workflow` scope,
+so it cannot push any change under `.github/workflows/`. **Whoever is on the
+Linux box can — do it there**, or grant the Mac's token the scope.

@@ -95,50 +95,13 @@ jobs:
       # and builds SQLite from source with MSVC, so no system SQLite is
       # needed. SO_REUSEPORT is already cfg-gated away in lantern-discovery.
       - run: cargo build --release -p lantern-cli -p lantern-gui
-      # Bare .exes are not something a person can use: there is no native
-      # window, so without a launcher the first thing they meet is a console
-      # that appears to do nothing. Ship the same package make-windows.sh
-      # produces — engine, launcher, and a README that says plainly what this
-      # is and what the firewall prompt is for.
-      - name: Package
-        shell: bash
-        run: |
-          mkdir -p dist/lantern-windows
-          cp target/release/lantern-gui.exe dist/lantern-windows/
-          cp target/release/lantern.exe dist/lantern-windows/
-          cp target/release/lantern-doctor.exe dist/lantern-windows/
-          # CRLF: Notepad renders LF-only text as one endless line.
-          sed 's/$/\r/' > dist/lantern-windows/Start-Lantern.cmd <<'CMD'
-          @echo off
-          rem Starts the engine, then opens the interface. Localhost only:
-          rem nothing outside this machine can reach the window.
-          start "" "%~dp0lantern-gui.exe"
-          timeout /t 2 >nul
-          start "" http://localhost:3999
-          CMD
-          sed 's/$/\r/' > dist/lantern-windows/README.txt <<'TXT'
-          Lantern for Windows (interim shell)
-          -----------------------------------
-          Double-click Start-Lantern.cmd. The engine starts and your browser
-          opens http://localhost:3999 - that page is the app, and only this
-          machine can reach it.
-
-          Windows Firewall asks once, on first run. Allow Lantern on private
-          networks, or nobody on your LAN can see you: discovery needs UDP
-          3939, and transfers need one more UDP port.
-
-          Nothing is installed outside your user folder. Your identity key and
-          message history live in %USERPROFILE%\.lantern - copy that folder to
-          move your identity, delete it to start over.
-
-          There is no native Windows window yet. Everything under the glass is
-          the same engine the Mac and Linux apps run: no server, no accounts,
-          no cloud, nothing leaves the LAN.
-          TXT
       - uses: actions/upload-artifact@v4
         with:
           name: lantern-windows
-          path: dist/lantern-windows
+          path: |
+            target/release/lantern.exe
+            target/release/lantern-doctor.exe
+            target/release/lantern-gui.exe
           if-no-files-found: error
 
   release:
