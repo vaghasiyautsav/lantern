@@ -46,6 +46,7 @@ clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 if-addrs = "0.15"
 socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

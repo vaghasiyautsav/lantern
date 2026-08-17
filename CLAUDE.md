@@ -105,34 +105,12 @@ undo them:
 box), not just a build target — engine, CLI, doctor and the GTK app all
 build and run there.
 
-**Windows now builds** (18 Aug 2026). Two ways, both without a Windows
-machine in the loop:
-
-- `bash packaging/make-windows.sh` cross-compiles from the Mac or the Ubuntu
-  box (`x86_64-pc-windows-gnu` + mingw-w64) → `dist/lantern-windows-x64.zip`.
-  52 s, clean, first try — nothing in the engine is platform-bound: `ring`
-  and bundled SQLite both build under mingw, and the interface is a browser.
-- `.github/workflows/build.yml` builds it natively on `windows-latest` and
-  uploads `lantern-windows` as an artifact on every push to main; a `v*` tag
-  additionally drafts a release with the zip attached, which is the only form
-  a person can download without a GitHub login. **Untested on real Windows**
-  as of writing — it compiles and packages, nobody has double-clicked it yet.
-
-What ships is the engine plus the localhost interface behind
-`Start-Lantern.cmd`; there is no native Windows window (DESIGN §5.3 keeps
-WinUI as future work), and the README in the zip says so rather than
-implying one.
-
-That CI matrix also closes a hole this project keeps falling into: a Mac
-session cannot compile `apps/linux-native`, a Linux session cannot compile
-the SwiftUI shell, so each can ship a shell it never built. CI compiles all
-three, plus clippy and the full test run per platform.
-
-**Next, in order:** (1) test the Windows zip on a real Windows machine, then
-`.dmg`/`.deb` jobs in the same workflow; (2) Phase 4 core depth (FTS search,
-durable offline queue); (3) shell parity screens (transfer center, log
-viewer, palette — DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start
-with a packet capture session).
+**Next, in order:** (1) confirm the first green CI run and try the Windows
+zip on a real Windows machine; (2) Phase 4 core depth (FTS search, durable
+offline queue); (3) shell parity screens (transfer center, log viewer,
+palette — DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start with a
+packet capture session); (5) a native Windows shell, if the .exe proves
+useful.
 
 **GTK shell, still to do** (18 Aug — two agents converged on this file the
 same day; the Linux-built version won, and these are what it doesn't have
@@ -142,6 +120,52 @@ equivalent) and the **update panel** (`core::update` + `check_update` /
 went — the app that starts one never sees it finish). Everything else is
 there: refresh, clear conversation, live transfer rate. A Mac session cannot
 compile this crate (no GTK4), so write it on Linux or expect a fixup pass.
+
+## CI — `.github/workflows/ci.yml` (18 Aug 2026)
+
+Four jobs: `check` (test + clippy, the CLAUDE.md bar, with `-D warnings` on
+the clippy invocation only — putting it in `RUSTFLAGS` would fail the build
+on a *dependency's* warning), `linux` → `.deb`, `macos` → `.dmg`, `windows` →
+`.exe`. Tagging `v*` publishes all three to a GitHub release via the
+preinstalled `gh`, so no third-party release action and no extra token.
+
+The matrix also closes a hole this project keeps falling into: a Mac session
+cannot compile `apps/linux-native`, a Linux session cannot compile the
+SwiftUI shell, so either can ship a shell it never built. CI compiles all
+three.
+
+**Windows had never been compiled before this.** There is no native Windows
+shell, so that job builds the engine, CLI, doctor and web interface, and not
+`lantern-gtk` (GTK4 on Windows needs msys2/vcpkg — separate work). Three
+things were fixed to give it a chance:
+
+- `hostname()` now reads `COMPUTERNAME` on Windows. `HOSTNAME` is a Unix
+  shell variable, so Windows would otherwise have shipped the exact
+  "unknown" bug just fixed for macOS.
+- `user_download_dir()` uses `USERPROFILE`; Windows has no `HOME`, so the
+  function returned `None` and files would have gone to the data directory.
+- `SO_REUSEPORT` was already cfg-gated in `lantern-discovery`, and
+  `lantern-discovery` cross-checks clean for `x86_64-pc-windows-gnu`.
+
+`rusqlite` is vendored and builds SQLite from source under MSVC, so no
+system SQLite is needed. Whether it links and runs under MSVC is what the
+first CI run answers.
+
+**It also builds without CI, and did.** `bash packaging/make-windows.sh`
+cross-compiles from this Mac (or the Ubuntu box) with
+`x86_64-pc-windows-gnu` + mingw-w64 and stages
+`dist/lantern-windows-x64.zip` — the three exes, a `Start-Lantern.cmd` that
+launches the engine and opens `localhost:3999`, and a README (CRLF, because
+Notepad renders LF-only text as one line) that says there is no native
+window yet. 52 s, clean, first attempt, on arm64: `ring` and bundled SQLite
+both build under mingw, and the interface is a browser rather than a native
+toolkit. So the gnu target links today; MSVC is what CI still has to prove.
+The CI job ships the same package rather than three bare .exes — without a
+launcher the first thing a person meets is a console that appears to do
+nothing.
+
+**Still untested on real Windows.** It compiles and packages; nobody has
+double-clicked it.
 
 *(GTK app polish — unread badges, verified badge, drag-drop — was item 2 and
 is done; see below.)*
@@ -341,6 +365,25 @@ plainly that this is local only and the peer keeps their copy — a "clear"
 that reads like a recall but is not would be the wrong thing to be vague
 about. Neither the SwiftUI shell nor the web GUI has this yet.
 
+### Fixed 18 Aug 2026 — every Mac announced itself as "unknown"
+
+`hostname()` tried `$HOSTNAME`, then `/etc/hostname`. **macOS has neither**:
+there is no `/etc/hostname`, and `HOSTNAME` is a *shell* variable that a GUI
+app launched from Finder never inherits. So it fell through to its last
+resort and every Mac told the whole network its name was the literal string
+"unknown" — which is what every peer then showed in its roster. Linux only
+worked by landing on `/etc/hostname`.
+
+It now asks the kernel via `gethostname(3)`, which is POSIX and answers on
+both platforms, keeping the old sources as fallbacks. The short name is used
+(`Some-MacBook.local` → `Some-MacBook`), matching what Linux reports for the
+same machine.
+
+`lantern-doctor` had **a second copy** of the same guess, so the tool whose
+entire job is comparing two machines would have labelled the Mac "unknown"
+too. It now calls `lantern_core::hostname()`; there is one implementation.
+If you need the host name anywhere else, call that — do not write a third.
+
 **App icon.** A GNOME/Wayland window is matched to its launcher by
 `app_id`, and the icon comes from `<app_id>.desktop`. The app announces
 `local.lantern.gtk` but `install.sh` wrote `lantern.desktop`, so the running
@@ -420,14 +463,7 @@ Lantern is open, that was a guaranteed failure on the common path.
 
 ## Open defects
 
-1. **Every macOS peer shows `host = unknown`.** `hostname()` in
-   `lantern-core` tries `$HOME`-style env (`HOSTNAME`) then `/etc/hostname`.
-   macOS has neither — no `/etc/hostname`, and `HOSTNAME` is not exported to
-   GUI-launched apps — so it falls through to the literal "unknown", which is
-   what every Linux peer then displays for the Mac. Linux only works by
-   landing on `/etc/hostname`. Fix with `gethostname(3)` rather than guessing
-   at env vars and files. Confirmed on a real pair, 17 Aug 2026.
-2. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
+1. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
    position then does `idx % 1024`, discarding the top bit of each group; two
    fingerprints differing only in those 8 bits render identically. DESIGN
    §3.2 is itself inconsistent ("2048-word list … two 1024-word halves" *and*
@@ -435,11 +471,11 @@ Lantern is open, that was a guaranteed failure on the common path.
    one: shrink the claim to 80, or grow the list to 4096 words in two
    2048-word halves. Changes every displayed fingerprint, so it is a product
    decision.
-3. **Wordlist is a procedural CVCV placeholder**, not screened for
+2. **Wordlist is a procedural CVCV placeholder**, not screened for
    near-homophones. DESIGN §3.2 requires a curated list before real use.
-4. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
+3. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
    unimplemented. Two VLANs will never see each other.
-5. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
+4. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
 
 ## Conventions (non-negotiable)
 
