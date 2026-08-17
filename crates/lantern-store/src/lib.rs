@@ -123,6 +123,23 @@ impl Store {
             .collect())
     }
 
+    /// Delete every stored message for one peer, returning how many went.
+    ///
+    /// The peer row itself stays: it carries the pinned key and the verified
+    /// flag, and dropping those would silently downgrade a verified contact
+    /// back to first-contact trust — the next connection would then be
+    /// accepted as new rather than checked against what we already pinned.
+    ///
+    /// The connection sets `secure_delete`, so the freed pages are
+    /// overwritten rather than merely unlinked.
+    pub fn clear_messages(&self, peer: &[u8; 32]) -> Result<usize, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM messages WHERE peer_id = ?1",
+            params![peer.as_slice()],
+        )?;
+        Ok(n)
+    }
+
     pub fn set_verified(&self, id: &[u8; 32], verified: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE peers SET verified = ?2 WHERE id = ?1",
@@ -211,6 +228,37 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_a_conversation_keeps_the_peer_and_its_trust() {
+        let store = Store::open_in_memory().unwrap();
+        let peer = [7u8; 32];
+        let other = [8u8; 32];
+        store.record_peer(&peer, "Mira", "mira-mbp", 1000).unwrap();
+        store.record_peer(&other, "Ravi", "ravi-box", 1000).unwrap();
+        store.set_verified(&peer, true).unwrap();
+
+        for (who, text) in [(peer, "one"), (peer, "two"), (other, "theirs")] {
+            store
+                .insert_message(&StoredMessage {
+                    mid: Uuid::new_v4(),
+                    peer_id: who,
+                    outgoing: false,
+                    ts: 2000,
+                    text: text.into(),
+                    state: 0,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(store.clear_messages(&peer).unwrap(), 2);
+        assert!(store.history(&peer, 10).unwrap().is_empty());
+        // Only that conversation.
+        assert_eq!(store.history(&other, 10).unwrap().len(), 1);
+        // And the peer survives with its trust intact — dropping the row
+        // would downgrade a verified contact back to first-contact trust.
+        assert!(store.is_verified(&peer).unwrap());
+    }
 
     #[test]
     fn message_log_round_trip() {

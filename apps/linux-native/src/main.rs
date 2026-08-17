@@ -346,9 +346,18 @@ fn build_ui(
     verify_btn.set_sensitive(false);
     verify_btn.set_valign(gtk::Align::Center);
 
+    let clear_btn = gtk::Button::from_icon_name("edit-clear-all-symbolic");
+    clear_btn.set_tooltip_text(Some("Clear this conversation"));
+    clear_btn.set_sensitive(false);
+    clear_btn.set_valign(gtk::Align::Center);
+
+    let head_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    head_actions.append(&clear_btn);
+    head_actions.append(&verify_btn);
+
     let title_row = gtk::CenterBox::new();
     title_row.set_start_widget(Some(&head_left));
-    title_row.set_end_widget(Some(&verify_btn));
+    title_row.set_end_widget(Some(&head_actions));
     title_row.set_margin_top(8);
     title_row.set_margin_bottom(8);
     title_row.set_margin_end(12);
@@ -447,40 +456,39 @@ fn build_ui(
     // So let the adjustment announce when it has grown, and follow only when
     // the view is already parked at the bottom: someone who scrolled up to
     // read should not be yanked back down because a message arrived.
-    let stick_bottom = Rc::new(std::cell::Cell::new(true));
-    {
-        let stick = Rc::clone(&stick_bottom);
-        msg_scroll.vadjustment().connect_changed(move |a| {
-            if stick.get() {
-                a.set_value(a.upper() - a.page_size());
-            }
-        });
-    }
-    {
-        let stick = Rc::clone(&stick_bottom);
-        msg_scroll.vadjustment().connect_value_changed(move |a| {
-            // A few pixels of slack — smooth scrolling rarely lands exactly
-            // on the bound, and being one subpixel off must not count as
-            // "the user scrolled away".
-            stick.set(a.value() >= a.upper() - a.page_size() - 8.0);
-        });
-    }
-
-    // Force the view to the newest message. Used when *we* act — sending, or
-    // opening a conversation — where following is always what is wanted.
+    // Two things make this harder than it looks.
+    //
+    // A row's height is unknown until GTK allocates it, which happens on the
+    // frame clock — after any idle callback we could queue — and a wrapped
+    // label can take more than one layout pass to settle, each pass pushing
+    // the bottom further down. So pin across a few frames instead of trying
+    // to guess the one correct moment.
+    //
+    // And the bottom is `upper - page_size`; `upper` alone is the full
+    // content height, which just clamps and lands short.
     let pin_to_bottom = {
-        let stick = Rc::clone(&stick_bottom);
         let msg_scroll = msg_scroll.clone();
         move || {
-            stick.set(true);
-            let a = msg_scroll.vadjustment();
-            a.set_value(a.upper() - a.page_size());
+            // A tick callback is `Fn`, so the frame counter needs a Cell.
+            let frames = std::cell::Cell::new(0u32);
+            msg_scroll.add_tick_callback(move |sw, _| {
+                let a = sw.vadjustment();
+                a.set_value(a.upper() - a.page_size());
+                frames.set(frames.get() + 1);
+                if frames.get() < 4 {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            });
         }
     };
 
     // One chat row: avatar and bubble, mirrored for our own messages.
     let append_row = {
         let msg_box = msg_box.clone();
+        let msg_scroll = msg_scroll.clone();
+        let pin_to_bottom = pin_to_bottom.clone();
         move |outgoing: bool,
               sender: &str,
               key: &str,
@@ -540,10 +548,19 @@ fn build_ui(
                 row.append(&column);
             }
 
+            // Decide *before* appending. Afterwards the adjustment has
+            // already grown by a row, so the view always measures as "not at
+            // the bottom" and following would never happen — which is
+            // precisely how this broke before.
+            let adj = msg_scroll.vadjustment();
+            let was_at_bottom = adj.value() >= adj.upper() - adj.page_size() - 24.0;
+
             msg_box.append(&row);
-            // No scroll here: the adjustment handler above follows when the
-            // view is at the bottom, and callers that must always follow
-            // (sending, opening a conversation) call pin_to_bottom().
+
+            // Someone who scrolled up to read history stays where they are.
+            if was_at_bottom {
+                pin_to_bottom();
+            }
         }
     };
 
@@ -745,6 +762,7 @@ fn build_ui(
         let msg_box = msg_box.clone();
         let stack = stack.clone();
         let entry = entry.clone();
+        let clear_btn = clear_btn.clone();
         let append_text = append_text.clone();
         let refresh_peers = refresh_peers.clone();
         let pin_to_bottom = pin_to_bottom.clone();
@@ -783,6 +801,7 @@ fn build_ui(
             let verified = backend.core.is_verified(&peer.id);
             verify_btn.set_label(if verified { "Verified ✓" } else { "Verify identity" });
             verify_btn.set_sensitive(true);
+            clear_btn.set_sensitive(true);
             entry.set_placeholder_text(Some(&format!(
                 "Message {}…  (or drop files here)",
                 peer.name
@@ -989,6 +1008,64 @@ fn build_ui(
             false
         });
         msg_scroll.add_controller(drop);
+    }
+
+    // ---- clear conversation ---------------------------------------------
+    // Local only. The wording says so plainly: a "clear" that quietly leaves
+    // the other side's copy intact, while looking like a recall, is the kind
+    // of thing someone makes a real decision on.
+    {
+        let state = Rc::clone(&state);
+        let backend = Rc::clone(&backend);
+        let window_weak = window.downgrade();
+        let msg_box = msg_box.clone();
+        let flash = flash.clone();
+        clear_btn.connect_clicked(move |_| {
+            let Some(peer) = state.borrow().selected else {
+                return;
+            };
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
+            let peer_name = {
+                let st = state.borrow();
+                st.peers
+                    .iter()
+                    .find(|p| p.id == peer)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "this peer".into())
+            };
+            let dialog = gtk::AlertDialog::builder()
+                .modal(true)
+                .message(format!("Clear your conversation with {peer_name}?"))
+                .detail(
+                    "This deletes your copy of these messages and cannot be \
+                     undone.\n\nIt does not remove anything from their \
+                     machine — they keep their copy, and they are not told.",
+                )
+                .buttons(["Cancel", "Clear"])
+                .cancel_button(0)
+                .default_button(0)
+                .build();
+
+            let backend = Rc::clone(&backend);
+            let msg_box = msg_box.clone();
+            let flash = flash.clone();
+            dialog.choose(Some(&window), None::<&gio::Cancellable>, move |answer| {
+                if answer != Ok(1) {
+                    return;
+                }
+                let n = backend.core.clear_history(&peer);
+                while let Some(child) = msg_box.first_child() {
+                    msg_box.remove(&child);
+                }
+                flash(&match n {
+                    0 => "Nothing to clear.".to_string(),
+                    1 => "Cleared 1 message from this machine.".to_string(),
+                    n => format!("Cleared {n} messages from this machine."),
+                });
+            });
+        });
     }
 
     // ---- verify dialog --------------------------------------------------

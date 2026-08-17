@@ -345,6 +345,17 @@ impl Core {
         lantern_crypto::safety_words(&lantern_crypto::fingerprint_of(id))
     }
 
+    /// Delete our local copy of a conversation, returning how many messages
+    /// went. Purely local: nothing is sent, and the peer keeps their copy —
+    /// any UI offering this must say so rather than implying a recall.
+    pub fn clear_history(&self, id: &[u8; 32]) -> usize {
+        self.store
+            .lock()
+            .unwrap()
+            .clear_messages(id)
+            .unwrap_or(0)
+    }
+
     /// Mark a peer verified after an out-of-band safety-word comparison.
     pub fn set_verified(&self, id: &[u8; 32], verified: bool) {
         let _ = self.store.lock().unwrap().set_verified(id, verified);
