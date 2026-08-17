@@ -105,11 +105,34 @@ undo them:
 box), not just a build target — engine, CLI, doctor and the GTK app all
 build and run there.
 
-**Next, in order:** (1) GitHub Actions CI → .dmg / .deb / Windows .exe —
-closes the Windows gap; (2) Phase 4 core depth (FTS search, durable offline
-queue); (3) shell parity screens (transfer center, log viewer, palette —
-DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start with a packet
-capture session).
+**Windows now builds** (18 Aug 2026). Two ways, both without a Windows
+machine in the loop:
+
+- `bash packaging/make-windows.sh` cross-compiles from the Mac or the Ubuntu
+  box (`x86_64-pc-windows-gnu` + mingw-w64) → `dist/lantern-windows-x64.zip`.
+  52 s, clean, first try — nothing in the engine is platform-bound: `ring`
+  and bundled SQLite both build under mingw, and the interface is a browser.
+- `.github/workflows/build.yml` builds it natively on `windows-latest` and
+  uploads `lantern-windows` as an artifact on every push to main; a `v*` tag
+  additionally drafts a release with the zip attached, which is the only form
+  a person can download without a GitHub login. **Untested on real Windows**
+  as of writing — it compiles and packages, nobody has double-clicked it yet.
+
+What ships is the engine plus the localhost interface behind
+`Start-Lantern.cmd`; there is no native Windows window (DESIGN §5.3 keeps
+WinUI as future work), and the README in the zip says so rather than
+implying one.
+
+That CI matrix also closes a hole this project keeps falling into: a Mac
+session cannot compile `apps/linux-native`, a Linux session cannot compile
+the SwiftUI shell, so each can ship a shell it never built. CI compiles all
+three, plus clippy and the full test run per platform.
+
+**Next, in order:** (1) test the Windows zip on a real Windows machine, then
+`.dmg`/`.deb` jobs in the same workflow; (2) Phase 4 core depth (FTS search,
+durable offline queue); (3) shell parity screens (transfer center, log
+viewer, palette — DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start
+with a packet capture session).
 
 **GTK shell, still to do** (18 Aug — two agents converged on this file the
 same day; the Linux-built version won, and these are what it doesn't have
