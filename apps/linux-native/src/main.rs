@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gtk4 as gtk;
+use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -29,6 +30,9 @@ struct UiState {
     selected: Option<[u8; 32]>,
     /// xid -> status label of the file row, so events can update it.
     file_rows: HashMap<String, gtk::Label>,
+    /// Unread arrivals per peer. Incremented when something lands for a
+    /// peer that is not on screen; cleared when that peer is selected.
+    unread: HashMap<[u8; 32], u32>,
 }
 
 fn main() -> glib::ExitCode {
@@ -77,6 +81,7 @@ fn main() -> glib::ExitCode {
             broadcast,
             quic_port: 0,
             in_memory_store: false,
+            download_dir: lantern_core::user_download_dir(),
         })
         .await
         .expect("core start");
@@ -100,7 +105,20 @@ fn main() -> glib::ExitCode {
     // Keep the runtime alive for the whole app lifetime.
     std::mem::forget(rt);
 
-    let app = gtk::Application::builder().application_id(APP_ID).build();
+    // GTK applications are single-instance: a second launch hands off to the
+    // first process and exits, which is right when someone clicks the
+    // launcher twice. An explicit LANTERN_DATA_DIR is a different identity
+    // and store, so it gets its own process — that is how two peers are
+    // tested on one machine.
+    let flags = if std::env::var_os("LANTERN_DATA_DIR").is_some() {
+        gio::ApplicationFlags::NON_UNIQUE
+    } else {
+        gio::ApplicationFlags::default()
+    };
+    let app = gtk::Application::builder()
+        .application_id(APP_ID)
+        .flags(flags)
+        .build();
     let event_rx = Rc::new(RefCell::new(Some(event_rx)));
     app.connect_activate(move |app| {
         build_ui(app, Rc::clone(&backend), event_rx.borrow_mut().take());
@@ -114,6 +132,31 @@ fn build_ui(
     event_rx: Option<async_channel::Receiver<CoreEvent>>,
 ) {
     let state = Rc::new(RefCell::new(UiState::default()));
+
+    // ---- style ----------------------------------------------------------
+    // Derived from the theme's own foreground, so the badge and the drop
+    // highlight follow light/dark without hardcoding a colour. Laltain green
+    // stays reserved for the mark (brand guide §04).
+    let css = gtk::CssProvider::new();
+    css.load_from_data(
+        ".lantern-unread { \
+             background-color: alpha(currentColor, 0.16); \
+             border-radius: 999px; \
+             padding: 0 8px; \
+             font-size: 0.85em; \
+             font-weight: bold; \
+         } \
+         .lantern-drop-active { \
+             background-color: alpha(currentColor, 0.06); \
+         }",
+    );
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 
     // ---- widgets --------------------------------------------------------
     let window = gtk::ApplicationWindow::builder()
@@ -260,6 +303,7 @@ fn build_ui(
 
     let refresh_peers = {
         let state = Rc::clone(&state);
+        let backend = Rc::clone(&backend);
         let peer_list = peer_list.clone();
         let empty_label = empty_label.clone();
         move || {
@@ -268,23 +312,56 @@ fn build_ui(
             while let Some(child) = peer_list.first_child() {
                 peer_list.remove(&child);
             }
-            for (id, name, host) in &st.peers {
-                let row = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            // The list is rebuilt wholesale, so note where the selected peer
+            // lands and restore it below — otherwise every beacon that
+            // refreshes the roster would drop the open conversation.
+            let mut selected_at = None;
+            for (i, (id, name, host)) in st.peers.iter().enumerate() {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 row.set_margin_top(6);
                 row.set_margin_bottom(6);
                 row.set_margin_start(10);
-                let n = gtk::Label::new(Some(name));
+                row.set_margin_end(8);
+
+                let text_col = gtk::Box::new(gtk::Orientation::Vertical, 1);
+                text_col.set_hexpand(true);
+                let n = gtk::Label::new(None);
                 n.set_halign(gtk::Align::Start);
-                let verified = lantern_core_is_verified(&state, id);
-                if verified {
+                // The tick means an out-of-band safety-word comparison
+                // happened — never that the transport is merely encrypted.
+                if backend.core.is_verified(id) {
                     n.set_text(&format!("{name} ✓"));
+                    n.set_tooltip_text(Some("Verified — safety words matched"));
+                } else {
+                    n.set_text(name);
                 }
                 let h = gtk::Label::new(Some(host));
                 h.set_halign(gtk::Align::Start);
                 h.add_css_class("dim-label");
-                row.append(&n);
-                row.append(&h);
+                text_col.append(&n);
+                text_col.append(&h);
+                row.append(&text_col);
+
+                if let Some(count) = st.unread.get(id).copied().filter(|c| *c > 0) {
+                    let badge = gtk::Label::new(Some(&count.to_string()));
+                    badge.add_css_class("lantern-unread");
+                    badge.set_valign(gtk::Align::Center);
+                    badge.set_tooltip_text(Some(&format!(
+                        "{count} unread from {name}"
+                    )));
+                    row.append(&badge);
+                }
+
                 peer_list.append(&row);
+                if st.selected == Some(*id) {
+                    selected_at = Some(i as i32);
+                }
+            }
+            drop(st);
+            if let Some(i) = selected_at {
+                if let Some(row) = peer_list.row_at_index(i) {
+                    peer_list.select_row(Some(&row));
+                }
             }
         }
     };
@@ -297,6 +374,7 @@ fn build_ui(
         let verify_btn = verify_btn.clone();
         let msg_list = msg_list.clone();
         let append_text = append_text.clone();
+        let refresh_peers = refresh_peers.clone();
         peer_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             let idx = row.index();
@@ -305,7 +383,23 @@ fn build_ui(
                 st.peers.get(idx as usize).cloned()
             };
             let Some((id, name, _host)) = peer else { return };
-            state.borrow_mut().selected = Some(id);
+            // refresh_peers() restores this selection after every rebuild.
+            // Without this guard each beacon would reload the same history,
+            // flickering the conversation and resetting the scroll.
+            let already_open = state.borrow().selected == Some(id);
+            if already_open {
+                return;
+            }
+            {
+                let mut st = state.borrow_mut();
+                st.selected = Some(id);
+                st.unread.remove(&id);
+            }
+            // Clear the badge on the next loop turn — refresh_peers() rebuilds
+            // the very ListBox currently emitting this signal.
+            {
+                glib::idle_add_local_once(refresh_peers.clone());
+            }
             conv_title.set_text(&name);
             verify_btn.set_sensitive(true);
             while let Some(child) = msg_list.first_child() {
@@ -353,51 +447,106 @@ fn build_ui(
     send_btn.connect_clicked(move |_| do_send());
 
     // ---- send file ------------------------------------------------------
-    {
+    // One path in, one transfer out. The paperclip and the drop target both
+    // go through here so a dropped file behaves exactly like a picked one.
+    let send_path = {
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
-        let window_weak = window.downgrade();
         let append_file = append_file.clone();
-        attach_btn.connect_clicked(move |_| {
+        move |path: std::path::PathBuf| {
             let Some(peer) = state.borrow().selected else {
                 return;
             };
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // Fire and let events update the row (keyed by xid); we don't
+            // know the xid until send_file returns, so the row is appended
+            // once a oneshot hands it back.
+            let core = Arc::clone(&backend.core);
+            let (tx, rx) = async_channel::bounded::<String>(1);
+            backend.rt.spawn(async move {
+                if let Ok(xid) = core.send_file(peer, &path).await {
+                    let _ = tx.send(xid.to_string()).await;
+                }
+            });
+            let append_file = append_file.clone();
+            glib::MainContext::default().spawn_local(async move {
+                if let Ok(xid) = rx.recv().await {
+                    append_file("You", &xid, &name, "sending…");
+                }
+            });
+        }
+    };
+
+    {
+        let state = Rc::clone(&state);
+        let window_weak = window.downgrade();
+        let send_path = send_path.clone();
+        attach_btn.connect_clicked(move |_| {
+            if state.borrow().selected.is_none() {
+                return;
+            }
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
             let dialog = gtk::FileDialog::new();
-            let backend = Rc::clone(&backend);
-            let append_file = append_file.clone();
-            dialog.open(
-                Some(&window),
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let Ok(file) = result else { return };
-                    let Some(path) = file.path() else { return };
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    // Fire and let events update the row (keyed by xid);
-                    // we don't know the xid until send_file returns, so
-                    // use a placeholder row updated via a oneshot.
-                    let core = Arc::clone(&backend.core);
-                    let (tx, rx) = async_channel::bounded::<String>(1);
-                    backend.rt.spawn(async move {
-                        if let Ok(xid) = core.send_file(peer, &path).await {
-                            let _ = tx.send(xid.to_string()).await;
-                        }
-                    });
-                    let append_file = append_file.clone();
-                    let name2 = name.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        if let Ok(xid) = rx.recv().await {
-                            append_file("You", &xid, &name2, "sending…");
-                        }
-                    });
-                },
-            );
+            let send_path = send_path.clone();
+            dialog.open(Some(&window), None::<&gio::Cancellable>, move |result| {
+                let Ok(file) = result else { return };
+                let Some(path) = file.path() else { return };
+                send_path(path);
+            });
         });
+    }
+
+    // ---- drop files onto the conversation --------------------------------
+    // Only a local path can be sent: the core streams from disk, and
+    // invariant 7 forbids the shell fetching anything off the link.
+    {
+        let state = Rc::clone(&state);
+        let send_path = send_path.clone();
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        drop.set_types(&[gdk::FileList::static_type(), gio::File::static_type()]);
+
+        let scroll_enter = msg_scroll.clone();
+        drop.connect_enter(move |_, _, _| {
+            scroll_enter.add_css_class("lantern-drop-active");
+            gdk::DragAction::COPY
+        });
+        let scroll_leave = msg_scroll.clone();
+        drop.connect_leave(move |_| {
+            scroll_leave.remove_css_class("lantern-drop-active");
+        });
+
+        let scroll_drop = msg_scroll.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            scroll_drop.remove_css_class("lantern-drop-active");
+            if state.borrow().selected.is_none() {
+                return false;
+            }
+            // A multi-file drag arrives as one FileList, a single file as
+            // a bare File, depending on the source application.
+            if let Ok(list) = value.get::<gdk::FileList>() {
+                let paths: Vec<_> = list.files().iter().filter_map(|f| f.path()).collect();
+                if paths.is_empty() {
+                    return false;
+                }
+                for path in paths {
+                    send_path(path);
+                }
+                return true;
+            }
+            if let Ok(file) = value.get::<gio::File>() {
+                if let Some(path) = file.path() {
+                    send_path(path);
+                    return true;
+                }
+            }
+            false
+        });
+        msg_scroll.add_controller(drop);
     }
 
     // ---- verify dialog --------------------------------------------------
@@ -475,19 +624,36 @@ fn build_ui(
                         drop(st);
                         refresh_peers();
                     }
-                    CoreEvent::MessageReceived { peer, peer_name, text, .. }
-                        if state.borrow().selected == Some(peer) => {
+                    CoreEvent::MessageReceived { peer, peer_name, text, .. } => {
+                        let open = state.borrow().selected == Some(peer);
+                        if open {
                             append_text(&peer_name, &text);
+                        } else {
+                            *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
+                            refresh_peers();
                         }
-                    CoreEvent::FileOffered { peer, peer_name, xid, name, .. }
-                        if state.borrow().selected == Some(peer) => {
+                    }
+                    CoreEvent::FileOffered { peer, peer_name, xid, name, .. } => {
+                        let open = state.borrow().selected == Some(peer);
+                        if open {
                             append_file(&peer_name, &xid.to_string(), &name, "receiving…");
+                        } else {
+                            *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
+                            refresh_peers();
                         }
-                    CoreEvent::FileReceived { xid, .. } => {
+                    }
+                    CoreEvent::FileReceived { xid, path, .. } => {
                         if let Some(lbl) =
                             state.borrow().file_rows.get(&xid.to_string())
                         {
-                            lbl.set_text("✓ saved to ~/.lantern/downloads");
+                            // Report where it actually went, rather than a
+                            // literal that goes stale the moment the
+                            // download directory is configurable.
+                            let dir = path
+                                .parent()
+                                .map(abbreviate_home)
+                                .unwrap_or_else(|| "the download folder".into());
+                            lbl.set_text(&format!("✓ saved to {dir}"));
                         }
                     }
                     CoreEvent::ChunksSent { xid, sent, total } => {
@@ -526,13 +692,19 @@ fn build_ui(
     window.present();
 }
 
+/// `/home/u/Downloads` → `~/Downloads`, so a status line stays readable.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(std::path::PathBuf::from(home)) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// The core's identity fingerprint (helper — core exposes id bytes).
 fn lantern_crypto_fingerprint(core: &Core) -> [u8; 32] {
     // words_for hashes internally; reuse the identity bytes directly.
     core.identity_id()
-}
-
-fn lantern_core_is_verified(state: &Rc<RefCell<UiState>>, _id: &[u8; 32]) -> bool {
-    let _ = state;
-    false // verified badge refresh arrives with the roster rework
 }

@@ -9,7 +9,7 @@ members = [
     "crates/lantern-core",
     "crates/lantern-cli",
     "crates/lantern-gui",
-    "crates/lantern-gtk",
+    "apps/linux-native",
 ]
 
 [workspace.package]
@@ -44,6 +44,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+if-addrs = "0.15"
+socket2 = { version = "0.5", features = ["all"] }
 
 [profile.release]
 lto = "thin"

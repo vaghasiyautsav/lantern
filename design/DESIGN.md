@@ -351,6 +351,8 @@ Advertised in beacons and in `Hello`, so the protocol can grow without version b
 Fingerprint = BLAKE3-256 of the public key, rendered two ways:
 
 - **Safety words** — 8 words from a 2048-word BIP-39-style list, e.g. `orbit · marina · flatten · cobra · sonnet · drifter · almanac · quill`. Encodes 88 bits, which puts a colliding fingerprint out of reach (2⁸⁸ grinding) while staying short enough to actually read aloud. The list alternates between two 1024-word halves by position, borrowing the PGP Word List's anti-transposition property — swapping two words yields an invalid sequence rather than a plausible one, and reading aloud across a desk is exactly where transposition happens. (Note: the actual PGP Word List is two 256-word lists encoding 8 bits each; this is BIP-39 sizing with PGP's alternation trick.)
+
+> **Correction pending — this paragraph is internally inconsistent.** A 2048-word list split into two 1024-word halves gives 10 bits per position, so eight words encode **80** bits, not 88. Getting 88 requires 4096 words in two 2048-word halves. `lantern_crypto::safety_words` currently implements the 80-bit version while its comments claim 88. See `CLAUDE.md`, open defect 1 — the choice changes every displayed fingerprint, so it is a product decision, not a cleanup.
 - **Emoji grid** — a 4×4 grid derived from the same digest, for at-a-glance visual comparison on two screens.
 
 Verification is a deliberate act: open the peer inspector, compare, tap **Verified**. Verified peers get a subtle badge. Unverified-but-pinned peers work normally — we do not nag — but a **key change** on a previously-seen peer produces a red banner and blocks file transfer until acknowledged.
@@ -393,6 +395,7 @@ Beyond that: no external hostname resolution, no update checker, no telemetry. O
 
 1. **mDNS-SD** (`_lantern._udp.local`) — the modern path. TXT record carries the **full 32-byte identity key** (44 base64 chars, comfortably inside a TXT record — truncating buys nothing and adds a collision surface) plus the QUIC port. Ship our own responder (`mdns-sd`) on **all three** platforms rather than relying on the OS: Windows has had a native mDNS resolver since 10 1703, but coverage is uneven and Windows Firewall blocks inbound 5353 for new apps by default behind a first-run prompt users routinely decline.
 2. **UDP broadcast** — the ipmsg path, kept because mDNS is blocked on plenty of managed networks. Sends to each interface's directed broadcast plus `255.255.255.255`.
+   *Implemented in `lantern-discovery::net`.* The "each interface's directed broadcast" half of this sentence is the load-bearing part and was missing until 17 Aug 2026: `255.255.255.255` alone is emitted on a single routing-table-chosen interface, which on a machine with containers or a VPN is usually not the LAN, and it fails silently. Do not simplify this back.
 3. **IPv6 multicast** — the RFC 3306 unicast-prefix-based group from §2.2, link scope for the local segment and site scope for routed v6.
 4. **Anchors and static peers** — explicit unicast addresses, for cross-subnet and for locked-down networks where nothing broadcasts.
 

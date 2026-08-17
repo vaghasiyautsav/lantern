@@ -74,6 +74,7 @@ install_bin target/release/lantern-gui "$HOME/.lantern/bin/lantern-gui"
 install_bin target/release/lantern "$HOME/.lantern/bin/lantern"
 # The updater itself, so `git pull` isn't the only way to get a newer one.
 install_bin packaging/update.sh "$HOME/.lantern/bin/lantern-update"
+install_bin target/release/lantern-doctor "$HOME/.lantern/bin/lantern-doctor"
 if [ "${BUILD_GTK:-0}" = "1" ] && [ -f target/release/lantern-gtk ]; then
     install_bin target/release/lantern-gtk "$HOME/.lantern/bin/lantern-gtk"
 fi

@@ -194,7 +194,15 @@ impl PartialState {
             };
             target = downloads.join(format!("{stem} ({n}){ext}"));
         }
-        std::fs::rename(&self.data_path, &target)?;
+        // A rename cannot cross a filesystem. The download directory is no
+        // longer guaranteed to sit beside the partial file — it follows the
+        // user's XDG setting, which may be another mount entirely — so fall
+        // back to copy-and-delete rather than failing a transfer that has
+        // already downloaded and verified every chunk.
+        if std::fs::rename(&self.data_path, &target).is_err() {
+            std::fs::copy(&self.data_path, &target)?;
+            std::fs::remove_file(&self.data_path)?;
+        }
         std::fs::remove_file(&self.sidecar_path).ok();
         Ok(target)
     }
@@ -211,6 +219,12 @@ pub struct CoreConfig {
     /// 0 = ephemeral.
     pub quic_port: u16,
     pub in_memory_store: bool,
+    /// Where received files are placed. `None` keeps them inside the data
+    /// directory (`<data_dir>/downloads`), which is what tests and embedders
+    /// want — a test must never write into the real user's Downloads folder.
+    /// Shells pass `user_download_dir()` so files land somewhere a person can
+    /// actually find them.
+    pub download_dir: Option<PathBuf>,
 }
 
 struct PeerInfo {
@@ -332,6 +346,18 @@ impl Core {
         self.transport.local_port()
     }
 
+    /// Where a received file ends up. Shells display this, so it must be the
+    /// same path `finalize` actually writes to — never a guess.
+    pub fn download_dir(&self) -> PathBuf {
+        self.config
+            .download_dir
+            .clone()
+            .unwrap_or_else(|| self.config.data_dir.join("downloads"))
+    }
+
+    /// The roster, with presence. Supersedes the tuple this used to return:
+    /// every shell needs to know whether a peer is reachable, and a tuple had
+    /// nowhere to put that.
     pub async fn peers(&self) -> Vec<PeerView> {
         let inner = self.inner.lock().await;
         let now = Instant::now();
@@ -748,7 +774,7 @@ impl Core {
             let events = self.events.clone();
             let inner = Arc::clone(&self.inner);
             let outbox_for_acks = outbox_tx.clone();
-            let downloads_dir = self.config.data_dir.join("downloads");
+            let downloads_dir = self.download_dir();
             let partial_dir = self.config.data_dir.join("partial");
             tokio::spawn(async move {
                 loop {
@@ -970,7 +996,7 @@ impl Core {
     ) {
         let inner = Arc::clone(&self.inner);
         let events = self.events.clone();
-        let downloads = self.config.data_dir.join("downloads");
+        let downloads = self.download_dir();
         let partial_dir = self.config.data_dir.join("partial");
         tokio::spawn(async move {
             loop {
@@ -1347,6 +1373,70 @@ fn sanitize_filename(name: &str) -> anyhow::Result<String> {
     Ok(base)
 }
 
+/// The user's real Downloads folder, if this machine has one.
+///
+/// Received files used to land in `<data_dir>/downloads`, i.e. inside a
+/// dotfile directory. On Linux that is hidden: the file manager does not show
+/// it, and the person who just accepted a file has no idea where it went.
+///
+/// Linux goes through the XDG user-dirs setting rather than hardcoding
+/// `~/Downloads`, because the folder is localised — a French desktop calls it
+/// `Téléchargements`, and writing to a literal `Downloads` there would quietly
+/// create a second, wrong folder beside the real one. macOS has no such
+/// indirection.
+///
+/// `None` means "no sensible answer" (no `HOME`), and the caller should fall
+/// back to the data directory rather than guessing.
+pub fn user_download_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+
+    if cfg!(target_os = "macos") {
+        return Some(home.join("Downloads"));
+    }
+
+    // An explicit environment override beats the config file.
+    if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR").map(PathBuf::from) {
+        if dir.is_absolute() {
+            return Some(dir);
+        }
+    }
+
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    if let Some(dir) = xdg_download_dir_from(&config_home.join("user-dirs.dirs"), &home) {
+        return Some(dir);
+    }
+
+    Some(home.join("Downloads"))
+}
+
+/// Read `XDG_DOWNLOAD_DIR` out of a `user-dirs.dirs` file, whose lines look
+/// like `XDG_DOWNLOAD_DIR="$HOME/Downloads"`.
+fn xdg_download_dir_from(path: &std::path::Path, home: &std::path::Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(value) = line.strip_prefix("XDG_DOWNLOAD_DIR=") else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        // Paths under home are written "$HOME/Downloads"; anything else is
+        // already absolute.
+        let expanded = match value.strip_prefix("$HOME/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(value),
+        };
+        if expanded.is_absolute() {
+            return Some(expanded);
+        }
+    }
+    None
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -1362,4 +1452,79 @@ fn hostname() -> String {
 fn getrandom(buf: &mut [u8]) {
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(buf);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lantern-xdg-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &std::path::Path, body: &str) -> PathBuf {
+        let path = dir.join("user-dirs.dirs");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn expands_home_relative_entry() {
+        let dir = scratch("home");
+        let file = write(&dir, "XDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n");
+        assert_eq!(
+            xdg_download_dir_from(&file, std::path::Path::new("/home/u")),
+            Some(PathBuf::from("/home/u/Downloads"))
+        );
+    }
+
+    #[test]
+    fn keeps_a_localised_absolute_path() {
+        // The folder is localised, which is the whole reason for reading this
+        // file instead of hardcoding "Downloads".
+        let dir = scratch("l10n");
+        let file = write(&dir, "XDG_DOWNLOAD_DIR=\"/mnt/big/Téléchargements\"\n");
+        assert_eq!(
+            xdg_download_dir_from(&file, std::path::Path::new("/home/u")),
+            Some(PathBuf::from("/mnt/big/Téléchargements"))
+        );
+    }
+
+    #[test]
+    fn ignores_comments_and_other_keys() {
+        let dir = scratch("skip");
+        let file = write(
+            &dir,
+            "# XDG_DOWNLOAD_DIR=\"$HOME/Wrong\"\n\
+             XDG_DESKTOP_DIR=\"$HOME/Desktop\"\n\
+             XDG_DOWNLOAD_DIR=\"$HOME/Right\"\n",
+        );
+        assert_eq!(
+            xdg_download_dir_from(&file, std::path::Path::new("/home/u")),
+            Some(PathBuf::from("/home/u/Right"))
+        );
+    }
+
+    #[test]
+    fn no_entry_means_no_answer() {
+        let dir = scratch("none");
+        let file = write(&dir, "XDG_DESKTOP_DIR=\"$HOME/Desktop\"\n");
+        assert_eq!(
+            xdg_download_dir_from(&file, std::path::Path::new("/home/u")),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_file_means_no_answer() {
+        assert_eq!(
+            xdg_download_dir_from(
+                std::path::Path::new("/nonexistent/user-dirs.dirs"),
+                std::path::Path::new("/home/u")
+            ),
+            None
+        );
+    }
 }

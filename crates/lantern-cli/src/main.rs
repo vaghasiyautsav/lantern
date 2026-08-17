@@ -31,8 +31,10 @@ struct Args {
     /// Comma-separated beacon target ports (for same-host testing).
     #[arg(long, default_value = "3939")]
     targets: String,
-    /// Enable subnet broadcast (real LAN mode).
-    #[arg(long, default_value_t = false)]
+    /// Subnet broadcast. On by default, matching the GUI shells — with it off
+    /// this node is invisible to every other machine and says nothing about it.
+    /// Pass `--broadcast=false` for isolated same-host tests.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     broadcast: bool,
     /// Keep the message log in memory only.
     #[arg(long, default_value_t = false)]
@@ -75,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         broadcast: args.broadcast,
         quic_port: 0,
         in_memory_store: args.ephemeral,
+        download_dir: lantern_core::user_download_dir(),
     })
     .await?;
 
