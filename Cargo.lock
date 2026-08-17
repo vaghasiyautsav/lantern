@@ -1327,6 +1327,7 @@ dependencies = [
  "lantern-proto",
  "lantern-store",
  "lantern-transport",
+ "libc",
  "quinn",
  "rand 0.8.7",
  "thiserror 2.0.20",

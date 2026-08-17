@@ -253,11 +253,10 @@ fn probe_beacon(name: &str, id: [u8; 32], port: u16, seq: u64) -> Beacon {
     }
 }
 
+/// Use the core's, so the doctor names this machine exactly the way the app
+/// announces it. This was a second copy of the same `/etc/hostname` guess
+/// that made every Mac call itself "unknown" — in the one tool whose whole
+/// job is comparing two machines side by side.
 fn host() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "unknown".into())
+    lantern_core::hostname()
 }

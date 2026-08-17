@@ -36,7 +36,7 @@ private, change it in the repo settings and correct this paragraph.
 **Working, tested:** engine — signed-beacon discovery (see the 17 Aug fix
 below — cross-machine discovery was broken until then), identity-pinned
 QUIC/TLS 1.3 sessions, chunked resumable BLAKE3-verified transfer (survives
-kill -9), TOFU trust with safety words, SQLite history. 26 tests, clippy
+kill -9), TOFU trust with safety words, SQLite history. 28 tests, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
@@ -240,6 +240,25 @@ plainly that this is local only and the peer keeps their copy — a "clear"
 that reads like a recall but is not would be the wrong thing to be vague
 about. Neither the SwiftUI shell nor the web GUI has this yet.
 
+### Fixed 18 Aug 2026 — every Mac announced itself as "unknown"
+
+`hostname()` tried `$HOSTNAME`, then `/etc/hostname`. **macOS has neither**:
+there is no `/etc/hostname`, and `HOSTNAME` is a *shell* variable that a GUI
+app launched from Finder never inherits. So it fell through to its last
+resort and every Mac told the whole network its name was the literal string
+"unknown" — which is what every peer then showed in its roster. Linux only
+worked by landing on `/etc/hostname`.
+
+It now asks the kernel via `gethostname(3)`, which is POSIX and answers on
+both platforms, keeping the old sources as fallbacks. The short name is used
+(`Some-MacBook.local` → `Some-MacBook`), matching what Linux reports for the
+same machine.
+
+`lantern-doctor` had **a second copy** of the same guess, so the tool whose
+entire job is comparing two machines would have labelled the Mac "unknown"
+too. It now calls `lantern_core::hostname()`; there is one implementation.
+If you need the host name anywhere else, call that — do not write a third.
+
 **App icon.** A GNOME/Wayland window is matched to its launcher by
 `app_id`, and the icon comes from `<app_id>.desktop`. The app announces
 `local.lantern.gtk` but `install.sh` wrote `lantern.desktop`, so the running
@@ -319,14 +338,7 @@ Lantern is open, that was a guaranteed failure on the common path.
 
 ## Open defects
 
-1. **Every macOS peer shows `host = unknown`.** `hostname()` in
-   `lantern-core` tries `$HOME`-style env (`HOSTNAME`) then `/etc/hostname`.
-   macOS has neither — no `/etc/hostname`, and `HOSTNAME` is not exported to
-   GUI-launched apps — so it falls through to the literal "unknown", which is
-   what every Linux peer then displays for the Mac. Linux only works by
-   landing on `/etc/hostname`. Fix with `gethostname(3)` rather than guessing
-   at env vars and files. Confirmed on a real pair, 17 Aug 2026.
-2. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
+1. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
    position then does `idx % 1024`, discarding the top bit of each group; two
    fingerprints differing only in those 8 bits render identically. DESIGN
    §3.2 is itself inconsistent ("2048-word list … two 1024-word halves" *and*
@@ -334,11 +346,11 @@ Lantern is open, that was a guaranteed failure on the common path.
    one: shrink the claim to 80, or grow the list to 4096 words in two
    2048-word halves. Changes every displayed fingerprint, so it is a product
    decision.
-3. **Wordlist is a procedural CVCV placeholder**, not screened for
+2. **Wordlist is a procedural CVCV placeholder**, not screened for
    near-homophones. DESIGN §3.2 requires a curated list before real use.
-4. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
+3. **Discovery cannot cross a subnet.** Broadcast only; mDNS-SD and anchors
    unimplemented. Two VLANs will never see each other.
-5. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
+4. **No IPv6 discovery** — the RFC 3306 group from §2.2 is designed, absent.
 
 ## Conventions (non-negotiable)
 

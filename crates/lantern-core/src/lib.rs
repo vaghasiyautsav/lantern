@@ -1287,15 +1287,46 @@ fn xdg_download_dir_from(path: &std::path::Path, home: &std::path::Path) -> Opti
     None
 }
 
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
+/// The machine's name, as every other peer will see it in their roster.
+///
+/// This used to try `$HOSTNAME` and then `/etc/hostname`. macOS has neither
+/// — there is no `/etc/hostname`, and `HOSTNAME` is a *shell* variable that
+/// a GUI app launched from Finder never inherits — so every Mac announced
+/// itself as the literal string "unknown", to everybody, forever.
+///
+/// `gethostname(3)` is POSIX and answers on both platforms, so ask the
+/// kernel instead of guessing at files and environment variables. The old
+/// sources stay as fallbacks for anything exotic.
+pub fn hostname() -> String {
+    #[cfg(unix)]
+    {
+        // POSIX allows up to 255 bytes plus the terminator; 256 covers it,
+        // and a truncated answer is still better than "unknown".
+        let mut buf = vec![0u8; 256];
+        // SAFETY: the pointer is valid for `buf.len()` bytes, which is what
+        // we tell gethostname it may write. It may leave the buffer
+        // unterminated on truncation, so the NUL search below is bounded by
+        // the buffer rather than trusting one to be present.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(name) = std::str::from_utf8(&buf[..end]) {
+                let name = name.trim();
+                // Macs on a Bonjour network report "Some-MacBook.local".
+                // The short name is what a person recognises, and it matches
+                // what Linux reports for the same machine.
+                let short = name.split('.').next().unwrap_or(name);
+                if !short.is_empty() {
+                    return short.to_string();
+                }
+            }
+        }
+    }
+    std::fs::read_to_string("/etc/hostname")
         .ok()
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "unknown".into())
 }
 
@@ -1318,6 +1349,17 @@ mod tests {
         let path = dir.join("user-dirs.dirs");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn hostname_is_a_real_name() {
+        let h = hostname();
+        // The bug this guards: macOS fell through every source and shipped
+        // the literal "unknown" to every peer on the network.
+        assert_ne!(h, "unknown", "hostname() fell through to its last resort");
+        assert!(!h.is_empty());
+        assert!(!h.contains('.'), "should be the short name, got {h:?}");
+        assert!(!h.contains('\0'), "NUL leaked out of the C buffer: {h:?}");
     }
 
     #[test]
