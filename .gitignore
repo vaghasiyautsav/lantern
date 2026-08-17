@@ -1,7 +1,9 @@
 /target
+/dist
 *.deb
 *.dmg
 *.tar.gz
+*.zip
 .DS_Save
 .DS_Store
 node_modules/

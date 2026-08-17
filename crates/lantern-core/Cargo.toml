@@ -17,7 +17,11 @@ uuid.workspace = true
 quinn.workspace = true
 hex.workspace = true
 rand.workspace = true
+blake3 = { workspace = true, features = ["mmap", "rayon"] }
 
+# `libc` only — for gethostname(3). Anything else that lands under here stops
+# existing on Windows: blake3 sat at the end of [dependencies] when this
+# section was appended below it, which quietly moved it into the unix-only
+# set and left lantern-core unable to compile for Windows at all.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-blake3 = { workspace = true, features = ["mmap", "rayon"] }

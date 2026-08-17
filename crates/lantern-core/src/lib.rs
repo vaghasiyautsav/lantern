@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lantern_crypto::Identity;
-use lantern_discovery::{now_ms, Discovered, Discovery, DiscoveryConfig};
+use lantern_discovery::{now_ms, Discovered, Discovery, DiscoveryConfig, OFFLINE_AFTER};
 use lantern_proto::{
     read_frame, write_frame, Beacon, BeaconType, ControlFrame, DeviceClass, PresenceState,
 };
@@ -18,9 +18,17 @@ use lantern_store::{Store, StoredMessage};
 use lantern_transport::{peer_identity, Transport};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
+
+mod rate;
+pub mod update;
+
+use rate::RateMeter;
 
 pub use lantern_crypto::{safety_words, short_hex};
+/// Used throughout this crate, and re-exported because shells handle message
+/// and transfer ids constantly — no reason for each to depend on `uuid` just
+/// to name the type.
+pub use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
@@ -40,6 +48,7 @@ pub enum CoreEvent {
         mid: Uuid,
         text: String,
         ts: u64,
+        reply_to: Option<Uuid>,
     },
     MessageDelivered {
         mid: Uuid,
@@ -71,18 +80,32 @@ pub enum CoreEvent {
     /// Sender-side stats after streaming: how many chunks the peer actually
     /// needed. `sent < total` is a resume in action.
     ChunksSent { xid: Uuid, sent: u32, total: u32 },
-    /// Live progress, emitted once per chunk in both directions. `bytes` of
-    /// `total` of the file are in place — on a resume that starts partway up,
-    /// because chunks already held count toward it.
+    /// Live progress in both directions. `bytes` of `total` of the file are in
+    /// place — on a resume that starts partway up, because chunks already held
+    /// count toward it.
     ///
-    /// Deliberately carries no rate: a shell knows when it painted the last
-    /// frame and the core does not, so the shell divides. Anything else
-    /// reports a speed that lags whatever the user is actually looking at.
+    /// Clock-paced (about five a second), not once per chunk: a 150 MB/s LAN
+    /// transfer moves 150 chunks a second, and no interface needs 150 frames
+    /// to show one bar moving.
+    ///
+    /// The rate is measured here rather than left to each shell to divide for
+    /// itself. Not because a shell couldn't, but because doing it well is the
+    /// whole problem — a raw delta between two 1 MiB bursts swings by an order
+    /// of magnitude, so `rate` smooths it and reports nothing at all until a
+    /// measurement window has closed. Four shells dividing badly in four
+    /// different ways is worse than one place doing it properly; a shell that
+    /// wants its own figure still has `bytes` and its own clock.
     TransferProgress {
         xid: Uuid,
+        /// True when we're the sender.
         outgoing: bool,
         bytes: u64,
         total: u64,
+        /// Smoothed bytes per second — None until it's been measurable for
+        /// long enough to state without lying (see `rate`).
+        bps: Option<u64>,
+        /// Seconds left at the current rate, when that can be said at all.
+        eta_s: Option<u64>,
     },
 }
 
@@ -220,6 +243,26 @@ struct PeerInfo {
     host: String,
     /// ip from the beacon's source, port from the beacon's `port` field.
     quic_addr: SocketAddr,
+    /// When the most recent signed beacon from this identity arrived.
+    /// Drives presence: an entry is kept forever (so history and trust
+    /// survive), but goes offline once the beacons stop.
+    last_beacon: Instant,
+}
+
+/// A roster entry as the shells see it. Identity-keyed, so a peer that
+/// changes IP is still the same peer (DESIGN §4.1).
+pub struct PeerView {
+    pub id: [u8; 32],
+    pub name: String,
+    pub host: String,
+    pub quic_addr: SocketAddr,
+    /// Age of the last beacon. `None` when the peer was learned some other
+    /// way than a beacon (an inbound connection, say).
+    pub since_beacon: Option<Duration>,
+    /// False once three heartbeats have passed with no beacon (DESIGN §4.2).
+    /// Sending to an offline peer will time out, so shells should say so
+    /// up front rather than let the user watch a spinner.
+    pub online: bool,
 }
 
 #[derive(Clone)]
@@ -326,12 +369,26 @@ impl Core {
             .unwrap_or_else(|| self.config.data_dir.join("downloads"))
     }
 
-    pub async fn peers(&self) -> Vec<([u8; 32], String, String, SocketAddr)> {
+    /// The roster, with presence. Supersedes the tuple this used to return:
+    /// every shell needs to know whether a peer is reachable, and a tuple had
+    /// nowhere to put that.
+    pub async fn peers(&self) -> Vec<PeerView> {
         let inner = self.inner.lock().await;
+        let now = Instant::now();
         inner
             .roster
             .iter()
-            .map(|(id, p)| (*id, p.name.clone(), p.host.clone(), p.quic_addr))
+            .map(|(id, p)| {
+                let age = now.saturating_duration_since(p.last_beacon);
+                PeerView {
+                    id: *id,
+                    name: p.name.clone(),
+                    host: p.host.clone(),
+                    quic_addr: p.quic_addr,
+                    since_beacon: Some(age),
+                    online: age < OFFLINE_AFTER,
+                }
+            })
             .collect()
     }
 
@@ -343,20 +400,58 @@ impl Core {
             .unwrap_or_default()
     }
 
-    /// Safety words for any identity — what you read aloud to compare.
-    pub fn words_for(id: &[u8; 32]) -> Vec<&'static str> {
-        lantern_crypto::safety_words(&lantern_crypto::fingerprint_of(id))
-    }
-
-    /// Delete our local copy of a conversation, returning how many messages
-    /// went. Purely local: nothing is sent, and the peer keeps their copy —
-    /// any UI offering this must say so rather than implying a recall.
-    pub fn clear_history(&self, id: &[u8; 32]) -> usize {
+    /// Delete one message from this machine's history. Returns whether a
+    /// message with that id was there to delete.
+    ///
+    /// Local only: nothing goes on the wire, and the other machine keeps its
+    /// copy. Shells must say that plainly rather than implying both sides.
+    pub fn delete_message(&self, mid: &Uuid) -> bool {
         self.store
             .lock()
             .unwrap()
-            .clear_messages(id)
+            .delete_message(mid)
+            .unwrap_or(false)
+    }
+
+    /// Delete the whole conversation with `peer` from this machine's history,
+    /// returning how many messages went. Purely local: nothing is sent, and
+    /// the peer keeps their copy — any UI offering this must say so rather
+    /// than implying a recall. Trust and the peer's name survive; see
+    /// `Store::clear_history`.
+    pub fn clear_history(&self, peer: &[u8; 32]) -> usize {
+        self.store
+            .lock()
+            .unwrap()
+            .clear_history(peer)
             .unwrap_or(0)
+    }
+
+    /// Where identity, history and update bookkeeping live.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.config.data_dir
+    }
+
+    /// Is there a newer Lantern on GitHub, and can this copy take it?
+    pub async fn check_update(&self) -> update::UpdateCheck {
+        update::check().await
+    }
+
+    /// Start the detached updater. An `Err` here is a reason to show someone,
+    /// not an internal failure — see `update::start`.
+    pub fn start_update(&self) -> Result<(), String> {
+        update::start(&self.config.data_dir)
+    }
+
+    /// What the last update attempt did, if there was one. Read on launch:
+    /// the app quits partway through its own update, so this is how it finds
+    /// out how the update it started went.
+    pub fn last_update_state(&self) -> Option<update::UpdateState> {
+        update::last_state(&self.config.data_dir)
+    }
+
+    /// Safety words for any identity — what you read aloud to compare.
+    pub fn words_for(id: &[u8; 32]) -> Vec<&'static str> {
+        lantern_crypto::safety_words(&lantern_crypto::fingerprint_of(id))
     }
 
     /// Mark a peer verified after an out-of-band safety-word comparison.
@@ -411,6 +506,19 @@ impl Core {
 
     /// Send a text message; establishes the session on demand.
     pub async fn send_message(&self, peer: [u8; 32], text: &str) -> anyhow::Result<Uuid> {
+        self.send_reply(peer, text, None).await
+    }
+
+    /// Send `text`, optionally as an answer to `reply_to`. The reference is
+    /// carried on the wire (`ControlFrame::Msg.reply_to`) and stored on both
+    /// ends, so a reply survives restarts and reads the same in history as
+    /// it did live.
+    pub async fn send_reply(
+        &self,
+        peer: [u8; 32],
+        text: &str,
+        reply_to: Option<Uuid>,
+    ) -> anyhow::Result<Uuid> {
         let mid = Uuid::new_v4();
         let ts = now_ms();
         let frame = ControlFrame::Msg {
@@ -418,7 +526,7 @@ impl Core {
             ts,
             text: text.to_string(),
             fmt: "plain".into(),
-            reply_to: None,
+            reply_to,
             sealed: false,
             receipt: false,
         };
@@ -430,6 +538,7 @@ impl Core {
             ts,
             text: text.to_string(),
             state: 0,
+            reply_to,
         })?;
 
         let session = self.ensure_session(peer).await?;
@@ -513,18 +622,63 @@ impl Core {
             .await
             .map_err(|_| anyhow::anyhow!("session closed"))?;
 
+        // The offer is away, so the xid is real and the caller can have it
+        // now. Everything after this — the peer's need-list, the streaming,
+        // the progress — belongs to the event stream, because a shell that
+        // only learns the xid once the bytes have all moved can't show a
+        // transfer in flight at all. Failures past this point arrive as
+        // `FileSent { ok: false }` rather than as a return value.
+        let events = self.events.clone();
+        let inner = Arc::clone(&self.inner);
+        let path = path.to_path_buf();
+        tokio::spawn(async move {
+            let outcome =
+                Self::stream_offered_file(&events, &inner, session, xid, &path, size, total, rx)
+                    .await;
+            if let Err(e) = outcome {
+                let _ = events
+                    .send(CoreEvent::FileSent {
+                        xid,
+                        ok: false,
+                        err: Some(e.to_string()),
+                    })
+                    .await;
+            }
+        });
+        Ok(xid)
+    }
+
+    /// The back half of `send_file`: wait for the need-list, then stream the
+    /// chunks the peer actually asked for, reporting speed as they go.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_offered_file(
+        events: &mpsc::Sender<CoreEvent>,
+        inner: &Arc<Mutex<Inner>>,
+        session: SessionHandle,
+        xid: Uuid,
+        path: &std::path::Path,
+        size: u64,
+        total: u32,
+        rx: tokio::sync::oneshot::Receiver<Result<Vec<u32>, String>>,
+    ) -> anyhow::Result<()> {
         // Wait for the need-list (or decline).
         let need = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(Ok(need))) => need,
             Ok(Ok(Err(reason))) => anyhow::bail!("peer declined: {reason}"),
             Ok(Err(_)) => anyhow::bail!("session dropped before accept"),
             Err(_) => {
-                self.inner.lock().await.accept_waiters.remove(&xid);
+                inner.lock().await.accept_waiters.remove(&xid);
                 anyhow::bail!("peer did not answer the offer");
             }
         };
 
+        // Said before the bytes move, not after: "only 3 of 180 chunks
+        // needed" is context for the progress that follows it.
         let sent = need.len() as u32;
+        let _ = events
+            .send(CoreEvent::ChunksSent { xid, sent, total })
+            .await;
+
         if !need.is_empty() {
             let mut uni = session.conn.open_uni().await?;
             let mut file = tokio::fs::File::open(path).await?;
@@ -535,6 +689,10 @@ impl Core {
             let already = (total as u64).saturating_sub(need.len() as u64)
                 * CHUNK_SIZE as u64;
             let mut moved = 0u64;
+            // Fed `moved`, not `already + moved`: the head start didn't happen
+            // now, and counting it as this second's traffic would open with a
+            // fantasy speed.
+            let mut meter = RateMeter::new(Instant::now());
             for idx in &need {
                 if *idx >= total {
                     continue; // hostile need-list; skip out-of-range
@@ -548,23 +706,37 @@ impl Core {
                 uni.write_all(&(len as u32).to_be_bytes()).await?;
                 uni.write_all(&buf[..len]).await?;
                 moved += len as u64;
-                let _ = self
-                    .events
-                    .send(CoreEvent::TransferProgress {
-                        xid,
-                        outgoing: true,
-                        bytes: (already + moved).min(size),
-                        total: size,
-                    })
-                    .await;
+                // The meter decides when there's something worth saying, so
+                // a 150 MB/s transfer emits ~5 events a second, not 150.
+                if meter.sample(moved, Instant::now()) {
+                    let bytes = (already + moved).min(size);
+                    let _ = events
+                        .send(CoreEvent::TransferProgress {
+                            xid,
+                            outgoing: true,
+                            bytes,
+                            total: size,
+                            bps: meter.bps(),
+                            eta_s: meter.eta_s(size.saturating_sub(bytes)),
+                        })
+                        .await;
+                }
             }
             uni.finish()?;
+            // Always land on 100%: without this a transfer that finishes
+            // mid-window stops at "38 of 40 MB" and looks stuck.
+            let _ = events
+                .send(CoreEvent::TransferProgress {
+                    xid,
+                    outgoing: true,
+                    bytes: (already + moved).min(size),
+                    total: size,
+                    bps: meter.bps(),
+                    eta_s: Some(0),
+                })
+                .await;
         }
-        let _ = self
-            .events
-            .send(CoreEvent::ChunksSent { xid, sent, total })
-            .await;
-        Ok(xid)
+        Ok(())
     }
 
     async fn ensure_session(&self, peer: [u8; 32]) -> anyhow::Result<SessionHandle> {
@@ -642,7 +814,7 @@ impl Core {
                         }
                     };
                     match frame {
-                        ControlFrame::Msg { mid, ts, text, .. } => {
+                        ControlFrame::Msg { mid, ts, text, reply_to, .. } => {
                             let peer_name = {
                                 let g = inner.lock().await;
                                 g.roster
@@ -657,6 +829,7 @@ impl Core {
                                 ts,
                                 text: text.clone(),
                                 state: 1,
+                                reply_to,
                             });
                             let _ = outbox_for_acks
                                 .send(ControlFrame::Ack {
@@ -672,6 +845,7 @@ impl Core {
                                     mid,
                                     text,
                                     ts,
+                                    reply_to,
                                 })
                                 .await;
                         }
@@ -866,6 +1040,10 @@ impl Core {
                 tokio::spawn(async move {
                     let mut header = [0u8; 24];
                     let mut buf = vec![0u8; CHUNK_SIZE as usize];
+                    // One stream carries one transfer's chunks, so a single
+                    // meter per stream measures exactly this transfer.
+                    let mut meter = RateMeter::new(Instant::now());
+                    let mut stream_bytes = 0u64;
                     loop {
                         // Read one record header (clean EOF between records
                         // ends the stream).
@@ -942,17 +1120,32 @@ impl Core {
 
                         // Verified bytes, not received bytes: a chunk that
                         // failed its hash never lands, so progress can only
-                        // move on data that is actually good.
-                        let _ = events
-                            .send(CoreEvent::TransferProgress {
-                                xid,
-                                outgoing: false,
-                                bytes: (verified_count as u64 * m.chunk_size as u64).min(m.size),
-                                total: m.size,
-                            })
-                            .await;
+                        // move on data that is actually good. Measured against
+                        // the whole file, so a resumed transfer reads "60 of
+                        // 100 MB" rather than restarting the bar at nothing.
+                        stream_bytes += len as u64;
+                        let have = (verified_count as u64 * m.chunk_size as u64).min(m.size);
+                        let complete = verified_count as u32 == m.chunk_count();
+                        // The rate comes from what this stream moved; `have`
+                        // includes chunks from an earlier attempt.
+                        if meter.sample(stream_bytes, Instant::now()) || complete {
+                            let _ = events
+                                .send(CoreEvent::TransferProgress {
+                                    xid,
+                                    outgoing: false,
+                                    bytes: have,
+                                    total: m.size,
+                                    bps: meter.bps(),
+                                    eta_s: if complete {
+                                        Some(0)
+                                    } else {
+                                        meter.eta_s(m.size.saturating_sub(have))
+                                    },
+                                })
+                                .await;
+                        }
 
-                        if verified_count as u32 == m.chunk_count() {
+                        if complete {
                             // Complete: finalize off the async path.
                             inner.lock().await.pending_offers.remove(&xid);
                             let fin = {
@@ -1017,6 +1210,7 @@ impl Core {
                             name: beacon.name.clone(),
                             host: beacon.host.clone(),
                             quic_addr,
+                            last_beacon: Instant::now(),
                         },
                     );
                     is_new
@@ -1156,11 +1350,21 @@ impl Core {
                             // Learn/refresh the roster entry from the session.
                             {
                                 let mut inner = core.inner.lock().await;
-                                inner.roster.entry(cert_id).or_insert(PeerInfo {
-                                    name: name.clone(),
-                                    host: host.clone(),
-                                    quic_addr: conn.remote_address(),
-                                });
+                                // A live inbound session is better proof of
+                                // presence than a beacon, so it refreshes the
+                                // clock — but not `quic_addr`: the remote
+                                // address here is their ephemeral source
+                                // port, not the port they listen on.
+                                inner
+                                    .roster
+                                    .entry(cert_id)
+                                    .and_modify(|p| p.last_beacon = Instant::now())
+                                    .or_insert(PeerInfo {
+                                        name: name.clone(),
+                                        host: host.clone(),
+                                        quic_addr: conn.remote_address(),
+                                        last_beacon: Instant::now(),
+                                    });
                             }
                             let _ = core
                                 .store
@@ -1273,6 +1477,12 @@ pub fn user_download_dir() -> Option<PathBuf> {
 
 /// Read `XDG_DOWNLOAD_DIR` out of a `user-dirs.dirs` file, whose lines look
 /// like `XDG_DOWNLOAD_DIR="$HOME/Downloads"`.
+///
+/// Only the non-Windows path calls this — Windows names that folder itself,
+/// so compiling it there is dead code and a warning. The parsing tests are
+/// worth running wherever they compile, hence `test` rather than a blanket
+/// `allow(dead_code)`.
+#[cfg(any(not(windows), test))]
 fn xdg_download_dir_from(path: &std::path::Path, home: &std::path::Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(path).ok()?;
     for line in text.lines() {

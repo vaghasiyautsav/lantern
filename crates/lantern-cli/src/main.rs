@@ -7,6 +7,7 @@
 //!     --discovery-port 4001 --targets 4001,4002
 //! ```
 //! Commands on stdin: /peers · /msg <name-prefix> <text> · /refresh ·
+//! /clear <name-prefix> (delete this machine's history with them) ·
 //! /whoami · /quit
 
 use std::io::Write as _;
@@ -137,9 +138,6 @@ async fn main() -> anyhow::Result<()> {
                         println!("✓ received {name} ({}) → {}", human_size(size), path.display());
                     }
                 }
-                // Per-chunk and far too noisy for a terminal log; the CLI
-                // reports the summary lines instead.
-                CoreEvent::TransferProgress { .. } => {}
                 CoreEvent::ChunksSent { xid, sent, total } => {
                     if script {
                         println!("EVENT chunks-sent {xid} {sent} {total}");
@@ -147,6 +145,36 @@ async fn main() -> anyhow::Result<()> {
                         println!("  ↻ resume: peer needed only {sent} of {total} chunks");
                     } else {
                         println!("  streaming {total} chunks…");
+                    }
+                }
+                CoreEvent::TransferProgress { xid, outgoing, bytes, total, bps, eta_s } => {
+                    if script {
+                        println!(
+                            "EVENT progress {xid} {} {bytes} {total} {}",
+                            if outgoing { "out" } else { "in" },
+                            bps.unwrap_or(0)
+                        );
+                    } else {
+                        // One line that rewrites itself: a terminal watching a
+                        // 2 GB transfer shouldn't scroll a thousand lines.
+                        print!(
+                            "\r  {} {} / {}{}{}   ",
+                            if outgoing { "↑" } else { "↓" },
+                            human_size(bytes),
+                            human_size(total),
+                            bps.map(|b| format!(" · {}/s", human_size(b)))
+                                .unwrap_or_default(),
+                            eta_s
+                                .map(|s| if s == 0 {
+                                    String::new()
+                                } else {
+                                    format!(" · {s}s left")
+                                })
+                                .unwrap_or_default(),
+                        );
+                        if bytes >= total {
+                            println!();
+                        }
                     }
                 }
                 CoreEvent::FileSent { xid, ok, err } => {
@@ -184,16 +212,16 @@ async fn main() -> anyhow::Result<()> {
             let peers = core.peers().await;
             let matched: Vec<_> = peers
                 .iter()
-                .filter(|(_, name, _, _)| name.to_lowercase().starts_with(&target.to_lowercase()))
+                .filter(|p| p.name.to_lowercase().starts_with(&target.to_lowercase()))
                 .collect();
             match matched.as_slice() {
                 [] => println!("no peer matching '{target}'"),
-                [(pid, name, _, _)] => match core.send_message(*pid, text).await {
+                [p] => match core.send_message(p.id, text).await {
                     Ok(mid) => {
                         if args.script {
                             println!("SENT {mid}");
                         } else {
-                            println!("→ {name}: {text}");
+                            println!("→ {}: {text}", p.name);
                         }
                     }
                     Err(e) => println!("send failed: {e}"),
@@ -201,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
                 many => println!(
                     "ambiguous: {}",
                     many.iter()
-                        .map(|(_, n, _, _)| n.as_str())
+                        .map(|p| p.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -246,13 +274,80 @@ async fn main() -> anyhow::Result<()> {
                 }
                 other => other.report(target),
             }
+        } else if let Some(target) = line.strip_prefix("/clear ") {
+            match find_peer(&core, target.trim()).await {
+                FindResult::One(pid, name) => {
+                    // Local only — the peer keeps their copy, and there is no
+                    // undo, so a headless shell states both before it goes.
+                    let n = core.clear_history(&pid);
+                    if args.script {
+                        println!("CLEARED {n}");
+                    } else if n == 0 {
+                        println!("nothing stored for {name} here");
+                    } else {
+                        println!(
+                            "✓ deleted {n} message{} with {name} from this machine \
+                             ({name} keeps their own copy)",
+                            if n == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+                other => other.report(target.trim()),
+            }
+        } else if line == "/update" || line == "/update now" {
+            let check = core.check_update().await;
+            println!("{}", check.summary());
+            for c in &check.commits {
+                println!("  · {c}");
+            }
+            if line == "/update now" {
+                if !check.can_update() {
+                    println!("nothing to install");
+                } else {
+                    match core.start_update() {
+                        // The updater stops the engine and reopens the app, so
+                        // this CLI's own engine is about to go away with it.
+                        Ok(()) => println!(
+                            "updating in the background — watch \
+                             ~/.lantern/update.log; this node will be stopped"
+                        ),
+                        Err(e) => println!("can't update: {e}"),
+                    }
+                }
+            } else if check.can_update() {
+                println!("run /update now to install");
+            }
+        } else if line == "/version" {
+            let b = lantern_core::update::BuildInfo::current();
+            println!("build {} ({})", b.commit, b.date);
+            match b.repo {
+                Some(p) => println!("built from {}", p.display()),
+                None => println!("built without a source checkout"),
+            }
+            if let Some(s) = core.last_update_state() {
+                println!("last update: {} — {}", s.state, s.message);
+            }
         } else if line == "/peers" {
             let peers = core.peers().await;
             if peers.is_empty() {
                 println!("(nobody yet)");
             }
-            for (pid, name, host, addr) in peers {
-                println!("  {} {name} ({host}) {addr}", hex::encode(&pid[..6]));
+            for p in peers {
+                let presence = if p.online {
+                    "online".to_string()
+                } else {
+                    match p.since_beacon {
+                        Some(d) => format!("offline, last seen {}s ago", d.as_secs()),
+                        None => "offline".to_string(),
+                    }
+                };
+                println!(
+                    "  {} {} ({}) {} — {presence}",
+                    hex::encode(&p.id[..6]),
+                    p.name,
+                    p.host,
+                    p.quic_addr
+                );
             }
         } else if line == "/refresh" {
             // Ping, not Hello: a peer only answers a beacon from someone new
@@ -268,7 +363,8 @@ async fn main() -> anyhow::Result<()> {
         } else {
             println!(
                 "commands: /peers · /msg <name> <text> · /send <name> <path> · \
-                 /verify <name> · /trust <name> · /whoami · /quit"
+                 /verify <name> · /trust <name> · /clear <name> · /refresh · \
+                 /whoami · /version · /update [now] · /quit"
             );
         }
     }
@@ -295,12 +391,12 @@ async fn find_peer(core: &Core, prefix: &str) -> FindResult {
     let peers = core.peers().await;
     let matched: Vec<_> = peers
         .iter()
-        .filter(|(_, name, _, _)| name.to_lowercase().starts_with(&prefix.to_lowercase()))
+        .filter(|p| p.name.to_lowercase().starts_with(&prefix.to_lowercase()))
         .collect();
     match matched.as_slice() {
         [] => FindResult::None,
-        [(pid, name, _, _)] => FindResult::One(*pid, name.clone()),
-        many => FindResult::Many(many.iter().map(|(_, n, _, _)| n.clone()).collect()),
+        [p] => FindResult::One(p.id, p.name.clone()),
+        many => FindResult::Many(many.iter().map(|p| p.name.clone()).collect()),
     }
 }
 

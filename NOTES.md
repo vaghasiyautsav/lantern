@@ -31,26 +31,95 @@ endpoints. When it is flipped to private, correct this paragraph.
   Every protocol/architecture decision traces here; §11 logs review fixes.
 - **Brand:** `brand/Lantern-Brand-Guide.html` + `design/icon-philosophy.md`.
 
-## Status (last update: 17 Aug 2026)
+## Two machines, one repo — read before you touch anything
+
+Lantern is built from **both** working copies: this Mac and the Ubuntu box.
+Another agent may be editing the same files right now. On 18 Aug 2026 two
+sessions independently built a refresh button, a clear-conversation flow, a
+transfer-rate readout and an updater the same afternoon; reconciling that
+cost more than the features did. So:
+
+1. **Fetch before you write, not just before you push.**
+   `git fetch origin && git status -sb`. If you are behind, fast-forward
+   first (`git merge --ff-only origin/main`) so you are writing against
+   what's real. Read `git log --oneline HEAD..origin/main` — that list is the
+   other machine telling you what it just did.
+2. **Fetch again immediately before pushing.** If origin moved while you
+   worked, merge it, re-run the gate (`cargo test --workspace --exclude
+   lantern-gtk`, `cargo clippy`, plus the shell you touched), and only then
+   push. A rejected push means somebody else's work is sitting there — never
+   `--force`.
+3. **Prefer your own platform's shell.** A Mac session owns
+   `apps/macos-native`; a Linux session owns `apps/linux-native`. Neither can
+   compile the other's (no GTK4 on macOS, no swiftc on Linux), so a shell
+   edited blind is a guess. If both sides did edit one, **the version that
+   was actually built and run on that platform wins** — that is how the
+   18 Aug collision was settled.
+4. **Put shared behaviour in `lantern-core`, once.** Two shells solving the
+   same problem separately is the collision above in miniature. Core is also
+   the only place both machines can test.
+5. **Commit and push in small pieces.** Every hour of unpushed work raises
+   the odds of a conflict in exactly the file the other agent is in.
+6. **Say what you are mid-way through** in the Status section below before
+   you stop. That is the only channel between the two machines.
+
+## Status (last update: 18 Aug 2026)
 
 **Working, tested:** engine — signed-beacon discovery (see the 17 Aug fix
 below — cross-machine discovery was broken until then), identity-pinned
 QUIC/TLS 1.3 sessions, chunked resumable BLAKE3-verified transfer (survives
-kill -9), TOFU trust with safety words, SQLite history. 28 tests, clippy
+kill -9), TOFU trust with safety words, SQLite history, **presence**
+(`PeerView.online`, offline after 3 missed heartbeats — DESIGN §4.2),
+**history deletion** (per message or whole conversation, local only, WAL
+checkpointed), **live transfer speed + ETA** (`CoreEvent::TransferProgress`,
+`core::rate`), **update from GitHub** (`core::update` +
+`packaging/update.sh`, also the standalone `lantern-update`), **look-again**
+(`BeaconType::Ping` via `core.refresh()` / `POST /api/refresh`, behind a
+refresh button in every shell). 39 tests workspace-wide, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
 `install.sh` (mac+linux), `packaging/make-dmg.sh`, `packaging/make-deb.sh`.
 Icon: the **laltain** (final, user-approved — do NOT redesign unasked).
 
+**Three rules the new features encode** — they cost real debugging, so don't
+undo them:
+
+1. **Deleting is local, and says so.** Wisp has no delete-for-everyone
+   frame. Every string in every shell says "this machine"; none imply the
+   peer's copy goes too. Deletion also checkpoints the WAL — `secure_delete`
+   zeroes the freed page, but `lantern.db-wal` keeps the *old* page image, so
+   without the checkpoint deleted message text is still greppable on disk.
+2. **`send_file` returns as soon as the offer is away**, then streams in a
+   spawned task. It used to return after the last byte, which meant no shell
+   could learn the xid until the transfer was already over — a progress bar
+   was impossible by construction. Failures after the offer arrive as
+   `FileSent { ok: false }`, not as a return value.
+3. **An update never touches uncommitted work.** A dirty checkout is refused
+   with the reason. The updater runs detached (`packaging/update.sh`) because
+   it replaces the binaries the app is running from — Linux refuses to write
+   a busy executable at all — and `install.sh` therefore installs by
+   copy-then-rename and stages `Lantern.app` before swapping it in.
+
 **Linux is now a first-class working copy** (`~/dev/lantern` on the Ubuntu
 box), not just a build target — engine, CLI, doctor and the GTK app all
 build and run there.
 
-**Next, in order:** (1) Phase 4 core depth (FTS search, durable offline
-queue); (2) shell parity screens (transfer center, log viewer, palette —
-DESIGN §5.3); (3) ipmsg compat bridge (Phase 7 — start with a packet
-capture session); (4) a native Windows shell, if the .exe proves useful.
+**Next, in order:** (1) confirm the first green CI run and try the Windows
+zip on a real Windows machine; (2) Phase 4 core depth (FTS search, durable
+offline queue); (3) shell parity screens (transfer center, log viewer,
+palette — DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start with a
+packet capture session); (5) a native Windows shell, if the .exe proves
+useful.
+
+**GTK shell, still to do** (18 Aug — two agents converged on this file the
+same day; the Linux-built version won, and these are what it doesn't have
+yet): **per-message delete** (`core.delete_message`, the macOS ⋯ menu's
+equivalent) and the **update panel** (`core::update` + `check_update` /
+`start_update` / `take_unseen_result`, which reports how the last update
+went — the app that starts one never sees it finish). Everything else is
+there: refresh, clear conversation, live transfer rate. A Mac session cannot
+compile this crate (no GTK4), so write it on Linux or expect a fixup pass.
 
 ## CI — `.github/workflows/ci.yml` (18 Aug 2026)
 
@@ -59,6 +128,11 @@ the clippy invocation only — putting it in `RUSTFLAGS` would fail the build
 on a *dependency's* warning), `linux` → `.deb`, `macos` → `.dmg`, `windows` →
 `.exe`. Tagging `v*` publishes all three to a GitHub release via the
 preinstalled `gh`, so no third-party release action and no extra token.
+
+The matrix also closes a hole this project keeps falling into: a Mac session
+cannot compile `apps/linux-native`, a Linux session cannot compile the
+SwiftUI shell, so either can ship a shell it never built. CI compiles all
+three.
 
 **Windows had never been compiled before this.** There is no native Windows
 shell, so that job builds the engine, CLI, doctor and web interface, and not
@@ -74,9 +148,24 @@ things were fixed to give it a chance:
   `lantern-discovery` cross-checks clean for `x86_64-pc-windows-gnu`.
 
 `rusqlite` is vendored and builds SQLite from source under MSVC, so no
-system SQLite is needed. Whether it links and runs is what the first CI run
-answers — until it is green, "the engine is portable Rust" is a claim, not a
-result.
+system SQLite is needed. Whether it links and runs under MSVC is what the
+first CI run answers.
+
+**It also builds without CI, and did.** `bash packaging/make-windows.sh`
+cross-compiles from this Mac (or the Ubuntu box) with
+`x86_64-pc-windows-gnu` + mingw-w64 and stages
+`dist/lantern-windows-x64.zip` — the three exes, a `Start-Lantern.cmd` that
+launches the engine and opens `localhost:3999`, and a README (CRLF, because
+Notepad renders LF-only text as one line) that says there is no native
+window yet. 52 s, clean, first attempt, on arm64: `ring` and bundled SQLite
+both build under mingw, and the interface is a browser rather than a native
+toolkit. So the gnu target links today; MSVC is what CI still has to prove.
+The CI job ships the same package rather than three bare .exes — without a
+launcher the first thing a person meets is a console that appears to do
+nothing.
+
+**Still untested on real Windows.** It compiles and packages; nobody has
+double-clicked it.
 
 *(GTK app polish — unread badges, verified badge, drag-drop — was item 2 and
 is done; see below.)*
@@ -124,10 +213,21 @@ review. `design/DESIGN.md` §11 has the full reasoning.
    A `Hello` disagreeing with the cert must close the connection.
 6. Beacons go to **every interface's directed broadcast**, not only
    `255.255.255.255`. See `lantern-discovery/src/net.rs`.
-7. Nothing connects off the local link — no update check, no telemetry, no
-   remote resource fetched by the message renderer. Updating is a real need
-   and it is met *outside* the app, by `lantern-update`; see below. Do not
-   answer "how do I ship updates?" by putting a fetch back in the binary.
+7. Nothing connects off the local link **on its own**. No check at launch, no
+   polling, no telemetry, no remote resource fetched by the message renderer.
+   The single exception is an update a person explicitly asks for — by
+   clicking Update and confirming, or by running `lantern-update` — and even
+   then the network step happens in `packaging/update.sh`, not in the app's
+   own code. Nothing schedules that. Do not answer "how do I ship updates?"
+   with a background checker, and do not add a second network path.
+
+**Amended 18 Aug 2026** (owner asked for an in-app updater; original wording
+allowed no update path inside the app at all). What the wording protects is
+unchanged: Lantern must never reveal who is running it, from where, or how
+often, to anyone the user didn't decide to talk to. A fetch that happens only
+when someone clicks a button, in a script the app hands off to, keeps that.
+An automatic one wouldn't — so if a future session is tempted by "just check
+once a day in the background", the answer is still no.
 8. Received paths are normalized and confined to the destination root.
 
 ## Fixed 17 Aug 2026 — LAN discovery never left the machine
@@ -421,3 +521,22 @@ invisible until the others list 3941 in `--targets`/`LANTERN_TARGETS` too.
   `_to_delete/` folder).
 - Ubuntu 22.04 ships GTK 4.6 — too old for `lantern-gtk` (needs 4.10+);
   install.sh detects and falls back gracefully.
+- **SwiftUI: `.fixedSize(horizontal: false, vertical: true)` on a `Text` in
+  the `NavigationSplitView` *detail* pane silently blanks the whole
+  **sidebar** column** — no crash, no log, the data is fine and the detail
+  pane still draws. Cost hours on 17 Aug 2026. Give such text a width
+  (`.frame(maxWidth: .infinity, alignment: .leading)`) or a `lineLimit`
+  instead. If a pane ever renders empty, bisect the *other* pane.
+- `cargo test` at the workspace root fails on macOS because `lantern-gtk`
+  needs pkg-config/GTK. Use `cargo test --workspace --exclude lantern-gtk`.
+
+## Pending: the Windows CI job should ship a package, not three .exes
+
+`packaging/make-windows.sh` stages `Start-Lantern.cmd` and a README beside
+the binaries; the `windows` job in `ci.yml` uploads the bare .exes. Without a
+launcher the first thing a Windows user meets is a console that appears to do
+nothing, so the job should build the same package the script does.
+
+Not done from the Mac: that machine's GitHub token has no `workflow` scope,
+so it cannot push any change under `.github/workflows/`. **Whoever is on the
+Linux box can — do it there**, or grant the Mac's token the scope.
