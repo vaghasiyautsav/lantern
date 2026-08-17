@@ -435,23 +435,52 @@ fn build_ui(
         }
     };
 
-    let scroll_to_bottom = {
+    // Auto-scroll.
+    //
+    // Appending a row does not move the adjustment until GTK has allocated
+    // the new widget, and allocation runs on the frame clock — after any idle
+    // callback we could schedule here. Scrolling from an idle therefore reads
+    // the previous upper bound and stops one message short, which is exactly
+    // the "it doesn't follow my own messages" symptom. The bottom is also
+    // `upper - page_size`, not `upper`.
+    //
+    // So let the adjustment announce when it has grown, and follow only when
+    // the view is already parked at the bottom: someone who scrolled up to
+    // read should not be yanked back down because a message arrived.
+    let stick_bottom = Rc::new(std::cell::Cell::new(true));
+    {
+        let stick = Rc::clone(&stick_bottom);
+        msg_scroll.vadjustment().connect_changed(move |a| {
+            if stick.get() {
+                a.set_value(a.upper() - a.page_size());
+            }
+        });
+    }
+    {
+        let stick = Rc::clone(&stick_bottom);
+        msg_scroll.vadjustment().connect_value_changed(move |a| {
+            // A few pixels of slack — smooth scrolling rarely lands exactly
+            // on the bound, and being one subpixel off must not count as
+            // "the user scrolled away".
+            stick.set(a.value() >= a.upper() - a.page_size() - 8.0);
+        });
+    }
+
+    // Force the view to the newest message. Used when *we* act — sending, or
+    // opening a conversation — where following is always what is wanted.
+    let pin_to_bottom = {
+        let stick = Rc::clone(&stick_bottom);
         let msg_scroll = msg_scroll.clone();
         move || {
-            let adj = msg_scroll.vadjustment();
-            // Two turns: one for the new row to be allocated, one for the
-            // adjustment upper bound to catch up with it.
-            glib::idle_add_local_once(move || {
-                let adj2 = adj.clone();
-                glib::idle_add_local_once(move || adj2.set_value(adj2.upper()));
-            });
+            stick.set(true);
+            let a = msg_scroll.vadjustment();
+            a.set_value(a.upper() - a.page_size());
         }
     };
 
     // One chat row: avatar and bubble, mirrored for our own messages.
     let append_row = {
         let msg_box = msg_box.clone();
-        let scroll_to_bottom = scroll_to_bottom.clone();
         move |outgoing: bool,
               sender: &str,
               key: &str,
@@ -512,7 +541,9 @@ fn build_ui(
             }
 
             msg_box.append(&row);
-            scroll_to_bottom();
+            // No scroll here: the adjustment handler above follows when the
+            // view is at the bottom, and callers that must always follow
+            // (sending, opening a conversation) call pin_to_bottom().
         }
     };
 
@@ -716,6 +747,7 @@ fn build_ui(
         let entry = entry.clone();
         let append_text = append_text.clone();
         let refresh_peers = refresh_peers.clone();
+        let pin_to_bottom = pin_to_bottom.clone();
         peer_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             let idx = row.index();
@@ -781,6 +813,8 @@ fn build_ui(
                     );
                 }
             }
+            // Open a conversation at its newest message, not its oldest.
+            pin_to_bottom();
         });
     }
 
@@ -798,6 +832,7 @@ fn build_ui(
         let entry = entry.clone();
         let append_text = append_text.clone();
         let flash = flash.clone();
+        let pin_to_bottom = pin_to_bottom.clone();
         move || {
             let text = entry.text().to_string();
             let text = text.trim().to_string();
@@ -810,6 +845,8 @@ fn build_ui(
             entry.set_text("");
             let now = glib::real_time() as u64 / 1000;
             append_text(true, &backend.my_name, "me-self", now, Some(false), &text);
+            // Sending always follows, even if we were reading history.
+            pin_to_bottom();
             let core = Arc::clone(&backend.core);
             let (tx, rx) = async_channel::bounded::<Option<String>>(1);
             backend.rt.spawn(async move {
@@ -865,6 +902,7 @@ fn build_ui(
             });
             let append_file = append_file.clone();
             let flash = flash.clone();
+            let pin_to_bottom = pin_to_bottom.clone();
             let my_name = backend.my_name.clone();
             glib::MainContext::default().spawn_local(async move {
                 match rx.recv().await {
@@ -873,6 +911,7 @@ fn build_ui(
                         append_file(
                             true, &my_name, "me-self", now, &xid, &name, size, "sending…",
                         );
+                        pin_to_bottom();
                     }
                     Ok(Err(e)) => flash(&format!("Couldn't send {name} — {e}")),
                     Err(_) => {}
