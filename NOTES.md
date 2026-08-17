@@ -1,10 +1,8 @@
 # Lantern — Agent Notes
 
-Read this first. It is the shared brief for every agent (and human) working
-on this project, on any machine. Keep it current: when you finish meaningful
-work, update the **Status** section here and, if your session is attached to
-the "IP Messanger" Claude project, also update `claude/lantern-build-status.md`
-there.
+Read this first. It is the shared brief for anyone working on this project,
+on any machine. Keep it current: when you finish meaningful work, update the
+**Status** section here.
 
 ## What this is
 
@@ -14,12 +12,16 @@ cloud. Rust engine, native shells per platform. Personal, educational
 project. Inspired by IP Messenger (ipmsg.org); reimplements the idea, not
 the code.
 
-**The GitHub repo is public.** This brief used to say "private, never
-published"; checked on 17 Aug 2026, the GitHub API reports
-`"visibility": "public"`, and it clones anonymously. Treat everything
-committed here as world-readable: no host names, no LAN addresses, no
-tokens, no captures with real endpoints in them. If it was meant to be
-private, change it in the repo settings and correct this paragraph.
+**Personal, educational, not for public use or distribution.** It is not a
+product, it is not supported, and it is not meant to be handed to anyone as
+something to rely on.
+
+**But the GitHub repo is still public**, and intent is not a setting.
+Checked again on 18 Aug 2026, the API reports `"visibility": "public"` and
+it clones anonymously. Until that is changed in the repo settings — which
+only the owner can do — treat everything committed here as world-readable:
+no host names, no LAN addresses, no tokens, no packet captures with real
+endpoints. When it is flipped to private, correct this paragraph.
 
 ## Where things live
 
@@ -28,8 +30,6 @@ private, change it in the repo settings and correct this paragraph.
 - **Design doc:** `design/DESIGN.md` — architecture + Wisp protocol spec.
   Every protocol/architecture decision traces here; §11 logs review fixes.
 - **Brand:** `brand/Lantern-Brand-Guide.html` + `design/icon-philosophy.md`.
-- Claude project docs (cloud sessions): `claude/lantern-design.md`,
-  `claude/lantern-build-status.md`.
 
 ## Two machines, one repo — read before you touch anything
 
@@ -123,7 +123,7 @@ compile this crate (no GTK4), so write it on Linux or expect a fixup pass.
 
 ## CI — `.github/workflows/ci.yml` (18 Aug 2026)
 
-Four jobs: `check` (test + clippy, the CLAUDE.md bar, with `-D warnings` on
+Four jobs: `check` (test + clippy, the bar above, with `-D warnings` on
 the clippy invocation only — putting it in `RUSTFLAGS` would fail the build
 on a *dependency's* warning), `linux` → `.deb`, `macos` → `.dmg`, `windows` →
 `.exe`. Tagging `v*` publishes all three to a GitHub release via the
@@ -479,8 +479,8 @@ Lantern is open, that was a guaranteed failure on the common path.
 
 ## Conventions (non-negotiable)
 
-- **Commits:** author is Utsav Vaghasiya <admin@upplus.com.au>. **No Claude
-  co-author trailers** — owner's explicit requirement for this repo.
+- **Commits:** author is Utsav Vaghasiya <admin@upplus.com.au>. **No
+  co-author trailers of any kind** — owner's explicit requirement.
 - **Quality bar:** `cargo test` green and `cargo clippy` clean before any
   commit. Parsers never panic on hostile input.
 - **Honesty in UX copy:** plain language, limits stated (see brand guide §06).
@@ -512,9 +512,9 @@ invisible until the others list 3941 in `--targets`/`LANTERN_TARGETS` too.
 
 ## Environment gotchas (learned the hard way)
 
-- **Cloud Claude sessions cannot push to this repo** — the git/API proxy is
-  bound to a configured repo set (403 regardless of credentials). Flow:
-  commit in the cloud workspace → `git bundle` → user's machine → push.
+- **Some sandboxed environments cannot push to this repo** — their git/API
+  proxy is bound to a configured repo set and returns 403 regardless of
+  credentials. Flow: commit there → `git bundle` → a machine that can push.
 - **Desktop-bridge VM** (device_bash) has git but **no network**; `git`
   operations directly on mounted folders hit lock errors (clone in VM $HOME,
   `cp -a` to the mount); `rm` is not permitted on mounts (use `mv` to a
