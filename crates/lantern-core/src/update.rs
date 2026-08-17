@@ -150,18 +150,36 @@ pub fn check_blocking() -> UpdateCheck {
         .unwrap_or_default()
         .is_empty();
 
+    // Whatever this branch actually tracks — never an assumed `origin/main`.
+    // A work branch that exists only on this machine has no upstream at all,
+    // and saying so beats the raw "couldn't find remote ref" git offers.
+    let upstream = match git(&repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    {
+        Ok(u) => u,
+        Err(_) => {
+            return blocked(
+                build,
+                format!(
+                    "You're on branch {branch}, which isn't tracking anything on \
+                     GitHub — so there's nothing to update from. Lantern updates \
+                     the branch it was built from; switch to main and check again."
+                ),
+            )
+        }
+    };
+    let remote = upstream.split('/').next().unwrap_or("origin").to_string();
+
     // The fetch is the only step that needs the network — and for a private
     // repo, credentials. A GUI-launched engine may not have the ssh agent or
     // keychain helper its owner's terminal has, so the git error is passed
     // through verbatim rather than flattened to "check failed".
-    if let Err(e) = git(&repo, &["fetch", "--quiet", "origin", &branch]) {
+    if let Err(e) = git(&repo, &["fetch", "--quiet", &remote]) {
         return blocked(
             build,
             format!("Couldn't reach GitHub: {e}\nLantern didn't change anything."),
         );
     }
 
-    let upstream = format!("origin/{branch}");
     let range = format!("HEAD..{upstream}");
     let behind = git(&repo, &["rev-list", "--count", &range])
         .ok()

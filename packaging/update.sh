@@ -72,6 +72,15 @@ fi
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
 BEFORE="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+# Update whatever this branch tracks, not an assumed origin/main — and refuse
+# outright on a branch that exists only on this machine, rather than fetching
+# a ref that was never pushed.
+UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [ -z "$UPSTREAM" ]; then
+    fail start "Branch $BRANCH isn't tracking anything on GitHub, so there's nothing to update from. Switch to main and try again."
+fi
+REMOTE="${UPSTREAM%%/*}"
+
 # 2. Wait for the app to let go of its binaries ----------------------------
 # The app quits itself right after asking for this; give it a moment, then
 # stop the engine so the install step can replace it. Killing it here is safe:
@@ -88,14 +97,14 @@ CLOSED=1
 sleep 1
 
 # 3. Fetch and fast-forward ------------------------------------------------
-say running fetch "Fetching $BRANCH from GitHub"
-if ! OUT="$(git fetch origin "$BRANCH" 2>&1)"; then
+say running fetch "Fetching $UPSTREAM from GitHub"
+if ! OUT="$(git fetch "$REMOTE" 2>&1)"; then
     fail fetch "Couldn't reach GitHub: $OUT"
 fi
 echo "$OUT"
 
-say running merge "Fast-forwarding to origin/$BRANCH"
-if ! OUT="$(git merge --ff-only "origin/$BRANCH" 2>&1)"; then
+say running merge "Fast-forwarding to $UPSTREAM"
+if ! OUT="$(git merge --ff-only "$UPSTREAM" 2>&1)"; then
     fail merge "Couldn't fast-forward: $OUT — the branch has diverged; sort it out by hand."
 fi
 echo "$OUT"
