@@ -142,6 +142,8 @@ body{
   <div class="app-name">Lantern<span>.</span></div>
   <div class="me" id="me-line" title="Click for your safety words">…</div>
   <div class="spacer"></div>
+  <button class="vbtn" id="update-btn"
+    title="Check GitHub for a newer Lantern">Check for updates</button>
   <span class="lock">🔒 End-to-end encrypted · LAN only</span>
 </div>
 <div class="banner" id="banner"></div>
@@ -166,6 +168,8 @@ body{
       </div>
       <div class="spacer"></div>
       <button class="vbtn" id="verify-btn">Verify identity</button>
+      <button class="vbtn" id="clear-btn"
+        title="Delete this conversation from this machine">Clear chat</button>
     </div>
     <div class="thread" id="thread">
       <div class="placeholder" id="placeholder">
@@ -218,6 +222,19 @@ body{
   </div>
 </div>
 
+<div class="overlay" id="update-overlay">
+  <div class="modal">
+    <h2>Lantern updates</h2>
+    <p id="um-build">Checking this build…</p>
+    <p id="um-body">Asking GitHub…</p>
+    <div class="words" id="um-commits" style="display:none"></div>
+    <div class="mrow">
+      <button class="vbtn" onclick="hideUpdate()">Close</button>
+      <button class="send" id="um-apply" style="display:none">Update and reopen</button>
+    </div>
+  </div>
+</div>
+
 <div class="dropzone" id="dropzone"><div>Drop to send</div></div>
 
 <script>
@@ -238,6 +255,15 @@ const fmtSize = b => { const u=['B','KB','MB','GB']; let i=0,v=b;
 const esc = s => { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; };
 
 async function api(path, opts){ const r = await fetch(path, opts); return r.json(); }
+
+/* "12.0 MB of 40.0 MB · 8.4 MB/s · 3 s left" — speed and ETA are dropped
+   rather than guessed when the engine can't measure them yet. */
+function progressLine(ev){
+  const parts = [`${fmtSize(ev.done)} of ${fmtSize(ev.total)}`];
+  if(ev.bps) parts.push(fmtSize(ev.bps)+'/s');
+  if(ev.eta_s) parts.push(ev.eta_s+' s left');
+  return parts.join(' · ');
+}
 
 async function boot(){
   ME = await api('/api/me');
@@ -420,6 +446,14 @@ function handleEvent(ev){
       $('xfer-line').textContent = '';
       break;
     }
+    case 'progress': {
+      // Only ever updates a card that's already on screen — progress for a
+      // conversation you're not looking at must not conjure one here.
+      const card = document.querySelector(`.fcard[data-xid="${ev.xid}"]`);
+      const sub = card && card.querySelector('[data-fsub]');
+      if(sub) sub.textContent = progressLine(ev);
+      break;
+    }
     case 'chunks-sent': {
       const f = FILES[ev.xid];
       if(f && ev.sent < ev.total)
@@ -451,8 +485,60 @@ $('verify-btn').onclick = () => {
   $('verify-overlay').classList.add('show');
 };
 function hideVerify(){ $('verify-overlay').classList.remove('show'); }
+
+/* clear chat — local only, and it says so, because Wisp has no
+   "delete for everyone": the other machine keeps its own history. */
+$('clear-btn').onclick = async () => {
+  if(!CURRENT) return;
+  const p = PEERS.find(x=>x.id===CURRENT);
+  const who = p ? p.name : 'this peer';
+  if(!confirm(`Delete every message with ${who} from this machine?\n\n`
+    + `This can't be undone. ${who} keeps their own copy, and files already `
+    + `sent or received stay on disk.`)) return;
+  const r = await api('/api/history/'+CURRENT, {method:'DELETE'});
+  const n = r.deleted || 0;
+  $('thread').innerHTML = '';
+  UNREAD[CURRENT] = 0; renderRoster();
+  banner(n ? `Deleted ${n} message${n===1?'':'s'} from this machine. `
+             + `${who} still has their copy.`
+           : `Nothing was stored for ${who} — already empty here.`);
+};
 $('me-line').onclick = () => $('me-overlay').classList.add('show');
 function hideMe(){ $('me-overlay').classList.remove('show'); }
+
+/* updates — the same engine endpoints the native shells use. Updating
+   rebuilds from source on this machine and restarts the engine, so this page
+   loses its connection partway through and reconnects on its own. */
+function hideUpdate(){ $('update-overlay').classList.remove('show'); }
+
+$('update-btn').onclick = async () => {
+  $('update-overlay').classList.add('show');
+  $('um-commits').style.display = 'none';
+  $('um-apply').style.display = 'none';
+  $('um-body').textContent = 'Asking GitHub…';
+  const v = await api('/api/version');
+  $('um-build').textContent = `Build ${v.commit} · ${v.date}`
+    + (v.repo ? ` · built from ${v.repo}` : '');
+  const c = await api('/api/update/check', {method:'POST'});
+  if(c.blocked){ $('um-body').textContent = '⚠ ' + c.blocked; return; }
+  if(!c.behind){ $('um-body').textContent = `Up to date — nothing new on ${c.branch}.`; return; }
+  $('um-body').textContent = `${c.behind} new commit${c.behind===1?'':'s'} `
+    + `on ${c.branch}. Updating rebuilds Lantern from source here, so it takes `
+    + `a few minutes. Your identity, history and verified peers are untouched.`;
+  $('um-commits').style.display = 'grid';
+  $('um-commits').innerHTML = c.commits.map(l=>`<span>${esc(l)}</span>`).join('');
+  if(c.can_update) $('um-apply').style.display = 'inline-block';
+};
+
+$('um-apply').onclick = async () => {
+  const r = await api('/api/update/apply', {method:'POST'});
+  if(!r.started){ $('um-body').textContent = '⚠ ' + (r.error||'could not start'); return; }
+  $('um-commits').style.display = 'none';
+  $('um-apply').style.display = 'none';
+  $('um-body').textContent = 'Updating. Lantern is rebuilding itself and will '
+    + 'restart — this page goes quiet for a few minutes, then reconnects. '
+    + 'Progress is in ~/.lantern/update.log.';
+};
 
 /* composer */
 $('input').addEventListener('keydown', e=>{

@@ -17,6 +17,11 @@ use tracing::{debug, warn};
 
 pub const HEARTBEAT: Duration = Duration::from_secs(45);
 
+/// A peer is offline once three heartbeats have passed with no beacon
+/// (DESIGN §4.2). Three, not one, so a single dropped broadcast — routine
+/// on congested Wi-Fi — doesn't flap someone offline mid-conversation.
+pub const OFFLINE_AFTER: Duration = Duration::from_secs(135);
+
 #[derive(Debug, Clone)]
 pub struct Discovered {
     pub beacon: Beacon,

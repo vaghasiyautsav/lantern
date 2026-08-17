@@ -28,8 +28,9 @@ idea, not the code.
 
 **Working, tested:** engine — signed-beacon discovery, identity-pinned
 QUIC/TLS 1.3 sessions, chunked resumable BLAKE3-verified transfer (survives
-kill -9), TOFU trust with safety words, SQLite history. 16 tests, clippy
-clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
+kill -9), TOFU trust with safety words, SQLite history, **presence**
+(`PeerView.online`, offline after 3 missed heartbeats — DESIGN §4.2). 16
+tests, clippy clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`crates/lantern-gtk`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
 `install.sh` (mac+linux), `packaging/make-dmg.sh`, `packaging/make-deb.sh`.
@@ -74,3 +75,11 @@ lantern-gui --name Second --data-dir ~/.lantern2 \
   `_to_delete/` folder).
 - Ubuntu 22.04 ships GTK 4.6 — too old for `lantern-gtk` (needs 4.10+);
   install.sh detects and falls back gracefully.
+- **SwiftUI: `.fixedSize(horizontal: false, vertical: true)` on a `Text` in
+  the `NavigationSplitView` *detail* pane silently blanks the whole
+  **sidebar** column** — no crash, no log, the data is fine and the detail
+  pane still draws. Cost hours on 17 Aug 2026. Give such text a width
+  (`.frame(maxWidth: .infinity, alignment: .leading)`) or a `lineLimit`
+  instead. If a pane ever renders empty, bisect the *other* pane.
+- `cargo test` at the workspace root fails on macOS because `lantern-gtk`
+  needs pkg-config/GTK. Use `cargo test --workspace --exclude lantern-gtk`.

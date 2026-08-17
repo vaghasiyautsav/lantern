@@ -13,15 +13,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ws::WebSocketUpgrade, Path as AxPath, Query, State},
+    extract::{ws::WebSocketUpgrade, DefaultBodyLimit, Path as AxPath, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use clap::Parser;
 use lantern_core::{Core, CoreConfig, CoreEvent};
 use serde::Deserialize;
+use uuid::Uuid;
 use serde_json::json;
 use tokio::sync::broadcast;
 
@@ -116,11 +117,25 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/api/me", get(me))
         .route("/api/peers", get(peers))
-        .route("/api/history/{id}", get(history))
+        .route("/api/history/{id}", get(history).delete(clear_history))
+        .route("/api/message/{mid}", delete(delete_message))
         .route("/api/msg", post(send_msg))
-        .route("/api/file", post(send_file))
+        // Axum caps request bodies at 2 MB by default, which quietly turned
+        // every browser file send over that size into a 413 — a file-transfer
+        // app that can't send a 3 MB photo from its own window. The body is
+        // buffered in memory here, so the cap is raised rather than removed;
+        // the native shells avoid the copy entirely via /api/filepath.
+        .route(
+            "/api/file",
+            post(send_file).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         .route("/api/filepath", post(send_filepath))
         .route("/api/trust", post(trust))
+        .route("/api/version", get(version))
+        // A check fetches from GitHub — a side effect, so it's a POST.
+        .route("/api/update/check", post(update_check))
+        .route("/api/update/apply", post(update_apply))
+        .route("/api/update/state", get(update_state))
         .route("/ws", get(ws_upgrade))
         .with_state(app);
 
@@ -141,9 +156,10 @@ fn event_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::SessionEstablished { id } => {
             json!({ "type": "session", "id": hex::encode(id) })
         }
-        CoreEvent::MessageReceived { peer, peer_name, mid, text, ts } => json!({
+        CoreEvent::MessageReceived { peer, peer_name, mid, text, ts, reply_to } => json!({
             "type": "msg", "peer": hex::encode(peer), "peer_name": peer_name,
-            "mid": mid.to_string(), "text": text, "ts": ts
+            "mid": mid.to_string(), "text": text, "ts": ts,
+            "reply_to": reply_to.map(|r| r.to_string())
         }),
         CoreEvent::MessageDelivered { mid } => {
             json!({ "type": "delivered", "mid": mid.to_string() })
@@ -165,6 +181,10 @@ fn event_json(ev: &CoreEvent) -> serde_json::Value {
         }),
         CoreEvent::ChunksSent { xid, sent, total } => json!({
             "type": "chunks-sent", "xid": xid.to_string(), "sent": sent, "total": total
+        }),
+        CoreEvent::TransferProgress { xid, outgoing, done, total, bps, eta_s } => json!({
+            "type": "progress", "xid": xid.to_string(), "outgoing": outgoing,
+            "done": done, "total": total, "bps": bps, "eta_s": eta_s
         }),
     }
 }
@@ -188,14 +208,16 @@ async fn peers(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
     let peers = app.core.peers().await;
     let list: Vec<_> = peers
         .into_iter()
-        .map(|(id, name, host, addr)| {
+        .map(|p| {
             json!({
-                "id": hex::encode(id),
-                "name": name,
-                "host": host,
-                "addr": addr.to_string(),
-                "verified": app.core.is_verified(&id),
-                "words": Core::words_for(&id),
+                "id": hex::encode(p.id),
+                "name": p.name,
+                "host": p.host,
+                "addr": p.quic_addr.to_string(),
+                "verified": app.core.is_verified(&p.id),
+                "words": Core::words_for(&p.id),
+                "online": p.online,
+                "since_beacon_s": p.since_beacon.map(|d| d.as_secs()),
             })
         })
         .collect();
@@ -225,16 +247,44 @@ async fn history(
                 "ts": m.ts,
                 "text": m.text,
                 "state": m.state,
+                "reply_to": m.reply_to.map(|r| r.to_string()),
             })
         })
         .collect();
     Json(json!(msgs)).into_response()
 }
 
+/// Delete this machine's copy of a whole conversation. Nothing is sent to the
+/// peer — their history is theirs — so the response reports only what went
+/// from here, and the shell's wording has to match that.
+async fn clear_history(
+    State(app): State<Arc<App>>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let Some(pid) = parse_id(&id) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad id"}))).into_response();
+    };
+    Json(json!({"deleted": app.core.clear_history(&pid)})).into_response()
+}
+
+/// Delete one message from this machine's copy of the history.
+async fn delete_message(
+    State(app): State<Arc<App>>,
+    AxPath(mid): AxPath<String>,
+) -> impl IntoResponse {
+    let Ok(mid) = Uuid::parse_str(&mid) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad mid"}))).into_response();
+    };
+    Json(json!({"deleted": app.core.delete_message(&mid)})).into_response()
+}
+
 #[derive(Deserialize)]
 struct MsgReq {
     peer: String,
     text: String,
+    /// Optional mid this message answers.
+    #[serde(default)]
+    reply_to: Option<String>,
 }
 
 async fn send_msg(
@@ -244,7 +294,10 @@ async fn send_msg(
     let Some(pid) = parse_id(&req.peer) else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad id"}))).into_response();
     };
-    match app.core.send_message(pid, &req.text).await {
+    // An unparseable reply_to is dropped rather than rejected: the message
+    // itself is still worth sending.
+    let reply_to = req.reply_to.as_deref().and_then(|r| Uuid::parse_str(r).ok());
+    match app.core.send_reply(pid, &req.text, reply_to).await {
         Ok(mid) => Json(json!({"mid": mid.to_string()})).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -353,6 +406,68 @@ async fn trust(
     };
     app.core.set_verified(&pid, true);
     Json(json!({"ok": true})).into_response()
+}
+
+/// What this copy was built from, plus how the last update went. Cheap and
+/// side-effect free — the shells show it in an About/Updates panel.
+async fn version(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let b = lantern_core::update::BuildInfo::current();
+    Json(json!({
+        "commit": b.commit,
+        "date": b.date,
+        "repo": b.repo.map(|p| p.display().to_string()),
+        "last_update": app.core.last_update_state().map(state_json),
+    }))
+}
+
+fn state_json(s: lantern_core::update::UpdateState) -> serde_json::Value {
+    json!({
+        "state": s.state, "step": s.step, "message": s.message,
+        "commit": s.commit, "started": s.started,
+    })
+}
+
+async fn update_check(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let c = app.core.check_update().await;
+    Json(json!({
+        "commit": c.build.commit,
+        "date": c.build.date,
+        "branch": c.branch,
+        "behind": c.behind,
+        "commits": c.commits,
+        "dirty": c.dirty,
+        "blocked": c.blocked,
+        "can_update": c.can_update(),
+        "summary": c.summary(),
+    }))
+}
+
+/// Start the update. The engine is about to be replaced and restarted by the
+/// script it spawns, so the answer says what will happen rather than what
+/// happened — nothing here can report the outcome, and pretending it could
+/// would be the lie. Shells read `/api/update/state` (or the state file)
+/// afterwards.
+async fn update_apply(State(app): State<Arc<App>>) -> impl IntoResponse {
+    match app.core.start_update() {
+        Ok(()) => Json(json!({
+            "started": true,
+            "note": "Lantern will close, rebuild itself, and reopen. \
+                     Progress is in ~/.lantern/update.log."
+        }))
+        .into_response(),
+        Err(reason) => (
+            StatusCode::CONFLICT,
+            Json(json!({"started": false, "error": reason})),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_state(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    Json(match app.core.last_update_state() {
+        Some(s) => state_json(s),
+        None => json!(null),
+    })
 }
 
 async fn ws_upgrade(
