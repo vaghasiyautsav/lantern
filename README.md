@@ -9,7 +9,7 @@ aloud.
 Educational project, local use only. Inspired by (not copied from) IP
 Messenger (ipmsg.org).
 
-- `CLAUDE.md` — start here: status, crate map, invariants, open defects.
+- `NOTES.md` — start here: status, crate map, invariants, open defects.
 - `design/DESIGN.md` — the design document and why the protocol is shaped
   this way.
 

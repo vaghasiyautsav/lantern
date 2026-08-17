@@ -1,7 +1,7 @@
 name: CI
 
 # Builds the three platform artifacts and enforces the quality bar from
-# CLAUDE.md: cargo test green, cargo clippy clean.
+# NOTES.md: cargo test green, cargo clippy clean.
 #
 # The Windows job is the interesting one. Nobody has ever built Lantern for
 # Windows — there is no native Windows shell, so it builds the engine, the
@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev
       - run: cargo test --workspace
-      # CLAUDE.md's bar is "clippy clean", so a warning is a failure.
+      # NOTES.md's bar is "clippy clean", so a warning is a failure.
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   linux:
