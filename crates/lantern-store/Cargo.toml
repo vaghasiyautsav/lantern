@@ -1,0 +1,10 @@
+[package]
+name = "lantern-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+hex.workspace = true

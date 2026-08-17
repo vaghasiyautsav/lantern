@@ -1,0 +1,17 @@
+[package]
+name = "lantern-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lantern-proto.workspace = true
+lantern-crypto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+rustls-pki-types.workspace = true
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+x509-parser = "0.16"

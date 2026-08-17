@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lantern-proto",
+    "crates/lantern-crypto",
+    "crates/lantern-discovery",
+    "crates/lantern-transport",
+    "crates/lantern-store",
+    "crates/lantern-core",
+    "crates/lantern-cli",
+    "crates/lantern-gui",
+    "crates/lantern-gtk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+lantern-proto = { path = "crates/lantern-proto" }
+lantern-crypto = { path = "crates/lantern-crypto" }
+lantern-discovery = { path = "crates/lantern-discovery" }
+lantern-transport = { path = "crates/lantern-transport" }
+lantern-store = { path = "crates/lantern-store" }
+lantern-core = { path = "crates/lantern-core" }
+
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+blake3 = "1"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rustls-pki-types = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+
+[profile.release]
+lto = "thin"

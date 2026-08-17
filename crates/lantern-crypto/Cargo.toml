@@ -1,0 +1,11 @@
+[package]
+name = "lantern-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+rand.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+hex.workspace = true

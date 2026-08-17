@@ -1,0 +1,12 @@
+[package]
+name = "lantern-discovery"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lantern-proto.workspace = true
+lantern-crypto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true

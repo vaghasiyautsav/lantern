@@ -1,0 +1,7 @@
+/target
+*.deb
+*.dmg
+*.tar.gz
+.DS_Save
+.DS_Store
+node_modules/

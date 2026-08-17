@@ -1,0 +1,16 @@
+[package]
+name = "lantern-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["io-util"] }
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

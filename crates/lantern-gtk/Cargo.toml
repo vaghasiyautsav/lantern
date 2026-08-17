@@ -1,0 +1,17 @@
+[package]
+name = "lantern-gtk"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lantern-gtk"
+path = "src/main.rs"
+
+[dependencies]
+lantern-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+tracing-subscriber.workspace = true
+gtk4 = { version = "0.9", features = ["v4_10"] }
+async-channel = "2"

@@ -1,0 +1,17 @@
+[package]
+name = "lantern-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lantern"
+path = "src/main.rs"
+
+[dependencies]
+lantern-core.workspace = true
+lantern-crypto.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true

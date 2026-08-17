@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lantern</title>
+<style>
+:root{
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px;
+  --r-sm:6px; --r-md:10px; --r-full:999px;
+  --surface:#f7f8fa; --surface-raised:#ffffff; --surface-sunken:#eef0f4;
+  --border:#dde1e8; --text-1:#141821; --text-2:#5b6472; --text-3:#8a93a3;
+  --accent:#3b6ef5; --accent-soft:#e8eefe;
+  --success:#1a9c62; --warning:#c07a10; --danger:#d0342c;
+  --shadow-1:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.10);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --surface:#16181d; --surface-raised:#1e2127; --surface-sunken:#101216;
+    --border:#2c313a; --text-1:#eef1f6; --text-2:#a2abba; --text-3:#6f7887;
+    --accent:#7d9dff; --accent-soft:#1e2a4d;
+    --success:#3ecf8e; --warning:#e0a33a; --danger:#f0665e;
+    --shadow-1:0 1px 2px rgba(0,0,0,.4);
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  background:var(--surface); color:var(--text-1); display:flex; flex-direction:column;
+  -webkit-font-smoothing:antialiased; overflow:hidden;
+}
+.titlebar{
+  height:48px; flex:0 0 auto; display:flex; align-items:center; gap:var(--s3);
+  padding:0 var(--s4); border-bottom:1px solid var(--border); background:var(--surface-raised);
+}
+.app-name{font-weight:650;letter-spacing:-.01em}
+.app-name span{color:var(--accent)}
+.me{font-size:12.5px;color:var(--text-3);cursor:pointer}
+.me:hover{color:var(--text-1)}
+.spacer{flex:1}
+.lock{font-size:12px;color:var(--success);font-weight:600}
+.main{flex:1;display:grid;grid-template-columns:270px 1fr;min-height:0}
+/* roster */
+.roster{border-right:1px solid var(--border);background:var(--surface-raised);
+  display:flex;flex-direction:column;min-height:0}
+.sect{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--text-3);padding:var(--s4) var(--s4) var(--s1)}
+.rlist{overflow-y:auto;flex:1;padding:0 var(--s2) var(--s3)}
+.peer{display:grid;grid-template-columns:36px 1fr auto;gap:var(--s2);align-items:center;
+  padding:8px var(--s2);border-radius:var(--r-sm);cursor:pointer}
+.peer:hover{background:var(--surface-sunken)}
+.peer.active{background:var(--accent-soft)}
+.av{position:relative;width:36px;height:36px;border-radius:var(--r-full);
+  display:grid;place-items:center;font-weight:600;font-size:13px;color:#fff}
+.av::after{content:"";position:absolute;right:-1px;bottom:-1px;width:11px;height:11px;
+  border-radius:var(--r-full);border:2px solid var(--surface-raised);background:var(--success)}
+.pname{font-weight:550;font-size:13.5px;display:flex;gap:5px;align-items:center;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.psub{font-size:11.5px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vbadge{color:var(--success);font-size:12px}
+.badge{min-width:19px;height:19px;padding:0 6px;border-radius:var(--r-full);
+  background:var(--accent);color:#fff;font-size:11px;font-weight:600;
+  display:grid;place-items:center}
+.empty-roster{padding:var(--s5) var(--s4);color:var(--text-3);font-size:13px;line-height:1.6}
+/* conversation */
+.conv{display:flex;flex-direction:column;min-height:0}
+.convbar{height:56px;flex:0 0 auto;display:flex;align-items:center;gap:var(--s3);
+  padding:0 var(--s4);border-bottom:1px solid var(--border);background:var(--surface-raised)}
+.convbar .who{font-weight:600}
+.convbar .sub{font-size:12px;color:var(--text-3)}
+.vbtn{height:28px;padding:0 12px;border:1px solid var(--border);border-radius:var(--r-sm);
+  background:var(--surface);color:var(--text-2);font:inherit;font-size:12.5px;cursor:pointer}
+.vbtn:hover{background:var(--surface-sunken);color:var(--text-1)}
+.vbtn.trusted{color:var(--success);border-color:var(--success)}
+.thread{flex:1;overflow-y:auto;padding:var(--s5)}
+.placeholder{height:100%;display:grid;place-items:center;color:var(--text-3);
+  text-align:center;line-height:1.7;font-size:13.5px}
+.msg{display:grid;grid-template-columns:36px 1fr;gap:var(--s3);margin-bottom:var(--s4)}
+.mhead{display:flex;align-items:baseline;gap:var(--s2);margin-bottom:2px}
+.mhead .n{font-weight:600;font-size:13.5px}
+.mhead .t{font-size:11.5px;color:var(--text-3)}
+.mtext{font-size:14px;white-space:pre-wrap;word-break:break-word}
+.ticks{font-size:11px;color:var(--accent);margin-left:4px}
+.ticks.pending{color:var(--text-3)}
+.fcard{margin-top:var(--s2);max-width:420px;background:var(--surface-raised);
+  border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s3);
+  display:flex;gap:var(--s3);align-items:center;box-shadow:var(--shadow-1)}
+.ficon{width:38px;height:38px;border-radius:var(--r-sm);display:grid;place-items:center;
+  background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:10px;flex:0 0 auto}
+.fname{font-weight:550;font-size:13px;word-break:break-all}
+.fsub{font-size:11.5px;color:var(--text-3)}
+.fstate{margin-left:auto;font-size:16px;flex:0 0 auto}
+.fstate.done{color:var(--success)}
+/* composer */
+.composer{flex:0 0 auto;padding:var(--s3) var(--s4) var(--s4)}
+.cbox{border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface-raised);
+  box-shadow:var(--shadow-1)}
+.cbox:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.cbox textarea{width:100%;border:0;background:transparent;resize:none;
+  padding:var(--s3) var(--s4) var(--s1);font:inherit;font-size:14px;color:var(--text-1);
+  min-height:44px;max-height:160px;outline:none}
+.cbar{display:flex;align-items:center;gap:var(--s1);padding:var(--s2) var(--s2) var(--s2) var(--s3);
+  border-top:1px solid var(--border)}
+.ibtn{width:30px;height:30px;border:0;border-radius:var(--r-sm);background:transparent;
+  color:var(--text-2);cursor:pointer;display:grid;place-items:center;font-size:15px}
+.ibtn:hover{background:var(--surface-sunken);color:var(--text-1)}
+.hint{font-size:11px;color:var(--text-3);margin-right:8px}
+.send{height:30px;padding:0 var(--s4);border:0;border-radius:var(--r-sm);
+  background:var(--accent);color:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.send:disabled{opacity:.4;cursor:default}
+/* status bar + banner */
+.statusbar{height:30px;flex:0 0 auto;border-top:1px solid var(--border);
+  background:var(--surface-raised);display:flex;align-items:center;gap:var(--s4);
+  padding:0 var(--s4);font-size:12px;color:var(--text-2)}
+.banner{display:none;padding:var(--s2) var(--s4);background:#fbf3e2;color:#8a6d3b;
+  font-size:12.5px;border-bottom:1px solid #e0cfa0}
+@media (prefers-color-scheme: dark){.banner{background:#2a2318;color:#d0a95f;border-color:#4a3c1e}}
+.banner.show{display:block}
+/* modal */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);
+  place-items:center;z-index:10}
+.overlay.show{display:grid}
+.modal{width:400px;background:var(--surface-raised);border:1px solid var(--border);
+  border-radius:14px;padding:var(--s5);box-shadow:0 10px 40px rgba(0,0,0,.3)}
+.modal h2{font-size:16px;margin-bottom:var(--s2)}
+.modal p{font-size:13px;color:var(--text-2);margin-bottom:var(--s3);line-height:1.6}
+.words{display:grid;grid-template-columns:1fr 1fr;gap:6px var(--s4);
+  font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--surface-sunken);
+  border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--s4);
+  margin-bottom:var(--s4)}
+.words b{font-weight:650}
+.mrow{display:flex;gap:var(--s2);justify-content:flex-end}
+.dropzone{display:none;position:fixed;inset:12px;border:2px dashed var(--accent);
+  border-radius:14px;background:color-mix(in srgb,var(--accent) 8%,transparent);
+  place-items:center;z-index:20;font-size:16px;font-weight:600;color:var(--accent)}
+.dropzone.show{display:grid}
+</style>
+</head>
+<body>
+<div class="titlebar">
+  <div class="app-name">Lantern<span>.</span></div>
+  <div class="me" id="me-line" title="Click for your safety words">…</div>
+  <div class="spacer"></div>
+  <span class="lock">🔒 End-to-end encrypted · LAN only</span>
+</div>
+<div class="banner" id="banner"></div>
+<div class="main">
+  <aside class="roster">
+    <div class="sect">On this network</div>
+    <div class="rlist" id="rlist">
+      <div class="empty-roster" id="empty-roster">
+        Nobody else yet.<br><br>
+        Open Lantern on another machine on this network — or run a second
+        instance on this one — and they'll appear here automatically.
+        No accounts, no server.
+      </div>
+    </div>
+  </aside>
+  <main class="conv">
+    <div class="convbar" id="convbar" style="display:none">
+      <div class="av" id="conv-av" style="background:#6b5ce7"></div>
+      <div>
+        <div class="who" id="conv-name"></div>
+        <div class="sub" id="conv-sub"></div>
+      </div>
+      <div class="spacer"></div>
+      <button class="vbtn" id="verify-btn">Verify identity</button>
+    </div>
+    <div class="thread" id="thread">
+      <div class="placeholder" id="placeholder">
+        <div>Select someone on the left to start.<br>
+        Messages and files go straight to their machine — nothing in between.</div>
+      </div>
+    </div>
+    <div class="composer" id="composer" style="display:none">
+      <div class="cbox">
+        <textarea id="input" placeholder="Message…  (drop a file anywhere to send it)" rows="1"></textarea>
+        <div class="cbar">
+          <button class="ibtn" id="attach" title="Send a file">📎</button>
+          <input type="file" id="file-input" hidden>
+          <div class="spacer"></div>
+          <span class="hint">⏎ send · ⇧⏎ newline</span>
+          <button class="send" id="send-btn">Send</button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="statusbar">
+  <span id="peer-count">0 peers</span>
+  <span id="net-line"></span>
+  <div class="spacer"></div>
+  <span id="xfer-line"></span>
+</div>
+
+<div class="overlay" id="verify-overlay">
+  <div class="modal">
+    <h2 id="vm-title">Verify identity</h2>
+    <p>Read these words aloud to each other (call, or across the room).
+       If they match what <b id="vm-name"></b> sees for themselves, this
+       connection cannot be an impostor's.</p>
+    <div class="words" id="vm-words"></div>
+    <div class="mrow">
+      <button class="vbtn" onclick="hideVerify()">Close</button>
+      <button class="send" id="vm-trust">They match — mark verified</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="me-overlay">
+  <div class="modal">
+    <h2>Your identity</h2>
+    <p>These are <b>your</b> safety words. Someone verifying you will read
+       their copy of them — confirm the words match.</p>
+    <div class="words" id="me-words"></div>
+    <div class="mrow"><button class="vbtn" onclick="hideMe()">Close</button></div>
+  </div>
+</div>
+
+<div class="dropzone" id="dropzone"><div>Drop to send</div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const AV_COLORS = ['#6b5ce7','#0f8a72','#c2410c','#7c3aed','#0369a1','#be185d','#b91c1c','#64748b'];
+let ME = null;
+let PEERS = [];           // [{id,name,host,addr,verified,words}]
+let CURRENT = null;       // selected peer id (hex)
+let UNREAD = {};          // id -> count
+let FILES = {};           // xid -> {name,size,dir,state,detail}
+let sending = false;
+
+const avColor = id => AV_COLORS[parseInt(id.slice(0,4),16) % AV_COLORS.length];
+const initials = n => n.split(/\s+/).map(w=>w[0]).join('').slice(0,2).toUpperCase();
+const fmtTime = ts => new Date(ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+const fmtSize = b => { const u=['B','KB','MB','GB']; let i=0,v=b;
+  while(v>=1024&&i<3){v/=1024;i++} return i? v.toFixed(1)+' '+u[i] : b+' B'; };
+const esc = s => { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; };
+
+async function api(path, opts){ const r = await fetch(path, opts); return r.json(); }
+
+async function boot(){
+  ME = await api('/api/me');
+  $('me-line').textContent = ME.name + ' · ' + ME.short + '…';
+  $('me-words').innerHTML = ME.words.map((w,i)=>`<span>${i+1} <b>${w}</b></span>`).join('');
+  $('net-line').textContent = 'discovery active';
+  await refreshPeers();
+  connectWS();
+}
+
+async function refreshPeers(){
+  PEERS = await api('/api/peers');
+  renderRoster();
+}
+
+function renderRoster(){
+  const list = $('rlist');
+  $('empty-roster').style.display = PEERS.length ? 'none' : 'block';
+  list.querySelectorAll('.peer').forEach(e=>e.remove());
+  for(const p of PEERS){
+    const el = document.createElement('div');
+    el.className = 'peer' + (p.id===CURRENT?' active':'');
+    el.onclick = () => select(p.id);
+    const unread = UNREAD[p.id] || 0;
+    el.innerHTML = `
+      <div class="av" style="background:${avColor(p.id)}">${initials(p.name)}</div>
+      <div style="min-width:0">
+        <div class="pname">${esc(p.name)} ${p.verified?'<span class="vbadge" title="Verified">✓</span>':''}</div>
+        <div class="psub">${esc(p.host)} · ${esc(p.addr.split(':')[0])}</div>
+      </div>
+      ${unread?`<div class="badge">${unread}</div>`:''}`;
+    list.appendChild(el);
+  }
+  $('peer-count').textContent = PEERS.length + (PEERS.length===1?' peer':' peers');
+}
+
+async function select(id){
+  CURRENT = id; UNREAD[id] = 0;
+  const p = PEERS.find(x=>x.id===id); if(!p) return;
+  renderRoster();
+  $('convbar').style.display = 'flex';
+  $('composer').style.display = 'block';
+  $('placeholder')?.remove();
+  $('conv-av').style.background = avColor(id);
+  $('conv-av').textContent = initials(p.name);
+  $('conv-name').textContent = p.name;
+  $('conv-sub').textContent = p.host + ' · ' + p.addr;
+  updateVerifyBtn(p);
+  const hist = await api('/api/history/'+id);
+  const t = $('thread'); t.innerHTML = '';
+  for(const m of hist) appendMsg(m.outgoing ? ME.name : p.name,
+      m.outgoing ? 'me' : id, m.text, m.ts, m.mid, m.outgoing, m.state);
+  t.scrollTop = t.scrollHeight;
+  $('input').focus();
+}
+
+function updateVerifyBtn(p){
+  const b = $('verify-btn');
+  b.textContent = p.verified ? '✓ Verified' : 'Verify identity';
+  b.className = 'vbtn' + (p.verified ? ' trusted' : '');
+}
+
+function appendMsg(name, colorKey, text, ts, mid, outgoing, state){
+  const t = $('thread');
+  const el = document.createElement('div');
+  el.className = 'msg'; el.dataset.mid = mid || '';
+  const color = colorKey==='me' ? 'var(--accent)' : avColor(colorKey);
+  const ticks = outgoing
+    ? `<span class="ticks ${state>=1?'':'pending'}" data-ticks>${state>=1?'✓✓':'◷'}</span>` : '';
+  el.innerHTML = `
+    <div class="av" style="background:${color}">${initials(name)}</div>
+    <div style="min-width:0">
+      <div class="mhead"><span class="n">${esc(name)}</span>
+        <span class="t">${fmtTime(ts)}</span>${ticks}</div>
+      <div class="mtext">${esc(text)}</div>
+    </div>`;
+  t.appendChild(el);
+  t.scrollTop = t.scrollHeight;
+  return el;
+}
+
+function appendFileCard(xid, who, colorKey, name, size, state, detail){
+  const t = $('thread');
+  let card = t.querySelector(`[data-xid="${xid}"]`);
+  if(!card){
+    const el = document.createElement('div');
+    el.className = 'msg'; el.dataset.xid = xid;
+    const color = colorKey==='me' ? 'var(--accent)' : avColor(colorKey);
+    el.innerHTML = `
+      <div class="av" style="background:${color}">${initials(who)}</div>
+      <div style="min-width:0">
+        <div class="mhead"><span class="n">${esc(who)}</span>
+          <span class="t">${fmtTime(Date.now())}</span></div>
+        <div class="fcard" data-xid="${xid}">
+          <div class="ficon">FILE</div>
+          <div style="min-width:0">
+            <div class="fname">${esc(name)}</div>
+            <div class="fsub" data-fsub>${fmtSize(size)}</div>
+          </div>
+          <div class="fstate" data-fstate>⏳</div>
+        </div>
+      </div>`;
+    t.appendChild(el);
+    card = el.querySelector('.fcard');
+  }
+  const sub = card.querySelector('[data-fsub]');
+  const st = card.querySelector('[data-fstate]');
+  if(state==='done'){ st.textContent='✓'; st.className='fstate done';
+    if(detail) sub.textContent = fmtSize(size)+' · '+detail; }
+  else if(state==='fail'){ st.textContent='✗'; st.style.color='var(--danger)';
+    sub.textContent = detail || 'failed'; }
+  else { st.textContent='⏳'; if(detail) sub.textContent = fmtSize(size)+' · '+detail; }
+  t.scrollTop = t.scrollHeight;
+}
+
+async function sendCurrent(){
+  const text = $('input').value.trim();
+  if(!text || !CURRENT || sending) return;
+  sending = true; $('send-btn').disabled = true;
+  try{
+    const r = await api('/api/msg', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({peer: CURRENT, text})});
+    if(r.mid){
+      $('input').value = '';
+      appendMsg(ME.name, 'me', text, Date.now(), r.mid, true, 0);
+    } else banner('Send failed: '+(r.error||'unknown'));
+  } finally { sending=false; $('send-btn').disabled=false; $('input').focus(); }
+}
+
+async function sendFile(file){
+  if(!CURRENT) { banner('Pick a peer first, then drop the file.'); return; }
+  const p = PEERS.find(x=>x.id===CURRENT);
+  const r = await fetch(`/api/file?peer=${CURRENT}&name=${encodeURIComponent(file.name)}`,
+    {method:'POST', body: file});
+  const j = await r.json();
+  if(j.xid){
+    FILES[j.xid] = {name:file.name, size:file.size, dir:'out'};
+    appendFileCard(j.xid, ME.name, 'me', file.name, file.size, 'progress', 'sending…');
+  } else banner('File send failed: '+(j.error||'unknown'));
+}
+
+function banner(text){
+  const b = $('banner'); b.textContent = text; b.classList.add('show');
+  clearTimeout(banner._t); banner._t = setTimeout(()=>b.classList.remove('show'), 8000);
+}
+
+function connectWS(){
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = e => handleEvent(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connectWS, 1500);
+}
+
+function handleEvent(ev){
+  switch(ev.type){
+    case 'peer': refreshPeers(); break;
+    case 'msg': {
+      if(ev.peer === CURRENT){
+        appendMsg(ev.peer_name, ev.peer, ev.text, ev.ts, ev.mid, false, 1);
+      } else {
+        UNREAD[ev.peer] = (UNREAD[ev.peer]||0)+1; renderRoster();
+      }
+      break;
+    }
+    case 'delivered': {
+      const el = document.querySelector(`[data-mid="${ev.mid}"] [data-ticks]`);
+      if(el){ el.textContent='✓✓'; el.classList.remove('pending'); }
+      break;
+    }
+    case 'file-offered': {
+      FILES[ev.xid] = {name:ev.name, size:ev.size, dir:'in'};
+      if(ev.peer===CURRENT)
+        appendFileCard(ev.xid, ev.peer_name, ev.peer, ev.name, ev.size, 'progress', 'receiving…');
+      else { UNREAD[ev.peer]=(UNREAD[ev.peer]||0)+1; renderRoster(); }
+      $('xfer-line').textContent = '⇣ receiving '+ev.name;
+      break;
+    }
+    case 'file-received': {
+      appendFileCard(ev.xid, '', ev.peer, ev.name, ev.size, 'done', 'saved to Lantern downloads');
+      $('xfer-line').textContent = '';
+      break;
+    }
+    case 'chunks-sent': {
+      const f = FILES[ev.xid];
+      if(f && ev.sent < ev.total)
+        appendFileCard(ev.xid, ME.name, 'me', f.name, f.size, 'progress',
+          `resume — only ${ev.sent} of ${ev.total} chunks needed`);
+      break;
+    }
+    case 'file-sent': {
+      const f = FILES[ev.xid] || {name:'file', size:0};
+      appendFileCard(ev.xid, ME.name, 'me', f.name, f.size,
+        ev.ok?'done':'fail', ev.ok?'delivered & verified':(ev.err||'refused'));
+      $('xfer-line').textContent = '';
+      break;
+    }
+    case 'trust-warning': banner('⚠ '+ev.detail); break;
+  }
+}
+
+/* verify modal */
+$('verify-btn').onclick = () => {
+  const p = PEERS.find(x=>x.id===CURRENT); if(!p) return;
+  $('vm-name').textContent = p.name;
+  $('vm-words').innerHTML = p.words.map((w,i)=>`<span>${i+1} <b>${w}</b></span>`).join('');
+  $('vm-trust').onclick = async () => {
+    await api('/api/trust',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({peer:CURRENT})});
+    p.verified = true; updateVerifyBtn(p); renderRoster(); hideVerify();
+  };
+  $('verify-overlay').classList.add('show');
+};
+function hideVerify(){ $('verify-overlay').classList.remove('show'); }
+$('me-line').onclick = () => $('me-overlay').classList.add('show');
+function hideMe(){ $('me-overlay').classList.remove('show'); }
+
+/* composer */
+$('input').addEventListener('keydown', e=>{
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendCurrent(); }
+});
+$('send-btn').onclick = sendCurrent;
+$('attach').onclick = () => $('file-input').click();
+$('file-input').onchange = e => { for(const f of e.target.files) sendFile(f); e.target.value=''; };
+
+/* drag & drop */
+let dragDepth = 0;
+window.addEventListener('dragenter', e=>{ e.preventDefault(); if(++dragDepth) $('dropzone').classList.add('show'); });
+window.addEventListener('dragleave', e=>{ if(--dragDepth<=0){ dragDepth=0; $('dropzone').classList.remove('show'); } });
+window.addEventListener('dragover', e=>e.preventDefault());
+window.addEventListener('drop', e=>{
+  e.preventDefault(); dragDepth=0; $('dropzone').classList.remove('show');
+  for(const f of e.dataTransfer.files) sendFile(f);
+});
+
+boot();
+</script>
+</body>
+</html>
