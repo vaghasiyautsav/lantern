@@ -6,8 +6,12 @@ simply appears. Messages and files go machine-to-machine over QUIC/TLS 1.3,
 end-to-end, with device identities you can verify by reading eight words
 aloud.
 
-Educational project, local use only. Design doc and build log live in the
-project workspace. Inspired by (not copied from) IP Messenger (ipmsg.org).
+Educational project, local use only. Inspired by (not copied from) IP
+Messenger (ipmsg.org).
+
+- `CLAUDE.md` — start here: status, crate map, invariants, open defects.
+- `design/DESIGN.md` — the design document and why the protocol is shaped
+  this way.
 
 ## Install (macOS / Linux)
 

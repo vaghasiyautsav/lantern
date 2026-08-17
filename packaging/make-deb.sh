@@ -20,6 +20,7 @@ done
 cp target/release/lantern-gtk "$STAGE/usr/bin/"
 cp target/release/lantern-gui "$STAGE/usr/bin/"
 cp target/release/lantern     "$STAGE/usr/bin/"
+cp target/release/lantern-doctor "$STAGE/usr/bin/"
 
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: lantern
@@ -32,7 +33,8 @@ Maintainer: Lantern (local build)
 Description: Serverless LAN messenger
  Encrypted peer-to-peer messaging and file transfer for local networks.
  No accounts, no cloud, no server. Native GTK4 app (lantern-gtk),
- localhost web interface (lantern-gui), and CLI (lantern).
+ localhost web interface (lantern-gui), CLI (lantern), and the
+ network diagnostic (lantern-doctor).
 EOF
 
 cat > "$STAGE/usr/share/applications/lantern.desktop" <<'EOF'

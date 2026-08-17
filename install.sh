@@ -61,6 +61,7 @@ bold "Step 4: installing…"
 mkdir -p "$HOME/.lantern/bin"
 cp target/release/lantern-gui "$HOME/.lantern/bin/"
 cp target/release/lantern "$HOME/.lantern/bin/"
+cp target/release/lantern-doctor "$HOME/.lantern/bin/"
 if [ "${BUILD_GTK:-0}" = "1" ] && [ -f target/release/lantern-gtk ]; then
     cp target/release/lantern-gtk "$HOME/.lantern/bin/"
 fi
