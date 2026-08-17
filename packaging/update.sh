@@ -40,6 +40,12 @@ mkdir -p "$DATA"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 
+# git's advice lines are written for a person mid-rebase at a terminal. Folded
+# into a one-line banner in the app they read as "hint: hint: hint:" and bury
+# the actual reason, so they are dropped from anything shown to a person —
+# the full output still goes to the log above.
+strip_hints() { printf '%s' "$1" | grep -v '^hint:' || true; }
+
 # The state file is how the app finds out how an update went: it quits partway
 # through its own update, so the run that comes next reads this. One writer,
 # one shape, so the parser in core::update stays five flat fields. Message text
@@ -105,7 +111,7 @@ REMOTE="${UPSTREAM%%/*}"
 # 2. Fetch ------------------------------------------------------------------
 say running fetch "Fetching $UPSTREAM"
 if ! OUT="$(git fetch "$REMOTE" 2>&1)"; then
-    fail fetch "Couldn't reach GitHub: $OUT
+    fail fetch "Couldn't reach GitHub: $(strip_hints "$OUT")
 This is the only step that talks to the internet; the app itself never does."
 fi
 echo "$OUT"
@@ -149,7 +155,7 @@ fi
 # 4. Fast-forward and build -------------------------------------------------
 say running merge "Fast-forwarding to $UPSTREAM"
 if ! OUT="$(git merge --ff-only "$UPSTREAM" 2>&1)"; then
-    fail merge "Couldn't fast-forward: $OUT — local history has diverged; sort it out by hand: git -C $REPO status"
+    fail merge "This checkout has commits GitHub doesn't have, so there's nothing to fast-forward to. Push or reset them first: git -C $REPO status"
 fi
 echo "$OUT"
 AFTER="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
