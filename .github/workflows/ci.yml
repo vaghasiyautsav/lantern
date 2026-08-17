@@ -83,6 +83,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # ring assembles its primitives with NASM on windows-msvc, and the
+      # runner does not ship it — the first run failed in exactly this step.
+      # ring arrives via quinn and rustls, so it is not optional for us.
+      - name: NASM (ring builds its assembly with it)
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       # No lantern-gtk: there is no Windows shell yet. rusqlite is vendored
       # and builds SQLite from source with MSVC, so no system SQLite is
       # needed. SO_REUSEPORT is already cfg-gated away in lantern-discovery.

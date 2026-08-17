@@ -303,6 +303,10 @@ fn build_ui(
     refresh_btn.set_tooltip_text(Some("Look for devices on this network now"));
     header.pack_start(&refresh_btn);
 
+    let update_btn = gtk::Button::from_icon_name("software-update-available-symbolic");
+    update_btn.set_tooltip_text(Some("Check for updates"));
+    header.pack_start(&update_btn);
+
     window.set_titlebar(Some(&header));
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -1017,6 +1021,136 @@ fn build_ui(
         msg_scroll.add_controller(drop);
     }
 
+    // ---- check for updates ----------------------------------------------
+    //
+    // The app still opens no socket off the local link. It runs
+    // `lantern-update`, the same tool a person can run in a terminal, and
+    // shows its output — the network access lives in that separate,
+    // auditable process, not in a messenger that is otherwise LAN-only.
+    //
+    // Everything here is off the UI thread and on a hard timeout. An update
+    // check that blocks the main loop is how a "check for updates" sheet
+    // ends up frozen with a spinner: a synchronous request on the UI thread
+    // holds the loop until the socket times out, often a minute or more, and
+    // the whole app appears hung.
+    {
+        let backend = Rc::clone(&backend);
+        let window_weak = window.downgrade();
+        update_btn.connect_clicked(move |btn| {
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
+            btn.set_sensitive(false);
+
+            let dlg = gtk::Window::builder()
+                .transient_for(&window)
+                .modal(true)
+                .title("Check for updates")
+                .default_width(560)
+                .build();
+            let v = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            v.set_margin_top(18);
+            v.set_margin_bottom(18);
+            v.set_margin_start(18);
+            v.set_margin_end(18);
+            let spinner_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            let spinner = gtk::Spinner::new();
+            spinner.start();
+            let status = gtk::Label::new(Some("Asking GitHub what's new…"));
+            status.set_xalign(0.0);
+            spinner_row.append(&spinner);
+            spinner_row.append(&status);
+            let output = gtk::Label::new(None);
+            output.set_xalign(0.0);
+            output.set_wrap(true);
+            output.set_selectable(true);
+            output.add_css_class("monospace");
+            output.add_css_class("lantern-filecard");
+            output.set_visible(false);
+            let apply = gtk::Button::with_label("Update and reinstall");
+            apply.add_css_class("suggested-action");
+            apply.set_visible(false);
+            let close = gtk::Button::with_label("Close");
+            let btns = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            btns.set_halign(gtk::Align::End);
+            btns.append(&close);
+            btns.append(&apply);
+            v.append(&spinner_row);
+            v.append(&output);
+            v.append(&btns);
+            dlg.set_child(Some(&v));
+
+            let dlg_close = dlg.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(d) = dlg_close.upgrade() {
+                    d.close();
+                }
+            });
+            // Re-enable the toolbar button whenever the dialog goes away, so
+            // closing mid-check does not leave it stuck insensitive.
+            {
+                let btn = btn.clone();
+                dlg.connect_close_request(move |_| {
+                    btn.set_sensitive(true);
+                    glib::Propagation::Proceed
+                });
+            }
+            dlg.present();
+
+            let (tx, rx) = async_channel::bounded::<(bool, String)>(1);
+            backend.rt.spawn(async move {
+                let _ = tx.send(run_updater(&["--check"]).await).await;
+            });
+
+            let spinner = spinner.clone();
+            let status = status.clone();
+            let output = output.clone();
+            let apply = apply.clone();
+            let backend2 = Rc::clone(&backend);
+            glib::MainContext::default().spawn_local(async move {
+                let Ok((ok, text)) = rx.recv().await else { return };
+                spinner.stop();
+                spinner.set_visible(false);
+                output.set_text(text.trim());
+                output.set_visible(true);
+                if !ok {
+                    status.set_text("Could not check.");
+                    return;
+                }
+                // update.sh prints "Already current at <sha>" when there is
+                // nothing, and "N new commit(s):" when there is.
+                if text.contains("new commit") {
+                    status.set_text("An update is available.");
+                    apply.set_visible(true);
+                } else {
+                    status.set_text("You are up to date.");
+                }
+
+                let status2 = status.clone();
+                let output2 = output.clone();
+                apply.connect_clicked(move |apply| {
+                    apply.set_sensitive(false);
+                    status2.set_text("Updating — this rebuilds from source, give it a minute…");
+                    let (tx, rx) = async_channel::bounded::<(bool, String)>(1);
+                    backend2.rt.spawn(async move {
+                        let _ = tx.send(run_updater(&[]).await).await;
+                    });
+                    let status3 = status2.clone();
+                    let output3 = output2.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        let Ok((ok, text)) = rx.recv().await else { return };
+                        output3.set_text(text.trim());
+                        status3.set_text(if ok {
+                            "Updated. Quit and reopen Lantern to run the new build."
+                        } else {
+                            "Update failed — see below."
+                        });
+                    });
+                });
+            });
+        });
+    }
+
     // ---- refresh --------------------------------------------------------
     {
         let backend = Rc::clone(&backend);
@@ -1311,6 +1445,67 @@ fn build_ui(
 
     window.set_icon_name(Some("lantern"));
     window.present();
+}
+
+/// Run `lantern-update` and collect what it said. `(succeeded, output)`.
+///
+/// Kept as a subprocess deliberately. The app binary opens no connection off
+/// the local link; the updater — a script anyone can read, run, or skip —
+/// does the fetching. That keeps invariant 7 meaningful instead of quietly
+/// turning a LAN-only messenger into something that phones out on its own.
+///
+/// The timeout is the important part. Without one, a network that accepts
+/// the connection and then goes silent leaves this pending until the OS
+/// gives up, and the dialog sits there spinning with no way to tell whether
+/// it is working or wedged.
+async fn run_updater(args: &[&str]) -> (bool, String) {
+    // Prefer the installed copy; fall back to PATH for a dev checkout.
+    let exe = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".lantern/bin/lantern-update"))
+        .ok()
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("lantern-update"));
+
+    // Rebuilding from source legitimately takes minutes; a check should be
+    // quick. Both are bounded so neither can hang the dialog forever.
+    let limit = if args.contains(&"--check") {
+        std::time::Duration::from_secs(60)
+    } else {
+        std::time::Duration::from_secs(900)
+    };
+
+    let run = tokio::process::Command::new(&exe)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
+
+    match tokio::time::timeout(limit, run).await {
+        Ok(Ok(out)) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.trim().is_empty() {
+                text.push_str(&err);
+            }
+            if text.trim().is_empty() {
+                text = "(no output)".into();
+            }
+            (out.status.success(), text)
+        }
+        Ok(Err(e)) => (
+            false,
+            format!(
+                "Could not run {}: {e}\n\nIt is installed by install.sh; \
+                 run that once from your checkout.",
+                exe.display()
+            ),
+        ),
+        Err(_) => (
+            false,
+            "Timed out. The network accepted the connection and then went \
+             quiet, or GitHub is unreachable from here."
+                .into(),
+        ),
+    }
 }
 
 /// The core's identity fingerprint (helper — core exposes id bytes).
