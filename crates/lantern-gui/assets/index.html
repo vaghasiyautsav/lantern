@@ -319,6 +319,16 @@ function appendMsg(name, colorKey, text, ts, mid, outgoing, state){
   return el;
 }
 
+// Full path of a received file -> the folder it landed in, with the home
+// directory shortened to ~. The destination follows the user's Downloads
+// folder, so this has to come from the event rather than a hardcoded string.
+function folderOf(path){
+  if(!path) return 'the download folder';
+  const cut = path.lastIndexOf('/');
+  const dir = cut > 0 ? path.slice(0, cut) : path;
+  return dir.replace(/^\/(home|Users)\/[^/]+/, '~');
+}
+
 function appendFileCard(xid, who, colorKey, name, size, state, detail){
   const t = $('thread');
   let card = t.querySelector(`[data-xid="${xid}"]`);
@@ -416,7 +426,7 @@ function handleEvent(ev){
       break;
     }
     case 'file-received': {
-      appendFileCard(ev.xid, '', ev.peer, ev.name, ev.size, 'done', 'saved to Lantern downloads');
+      appendFileCard(ev.xid, '', ev.peer, ev.name, ev.size, 'done', 'saved to '+folderOf(ev.path));
       $('xfer-line').textContent = '';
       break;
     }

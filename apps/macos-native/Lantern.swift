@@ -304,9 +304,17 @@ final class Model: ObservableObject {
             let xid = ev["xid"] as? String ?? ""
             let name = ev["name"] as? String ?? "file"
             let size = (ev["size"] as? NSNumber)?.uint64Value ?? 0
+            // Report the folder the core actually wrote to — the destination
+            // follows the user's Downloads folder now, so a literal here
+            // would go stale.
+            let path = ev["path"] as? String ?? ""
+            let folder = path.isEmpty
+                ? "the download folder"
+                : (path as NSString).deletingLastPathComponent
+                    .replacingOccurrences(of: NSHomeDirectory(), with: "~")
             upsertFile(
                 xid: xid, outgoing: false, name: name, size: size,
-                status: "saved to ~/.lantern/downloads", done: true, failed: false)
+                status: "saved to " + folder, done: true, failed: false)
             NSSound(named: "Glass")?.play()
 
         case "chunks-sent":

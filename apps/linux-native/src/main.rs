@@ -81,6 +81,7 @@ fn main() -> glib::ExitCode {
             broadcast,
             quic_port: 0,
             in_memory_store: false,
+            download_dir: lantern_core::user_download_dir(),
         })
         .await
         .expect("core start");
@@ -641,11 +642,18 @@ fn build_ui(
                             refresh_peers();
                         }
                     }
-                    CoreEvent::FileReceived { xid, .. } => {
+                    CoreEvent::FileReceived { xid, path, .. } => {
                         if let Some(lbl) =
                             state.borrow().file_rows.get(&xid.to_string())
                         {
-                            lbl.set_text("✓ saved to ~/.lantern/downloads");
+                            // Report where it actually went, rather than a
+                            // literal that goes stale the moment the
+                            // download directory is configurable.
+                            let dir = path
+                                .parent()
+                                .map(abbreviate_home)
+                                .unwrap_or_else(|| "the download folder".into());
+                            lbl.set_text(&format!("✓ saved to {dir}"));
                         }
                     }
                     CoreEvent::ChunksSent { xid, sent, total } => {
@@ -682,6 +690,17 @@ fn build_ui(
 
     window.set_icon_name(Some("lantern"));
     window.present();
+}
+
+/// `/home/u/Downloads` → `~/Downloads`, so a status line stays readable.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(std::path::PathBuf::from(home)) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 /// The core's identity fingerprint (helper — core exposes id bytes).

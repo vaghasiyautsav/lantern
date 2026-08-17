@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         broadcast: args.broadcast,
         quic_port: 0,
         in_memory_store: args.ephemeral,
+        download_dir: lantern_core::user_download_dir(),
     })
     .await?;
 

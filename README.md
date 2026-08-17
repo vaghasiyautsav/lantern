@@ -46,7 +46,10 @@ native shell needs a Windows machine (or CI) — deferred per the roadmap.
 - **Verify identity** shows their eight safety words — read them aloud to
   each other once; if they match, mark verified. If someone's key ever
   changes, Lantern warns you loudly.
-- Received files land in `~/.lantern/downloads`.
+- Received files land in your **Downloads** folder — the real one the file
+  manager shows, and on Linux the localised one if your desktop uses a
+  different name for it. The app tells you the exact path when a file
+  arrives.
 
 ## When nobody shows up
 

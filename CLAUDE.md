@@ -192,6 +192,38 @@ Two things had to be fixed to make that work:
   profile gets its own process, while a plain double-click on the launcher
   still just focuses the running window.
 
+## Received files go to the user's Downloads folder — 17 Aug 2026
+
+They used to land in `<data_dir>/downloads`, i.e. inside `~/.lantern`. On
+Linux that is a hidden directory: the file manager does not list it, so the
+person who just accepted a file had no way to find it.
+
+`CoreConfig.download_dir: Option<PathBuf>` now names the destination.
+**`None` keeps the old in-data-dir behaviour, and that is deliberate** — the
+integration tests pass `None` so a test run can never write into the real
+user's Downloads folder. Shells pass `lantern_core::user_download_dir()`.
+
+`user_download_dir()` reads the XDG user-dirs setting on Linux rather than
+hardcoding `~/Downloads`, because the folder is localised — on a French
+desktop it is `Téléchargements`, and writing to a literal `Downloads` would
+quietly create a second, wrong folder beside the real one. macOS has no such
+indirection. Five unit tests cover the parsing.
+
+Two things that fell out of this, worth not undoing:
+
+- `finalize` used a bare `std::fs::rename`, which **cannot cross a
+  filesystem**. The destination is now user-configurable and may be another
+  mount, so it falls back to copy-and-delete. Without that, a transfer that
+  had downloaded and verified every chunk would fail at the last step.
+- No shell hardcodes the destination in its UI any more; each reads `path`
+  off `CoreEvent::FileReceived`, which every shell already received. A
+  literal would go stale the moment the folder is configurable. `Core::
+  download_dir()` is there for anything that needs the path up front.
+
+Invariant 8 is unaffected: `sanitize_filename` strips separators and rejects
+`..`, so the received name is still confined to the destination root
+whatever that root is.
+
 ## Open defects
 
 1. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
