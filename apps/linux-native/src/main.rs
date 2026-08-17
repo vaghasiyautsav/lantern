@@ -296,6 +296,13 @@ fn build_ui(
     subtitle.add_css_class("dim-label");
     subtitle.set_tooltip_text(Some(&format!("Your safety words: {me_words}")));
     header.pack_end(&subtitle);
+
+    // "Look who's there now" — sends a Ping, which every node answers,
+    // instead of waiting out the heartbeat.
+    let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
+    refresh_btn.set_tooltip_text(Some("Look for devices on this network now"));
+    header.pack_start(&refresh_btn);
+
     window.set_titlebar(Some(&header));
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -1008,6 +1015,25 @@ fn build_ui(
             false
         });
         msg_scroll.add_controller(drop);
+    }
+
+    // ---- refresh --------------------------------------------------------
+    {
+        let backend = Rc::clone(&backend);
+        let flash = flash.clone();
+        refresh_btn.connect_clicked(move |btn| {
+            let core = Arc::clone(&backend.core);
+            backend.rt.spawn(async move {
+                core.refresh().await;
+            });
+            flash("Asked everyone on this network to check in…");
+            // Replies arrive over the network, not on a schedule we control,
+            // so the button goes quiet briefly rather than pretending to know
+            // when the answers are all in.
+            btn.set_sensitive(false);
+            let btn = btn.clone();
+            glib::timeout_add_seconds_local_once(2, move || btn.set_sensitive(true));
+        });
     }
 
     // ---- clear conversation ---------------------------------------------

@@ -216,6 +216,30 @@ rate is measured over; the smoothing is a 0.7/0.3 EMA because raw per-chunk
 deltas are unreadable. On the receive side progress counts *verified* bytes,
 so it can only advance on data that passed its hash.
 
+**Refresh — `BeaconType::Ping` is now implemented.** It had a slot in the
+wire format and the DESIGN §4.2 table from the start, and nothing ever sent
+one. It matters because a peer only answers a beacon from someone *new* to
+it, and the roster is in-memory: re-announcing at a node that already knows
+us gets no reply, so "look for devices now" via `announce()` would do
+nothing for exactly the peers you can already see. `Core::refresh()` sends a
+Ping; a node receiving one answers with its Hello. Exposed as the header-bar
+refresh button and the CLI's `/refresh`.
+
+**Ping replies are rate limited to one per two seconds, and must stay that
+way.** One broadcast Ping draws a reply from every node on the link, so
+without a limit an attacker spends one packet to cost the link N — a cheap
+amplifier. Signing does not help, since anyone can mint an identity.
+
+**Clear conversation** (`Store::clear_messages` / `Core::clear_history`)
+deletes one peer's messages and returns the count. **The peer row
+deliberately survives**: it holds the pinned key and the verified flag, and
+dropping it would silently downgrade a verified contact to first-contact
+trust, so the next connection would be accepted as new rather than checked
+against what we pinned. A store test covers that. The confirmation text says
+plainly that this is local only and the peer keeps their copy — a "clear"
+that reads like a recall but is not would be the wrong thing to be vague
+about. Neither the SwiftUI shell nor the web GUI has this yet.
+
 **App icon.** A GNOME/Wayland window is matched to its launcher by
 `app_id`, and the icon comes from `<app_id>.desktop`. The app announces
 `local.lantern.gtk` but `install.sh` wrote `lantern.desktop`, so the running

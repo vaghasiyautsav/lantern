@@ -237,6 +237,8 @@ struct Inner {
     accept_waiters: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<u32>, String>>>,
     /// Identities we've already raised a TOFU conflict for (dedup).
     warned: std::collections::HashSet<[u8; 32]>,
+    /// When we last answered a Ping. Rate limit — see the discovery loop.
+    last_ping_reply: Option<std::time::Instant>,
 }
 
 pub struct Core {
@@ -288,6 +290,7 @@ impl Core {
                 pending_offers: HashMap::new(),
                 accept_waiters: HashMap::new(),
                 warned: std::collections::HashSet::new(),
+                last_ping_reply: None,
             })),
             events: event_tx,
             seq: std::sync::atomic::AtomicU64::new(1),
@@ -389,6 +392,20 @@ impl Core {
 
     pub async fn announce(&self) {
         let b = self.make_beacon(BeaconType::Hello);
+        self.discovery.send_beacon(&b, self.identity.signing_key()).await;
+    }
+
+    /// Ask everyone on the link to announce themselves now, rather than
+    /// waiting out the heartbeat.
+    ///
+    /// A plain `announce()` is not enough for this. Peers only answer a
+    /// beacon from someone *new* to them, so re-announcing to a peer that
+    /// already has us in its roster produces no reply and the roster stays
+    /// stale for up to a heartbeat. `Ping` is the "everyone speak up" that
+    /// `BeaconType` has always had a slot for (DESIGN §4.2) and nothing ever
+    /// sent.
+    pub async fn refresh(&self) {
+        let b = self.make_beacon(BeaconType::Ping);
         self.discovery.send_beacon(&b, self.identity.signing_key()).await;
     }
 
@@ -1041,9 +1058,32 @@ impl Core {
                     .lock()
                     .unwrap()
                     .record_peer(&beacon.id, &beacon.name, &beacon.host, now_ms());
+                // Answer a Ping so whoever asked learns us immediately, and
+                // answer a first sighting so the new arrival does too.
+                //
+                // Ping replies are rate limited, because one broadcast Ping
+                // draws a reply from every node on the link. Without a limit
+                // an attacker sends Pings in a loop and each one costs them a
+                // packet and everyone else N — a cheap amplifier, and signing
+                // does not help since anyone can mint an identity. One reply
+                // per two seconds keeps a refresh button instant while
+                // flattening a flood into a trickle.
+                let answer_ping = beacon.beacon_type == BeaconType::Ping && {
+                    let mut inner = self.inner.lock().await;
+                    let now = std::time::Instant::now();
+                    let due = inner
+                        .last_ping_reply
+                        .is_none_or(|t| now.duration_since(t).as_secs_f32() >= 2.0);
+                    if due {
+                        inner.last_ping_reply = Some(now);
+                    }
+                    due
+                };
                 if is_new {
                     info!("discovered {} ({})", beacon.name, from);
-                    // Answer so the new arrival learns us quickly too.
+                }
+                if is_new || answer_ping {
+                    // Answer so the other side learns us quickly too.
                     self.announce().await;
                 }
                 let _ = self

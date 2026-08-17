@@ -6,7 +6,8 @@
 //! lantern run --name Mira --data-dir /tmp/mira \
 //!     --discovery-port 4001 --targets 4001,4002
 //! ```
-//! Commands on stdin: /peers · /msg <name-prefix> <text> · /whoami · /quit
+//! Commands on stdin: /peers · /msg <name-prefix> <text> · /refresh ·
+//! /whoami · /quit
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -253,6 +254,12 @@ async fn main() -> anyhow::Result<()> {
             for (pid, name, host, addr) in peers {
                 println!("  {} {name} ({host}) {addr}", hex::encode(&pid[..6]));
             }
+        } else if line == "/refresh" {
+            // Ping, not Hello: a peer only answers a beacon from someone new
+            // to it, so re-announcing to a node that already knows us gets
+            // nothing back. Ping is the "everyone speak up".
+            core.refresh().await;
+            println!("asked everyone on this network to check in…");
         } else if line == "/whoami" {
             println!("{} · {}", args.name, hex::encode(core.identity_id()));
             println!("safety words: {}", core.fingerprint_words().join(" · "));
