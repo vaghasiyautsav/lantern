@@ -9,7 +9,7 @@ members = [
     "crates/lantern-core",
     "crates/lantern-cli",
     "crates/lantern-gui",
-    "crates/lantern-gtk",
+    "apps/linux-native",
 ]
 
 [workspace.package]

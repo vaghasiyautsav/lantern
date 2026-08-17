@@ -107,6 +107,6 @@ chunked resumable file transfer (survives kill -9), TOFU identity trust
 with safety words, message history in SQLite, this GUI.
 
 Shells: **native SwiftUI app** on macOS (`apps/macos-native`),
-**native GTK4 app** on Linux (`crates/lantern-gtk`, links the core
+**native GTK4 app** on Linux (`apps/linux-native`, links the core
 directly), plus the localhost web interface (`lantern-gui`) — which also
 serves as the local API the SwiftUI shell drives — and the CLI.
