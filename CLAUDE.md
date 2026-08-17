@@ -31,17 +31,42 @@ private, change it in the repo settings and correct this paragraph.
 - Claude project docs (cloud sessions): `claude/lantern-design.md`,
   `claude/lantern-build-status.md`.
 
-## Status (last update: 17 Aug 2026)
+## Status (last update: 18 Aug 2026)
 
 **Working, tested:** engine — signed-beacon discovery (see the 17 Aug fix
 below — cross-machine discovery was broken until then), identity-pinned
 QUIC/TLS 1.3 sessions, chunked resumable BLAKE3-verified transfer (survives
-kill -9), TOFU trust with safety words, SQLite history. 21 tests, clippy
+kill -9), TOFU trust with safety words, SQLite history, **presence**
+(`PeerView.online`, offline after 3 missed heartbeats — DESIGN §4.2),
+**history deletion** (per message or whole conversation, local only, WAL
+checkpointed), **live transfer speed + ETA** (`CoreEvent::TransferProgress`,
+`core::rate`), **update from GitHub** (`core::update` +
+`packaging/update.sh`), **look-again** (`POST /api/announce` /
+`core.announce()` behind a refresh button). 39 tests workspace-wide, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
 `install.sh` (mac+linux), `packaging/make-dmg.sh`, `packaging/make-deb.sh`.
 Icon: the **laltain** (final, user-approved — do NOT redesign unasked).
+
+**Three rules the new features encode** — they cost real debugging, so don't
+undo them:
+
+1. **Deleting is local, and says so.** Wisp has no delete-for-everyone
+   frame. Every string in every shell says "this machine"; none imply the
+   peer's copy goes too. Deletion also checkpoints the WAL — `secure_delete`
+   zeroes the freed page, but `lantern.db-wal` keeps the *old* page image, so
+   without the checkpoint deleted message text is still greppable on disk.
+2. **`send_file` returns as soon as the offer is away**, then streams in a
+   spawned task. It used to return after the last byte, which meant no shell
+   could learn the xid until the transfer was already over — a progress bar
+   was impossible by construction. Failures after the offer arrive as
+   `FileSent { ok: false }`, not as a return value.
+3. **An update never touches uncommitted work.** A dirty checkout is refused
+   with the reason. The updater runs detached (`packaging/update.sh`) because
+   it replaces the binaries the app is running from — Linux refuses to write
+   a busy executable at all — and `install.sh` therefore installs by
+   copy-then-rename and stages `Lantern.app` before swapping it in.
 
 **Linux is now a first-class working copy** (`~/dev/lantern` on the Ubuntu
 box), not just a build target — engine, CLI, doctor and the GTK app all
@@ -52,6 +77,12 @@ closes the Windows gap; (2) Phase 4 core depth (FTS search, durable offline
 queue); (3) shell parity screens (transfer center, log viewer, palette —
 DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start with a packet
 capture session).
+
+**Unverified on Linux:** the GTK shell's own delete / speed / update /
+refresh wiring (18 Aug) was written on the Mac, where GTK4 can't be
+compiled — `cargo build -p lantern-gtk` on the Ubuntu box is what confirms
+it. The engine-level features behind it are tested and platform-neutral, so
+the CLI and web GUI already have all four on Linux either way.
 
 *(GTK app polish — unread badges, verified badge, drag-drop — was item 2 and
 is done; see below.)*
@@ -284,3 +315,11 @@ invisible until the others list 3941 in `--targets`/`LANTERN_TARGETS` too.
   `_to_delete/` folder).
 - Ubuntu 22.04 ships GTK 4.6 — too old for `lantern-gtk` (needs 4.10+);
   install.sh detects and falls back gracefully.
+- **SwiftUI: `.fixedSize(horizontal: false, vertical: true)` on a `Text` in
+  the `NavigationSplitView` *detail* pane silently blanks the whole
+  **sidebar** column** — no crash, no log, the data is fine and the detail
+  pane still draws. Cost hours on 17 Aug 2026. Give such text a width
+  (`.frame(maxWidth: .infinity, alignment: .leading)`) or a `lineLimit`
+  instead. If a pane ever renders empty, bisect the *other* pane.
+- `cargo test` at the workspace root fails on macOS because `lantern-gtk`
+  needs pkg-config/GTK. Use `cargo test --workspace --exclude lantern-gtk`.

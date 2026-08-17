@@ -59,11 +59,24 @@ fi
 # 4. Install ------------------------------------------------------------------
 bold "Step 4: installing…"
 mkdir -p "$HOME/.lantern/bin"
-cp target/release/lantern-gui "$HOME/.lantern/bin/"
-cp target/release/lantern "$HOME/.lantern/bin/"
-cp target/release/lantern-doctor "$HOME/.lantern/bin/"
+
+# Copy-then-rename, never a plain cp over the destination: an in-app update
+# reinstalls while a Lantern may still be running, and Linux refuses to write
+# to a busy executable (ETXTBSY) while macOS lets you corrupt one. A rename
+# swaps the directory entry and leaves any running process on its old inode.
+install_bin() { # <built file> <destination>
+    tmp="$2.new.$$"
+    cp "$1" "$tmp"
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$2"
+}
+install_bin target/release/lantern-gui "$HOME/.lantern/bin/lantern-gui"
+install_bin target/release/lantern "$HOME/.lantern/bin/lantern"
+# The updater itself, so `git pull` isn't the only way to get a newer one.
+install_bin packaging/update.sh "$HOME/.lantern/bin/lantern-update"
+install_bin target/release/lantern-doctor "$HOME/.lantern/bin/lantern-doctor"
 if [ "${BUILD_GTK:-0}" = "1" ] && [ -f target/release/lantern-gtk ]; then
-    cp target/release/lantern-gtk "$HOME/.lantern/bin/"
+    install_bin target/release/lantern-gtk "$HOME/.lantern/bin/lantern-gtk"
 fi
 
 # Linux: desktop entry + icon so Lantern appears in the app launcher.
@@ -103,8 +116,13 @@ if [ "$(uname)" = "Darwin" ]; then
         echo "note: /Applications not writable — installing to ~/Applications"
         echo "      (Finder: Go → Go to Folder… → ~/Applications)"
     fi
-    rm -rf "$APP"
-    mkdir -p "$APP/Contents/MacOS"
+    # Build the bundle beside the old one and swap at the end, so a failed
+    # compile leaves the working Lantern in place instead of a gutted one —
+    # which matters most during an in-app update, where the app being
+    # replaced is the app that asked for the update.
+    STAGE="$APP.new"
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE/Contents/MacOS"
 
     # Native SwiftUI app — no web view. Compiled locally with Apple's
     # swiftc from the Command Line Tools; no Xcode needed. Falls back to a
@@ -115,12 +133,12 @@ if [ "$(uname)" = "Darwin" ]; then
         ARCH="$(uname -m)"
         swiftc -parse-as-library -O \
             -target "${ARCH}-apple-macos13.0" \
-            -o "$APP/Contents/MacOS/Lantern" \
+            -o "$STAGE/Contents/MacOS/Lantern" \
             apps/macos-native/Lantern.swift
     else
         echo "swiftc not found — falling back to browser launcher"
         EXECUTABLE="lantern-launch"
-        cat > "$APP/Contents/MacOS/lantern-launch" <<'LAUNCH'
+        cat > "$STAGE/Contents/MacOS/lantern-launch" <<'LAUNCH'
 #!/bin/bash
 PORT=3999
 if ! curl -s "http://localhost:$PORT/api/me" >/dev/null 2>&1; then
@@ -134,13 +152,13 @@ if ! curl -s "http://localhost:$PORT/api/me" >/dev/null 2>&1; then
 fi
 open "http://localhost:$PORT"
 LAUNCH
-        chmod +x "$APP/Contents/MacOS/lantern-launch"
+        chmod +x "$STAGE/Contents/MacOS/lantern-launch"
     fi
 
-    mkdir -p "$APP/Contents/Resources"
-    cp assets/icon/Lantern.icns "$APP/Contents/Resources/Lantern.icns"
+    mkdir -p "$STAGE/Contents/Resources"
+    cp assets/icon/Lantern.icns "$STAGE/Contents/Resources/Lantern.icns"
 
-    cat > "$APP/Contents/Info.plist" <<PLIST
+    cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -158,6 +176,9 @@ LAUNCH
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>
 PLIST
+    # Swap: the old bundle only goes away once the new one is complete.
+    rm -rf "$APP"
+    mv "$STAGE" "$APP"
     # Nudge Finder/Dock to notice the icon.
     touch "$APP"
     echo "Created $APP"
