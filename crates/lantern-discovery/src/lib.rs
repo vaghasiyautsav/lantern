@@ -3,10 +3,16 @@
 //! Prototype scope: IPv4 broadcast + loopback unicast fan-out. mDNS and the
 //! RFC 3306 IPv6 group come later; the roster keys on identity, so adding
 //! paths never duplicates peers.
+//!
+//! Broadcast goes to **every interface's directed broadcast address**, not just
+//! `255.255.255.255` — see [`net`] for why that distinction is the difference
+//! between seeing the other machine and not.
+
+pub mod net;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -62,21 +68,47 @@ pub struct DiscoveryConfig {
     pub broadcast: bool,
 }
 
+/// One attempted send, for diagnostics.
+#[derive(Debug, Clone)]
+pub struct SendOutcome {
+    pub dst: SocketAddr,
+    pub result: Result<usize, String>,
+}
+
 pub struct Discovery {
     socket: Arc<UdpSocket>,
     config: DiscoveryConfig,
+    targets: Mutex<net::TargetCache>,
 }
 
 impl Discovery {
     pub async fn bind(config: DiscoveryConfig) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, config.bind_port)).await?;
+        let socket = UdpSocket::from_std(bind_reusable(config.bind_port)?)?;
         if config.broadcast {
             socket.set_broadcast(true)?;
         }
         Ok(Self {
             socket: Arc::new(socket),
             config,
+            targets: Mutex::new(net::TargetCache::new()),
         })
+    }
+
+    /// The addresses the next beacon will be sent to. Diagnostics only.
+    pub fn current_targets(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        let bcast: Vec<Ipv4Addr> = if self.config.broadcast {
+            self.targets.lock().unwrap().get().to_vec()
+        } else {
+            Vec::new()
+        };
+        for port in &self.config.target_ports {
+            out.push(SocketAddr::from((Ipv4Addr::LOCALHOST, *port)));
+            for b in &bcast {
+                out.push(SocketAddr::from((*b, *port)));
+            }
+        }
+        out
     }
 
     pub fn local_port(&self) -> u16 {
@@ -85,26 +117,57 @@ impl Discovery {
 
     /// Send one beacon to every configured target.
     pub async fn send_beacon(&self, beacon: &Beacon, signing_key: &SigningKey) {
+        let _ = self.send_beacon_reporting(beacon, signing_key).await;
+    }
+
+    /// As [`Self::send_beacon`], but returns what happened to each datagram.
+    ///
+    /// Every send is reported, including failures. A silent `sendto` error was
+    /// the reason the original bug was invisible: on a host whose default route
+    /// is a VPN or a container bridge, `255.255.255.255` either failed with
+    /// `ENETUNREACH` or succeeded onto the wrong link, and nothing said so.
+    pub async fn send_beacon_reporting(
+        &self,
+        beacon: &Beacon,
+        signing_key: &SigningKey,
+    ) -> Vec<SendOutcome> {
         let bytes = match beacon.encode(signing_key) {
             Ok(b) => b,
             Err(e) => {
                 warn!("beacon encode failed: {e}");
-                return;
+                return Vec::new();
             }
         };
-        for port in &self.config.target_ports {
-            if self.config.broadcast {
-                let _ = self
-                    .socket
-                    .send_to(&bytes, (Ipv4Addr::BROADCAST, *port))
-                    .await;
-            }
-            // Loopback always — same-host instances and tests.
-            let _ = self
+
+        let mut outcomes = Vec::new();
+        for dst in self.current_targets() {
+            let result = self
                 .socket
-                .send_to(&bytes, (Ipv4Addr::LOCALHOST, *port))
-                .await;
+                .send_to(&bytes, dst)
+                .await
+                .map_err(|e| format!("{e}"));
+            match &result {
+                Ok(_) => debug!("beacon → {dst}"),
+                // Not fatal: an interface can disappear between enumeration and
+                // send, and one dead path must not stop the others.
+                Err(e) => debug!("beacon → {dst} failed: {e}"),
+            }
+            outcomes.push(SendOutcome { dst, result });
         }
+
+        if outcomes.iter().all(|o| o.result.is_err()) && !outcomes.is_empty() {
+            warn!(
+                "every beacon send failed ({} targets) — nobody will discover this node",
+                outcomes.len()
+            );
+        }
+        outcomes
+    }
+
+    /// Read one raw datagram off the discovery socket, no parsing, no
+    /// filtering. Diagnostics only — the normal path is [`Self::spawn_receiver`].
+    pub async fn recv_raw(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await
     }
 
     /// Run the receive loop; verified, replay-filtered beacons flow out the
@@ -167,6 +230,26 @@ pub fn spawn_heartbeat(
             tokio::time::sleep(HEARTBEAT).await;
         }
     })
+}
+
+/// Bind `0.0.0.0:port` with address/port reuse.
+///
+/// Without `SO_REUSEADDR`/`SO_REUSEPORT`, a second instance on the same machine
+/// fails with `EADDRINUSE`, and on macOS a socket lingering in `TIME_WAIT`
+/// blocks a restart for up to two minutes — which reads as "Lantern stopped
+/// discovering anyone" rather than as a bind failure. With reuse set, the
+/// kernel delivers a copy of each broadcast datagram to every bound socket, so
+/// instances (and `lantern-doctor`) coexist.
+fn bind_reusable(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+    Ok(sock.into())
 }
 
 pub fn now_ms() -> u64 {

@@ -44,6 +44,34 @@ native shell needs a Windows machine (or CI) — deferred per the roadmap.
   changes, Lantern warns you loudly.
 - Received files land in `~/.lantern/downloads`.
 
+## When nobody shows up
+
+Run the diagnostic on **both** machines at the same time:
+
+```bash
+lantern-doctor            # or ~/.lantern/bin/lantern-doctor
+```
+
+It prints every interface, the exact broadcast addresses it beacons to,
+whether each send succeeded, and every datagram that arrives — then tells you
+which of the four usual causes you have. Quit Lantern first for the cleanest
+read, though the doctor sets `SO_REUSEPORT` and can run alongside it.
+
+Known causes, in the order the doctor checks them:
+
+1. **The two machines are on different subnets.** Compare the interface IPs
+   the doctor prints. Broadcast does not cross a router.
+2. **Wireless client isolation** on the access point. Common on guest SSIDs and
+   on some mesh systems; it silently drops broadcast between clients. Test by
+   putting both machines on the same wired segment.
+3. **A local firewall dropping inbound UDP 3939.** macOS: System Settings →
+   Network → Firewall. The doctor catches this as "not even our own broadcast
+   came back".
+4. **One side running an old build.** Before the LAN-discovery fix, beacons went
+   only to `255.255.255.255`, which the kernel emits on a single interface — on
+   a machine with Docker, libvirt or a VPN up, usually the wrong one. The CLI
+   also defaulted `--broadcast` to false. Both are fixed; rebuild both sides.
+
 ## Same-machine test (two instances)
 
 ```bash

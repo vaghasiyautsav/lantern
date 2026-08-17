@@ -7,9 +7,15 @@ edition.workspace = true
 name = "lantern"
 path = "src/main.rs"
 
+[[bin]]
+name = "lantern-doctor"
+path = "src/bin/doctor.rs"
+
 [dependencies]
 lantern-core.workspace = true
 lantern-crypto.workspace = true
+lantern-discovery.workspace = true
+lantern-proto.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true
