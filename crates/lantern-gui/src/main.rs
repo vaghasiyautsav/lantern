@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/filepath", post(send_filepath))
         .route("/api/trust", post(trust))
+        .route("/api/announce", post(announce))
         .route("/api/version", get(version))
         // A check fetches from GitHub — a side effect, so it's a POST.
         .route("/api/update/check", post(update_check))
@@ -407,6 +408,28 @@ async fn trust(
     };
     app.core.set_verified(&pid, true);
     Json(json!({"ok": true})).into_response()
+}
+
+/// Say hello again, now, and answer with the roster as it stands.
+///
+/// Discovery is already automatic — beacons go out on a heartbeat and peers
+/// appear on their own. This is for the moment when someone has just started
+/// Lantern on the other machine and doesn't want to wait out a heartbeat, or
+/// when the network changed under them (VPN up, Wi-Fi switched) and they want
+/// to know rather than wonder. Peers answer a HELLO with their own beacon, so
+/// one announce refills the roster.
+async fn announce(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    app.core.announce().await;
+    // A beacon is UDP: the replies land in the next few hundred milliseconds,
+    // not instantly. Wait briefly so the roster in this reply is the refreshed
+    // one — otherwise the button looks like it did nothing.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let peers = app.core.peers().await;
+    Json(json!({
+        "announced": true,
+        "peers": peers.len(),
+        "online": peers.iter().filter(|p| p.online).count(),
+    }))
 }
 
 /// What this copy was built from, plus how the last update went. Cheap and

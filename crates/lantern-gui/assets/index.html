@@ -149,7 +149,11 @@ body{
 <div class="banner" id="banner"></div>
 <div class="main">
   <aside class="roster">
-    <div class="sect">On this network</div>
+    <div class="sect" style="display:flex;align-items:center;gap:6px">
+      <span style="flex:1">On this network</span>
+      <button class="ibtn" id="refresh-btn" style="width:22px;height:22px;font-size:12px"
+        title="Look for people again now — Lantern also checks on its own">⟳</button>
+    </div>
     <div class="rlist" id="rlist">
       <div class="empty-roster" id="empty-roster">
         Nobody else yet.<br><br>
@@ -548,6 +552,19 @@ $('um-apply').onclick = async () => {
   $('um-body').textContent = 'Updating. Lantern is rebuilding itself and will '
     + 'restart — this page goes quiet for a few minutes, then reconnects. '
     + 'Progress is in ~/.lantern/update.log.';
+};
+
+/* refresh — say hello again so peers answer now, then rebuild the list.
+   Discovery is automatic; this is for "I just opened it over there". */
+$('refresh-btn').onclick = async () => {
+  const b = $('refresh-btn');
+  b.disabled = true; b.textContent = '…';
+  try {
+    const r = await api('/api/announce', {method:'POST'});
+    await refreshPeers();
+    if(!r.online) banner('Nobody answered. Check Lantern is open on the other '
+      + 'machine and both are on the same network.');
+  } finally { b.disabled = false; b.textContent = '⟳'; }
 };
 
 /* composer */

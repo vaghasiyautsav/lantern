@@ -197,6 +197,9 @@ final class Model: ObservableObject {
     @Published var replyingTo: ChatItem?
     @Published var showVerify = false
     @Published var engineUp = false
+    /// A look-again is in flight; the button spins rather than allowing five
+    /// more beacons to be fired by five more clicks.
+    @Published var refreshing = false
 
     // -- updates ----------------------------------------------------------
     @Published var build: BuildInfo?
@@ -508,6 +511,32 @@ final class Model: ObservableObject {
             // Long enough to read the sheet, short enough not to feel stuck.
             try? await Task.sleep(nanoseconds: 2_500_000_000)
             NSApp.terminate(nil)
+        }
+    }
+
+    /// Say hello to the network again and reload the roster.
+    ///
+    /// Discovery already runs on its own; this is for the case where someone
+    /// has just opened Lantern on the other machine, or the network moved
+    /// under you, and waiting out a heartbeat feels like being stuck.
+    func refreshNow() {
+        guard !refreshing else { return }
+        refreshing = true
+        Task {
+            // The engine waits for beacon replies before answering, so by the
+            // time this returns the roster is the refreshed one.
+            let r = await postJSON("/api/announce", [:])
+            await refreshPeers()
+            refreshing = false
+            guard let r, r["announced"] as? Bool == true else {
+                flash("Couldn't reach the engine to look again.")
+                return
+            }
+            let online = (r["online"] as? NSNumber)?.intValue ?? peers.filter(\.online).count
+            if online == 0 {
+                flash("Nobody answered. Check the other machine has Lantern "
+                    + "open and is on this same network.")
+            }
         }
     }
 
@@ -1644,6 +1673,34 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             VStack(alignment: .leading, spacing: 0) {
+                // Sidebar header: names what the list is, and holds the one
+                // control that belongs to the list rather than a conversation.
+                HStack(spacing: 6) {
+                    Text("On this network")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Spacer(minLength: 0)
+                    Button { model.refreshNow() } label: {
+                        if model.refreshing {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.secondary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+                    .keyboardShortcut("r", modifiers: .command)
+                    .disabled(model.refreshing || !model.engineUp)
+                    .help("Look for people again now  (⌘R) — Lantern also "
+                        + "checks on its own every few seconds")
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+
                 // Right-click a person to clear that chat without opening it
                 // first — the point of deleting is usually to be rid of a
                 // conversation, not to go and read it again.

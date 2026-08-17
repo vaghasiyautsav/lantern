@@ -15,7 +15,7 @@ use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use lantern_core::{Core, CoreConfig, CoreEvent};
+use lantern_core::{Core, CoreConfig, CoreEvent, Uuid};
 
 const APP_ID: &str = "local.lantern.gtk";
 
@@ -173,6 +173,13 @@ fn build_ui(
     subtitle.add_css_class("dim-label");
     subtitle.set_tooltip_text(Some(&format!("Your safety words: {me_words}")));
     header.pack_end(&subtitle);
+    let update_btn = gtk::Button::with_label("Updates");
+    let build = lantern_core::update::BuildInfo::current();
+    update_btn.set_tooltip_text(Some(&format!(
+        "Build {} ({}) — check GitHub for a newer Lantern",
+        build.commit, build.date
+    )));
+    header.pack_start(&update_btn);
     window.set_titlebar(Some(&header));
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -192,7 +199,28 @@ fn build_ui(
     ));
     empty_label.add_css_class("dim-label");
     empty_label.set_margin_top(24);
+    // Sidebar header: what the list is, and the one control that belongs to
+    // the list rather than to a conversation.
+    let roster_head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    roster_head.set_margin_top(8);
+    roster_head.set_margin_bottom(2);
+    roster_head.set_margin_start(12);
+    roster_head.set_margin_end(6);
+    let roster_lbl = gtk::Label::new(Some("On this network"));
+    roster_lbl.add_css_class("dim-label");
+    roster_lbl.set_xalign(0.0);
+    roster_lbl.set_hexpand(true);
+    let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
+    refresh_btn.add_css_class("flat");
+    refresh_btn.set_tooltip_text(Some(
+        "Look for people again now — Lantern also checks on its own every \
+         few seconds",
+    ));
+    roster_head.append(&roster_lbl);
+    roster_head.append(&refresh_btn);
+
     let left_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    left_box.append(&roster_head);
     left_box.append(&empty_label);
     left_box.append(&peers_scroll);
     peers_scroll.set_vexpand(true);
@@ -207,9 +235,18 @@ fn build_ui(
     conv_title.set_margin_bottom(6);
     let verify_btn = gtk::Button::with_label("Verify identity");
     verify_btn.set_sensitive(false);
+    let clear_btn = gtk::Button::with_label("Clear chat");
+    clear_btn.set_sensitive(false);
+    clear_btn.set_tooltip_text(Some(
+        "Delete this conversation from this machine — the other machine \
+         keeps its own copy",
+    ));
+    let title_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    title_actions.append(&verify_btn);
+    title_actions.append(&clear_btn);
     let title_row = gtk::CenterBox::new();
     title_row.set_center_widget(Some(&conv_title));
-    title_row.set_end_widget(Some(&verify_btn));
+    title_row.set_end_widget(Some(&title_actions));
     title_row.set_margin_end(10);
     right.append(&title_row);
     right.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -245,19 +282,67 @@ fn build_ui(
     window.set_child(Some(&paned));
 
     // ---- helpers --------------------------------------------------------
+    // `mid` is what makes a row deletable: given one, the row carries a ⋯
+    // menu that removes that message from this machine. Rows without one —
+    // transfers, trust warnings, Lantern's own notices — aren't in the
+    // message log, so offering to delete them would promise something the
+    // store can't do.
     let append_row = {
         let msg_list = msg_list.clone();
         let msg_scroll = msg_scroll.clone();
-        move |title: &str, body: &gtk::Widget| {
+        let backend = Rc::clone(&backend);
+        move |title: &str, body: &gtk::Widget, mid: Option<Uuid>| {
             let row_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
             row_box.set_margin_top(6);
             row_box.set_margin_bottom(6);
             row_box.set_margin_start(12);
             row_box.set_margin_end(12);
+
+            let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             let head = gtk::Label::new(Some(title));
             head.set_halign(gtk::Align::Start);
+            head.set_hexpand(true);
             head.add_css_class("caption-heading");
-            row_box.append(&head);
+            head_row.append(&head);
+
+            if let Some(mid) = mid {
+                let more = gtk::MenuButton::new();
+                more.set_icon_name("view-more-symbolic");
+                more.add_css_class("flat");
+                more.set_valign(gtk::Align::Center);
+                more.set_tooltip_text(Some("More — delete this message"));
+                let pop = gtk::Popover::new();
+                let del = gtk::Button::with_label("Delete on this machine");
+                del.add_css_class("destructive-action");
+                del.set_margin_top(6);
+                del.set_margin_bottom(6);
+                del.set_margin_start(6);
+                del.set_margin_end(6);
+                del.set_tooltip_text(Some(
+                    "Deletes your copy only — the other machine keeps theirs",
+                ));
+                pop.set_child(Some(&del));
+                more.set_popover(Some(&pop));
+                head_row.append(&more);
+
+                let core = Arc::clone(&backend.core);
+                let msg_list = msg_list.clone();
+                let row_weak = row_box.downgrade();
+                let pop_close = pop.clone();
+                del.connect_clicked(move |_| {
+                    pop_close.popdown();
+                    core.delete_message(&mid);
+                    // ListBox wraps an appended widget in a row of its own,
+                    // so what has to go is the parent, not this box.
+                    if let Some(row) = row_weak.upgrade() {
+                        if let Some(parent) = row.parent() {
+                            msg_list.remove(&parent);
+                        }
+                    }
+                });
+            }
+
+            row_box.append(&head_row);
             row_box.append(body);
             msg_list.append(&row_box);
             // Scroll to bottom after layout.
@@ -269,12 +354,12 @@ fn build_ui(
     };
     let append_text = {
         let append_row = append_row.clone();
-        move |title: &str, text: &str| {
+        move |title: &str, text: &str, mid: Option<Uuid>| {
             let lbl = gtk::Label::new(Some(text));
             lbl.set_halign(gtk::Align::Start);
             lbl.set_wrap(true);
             lbl.set_selectable(true);
-            append_row(title, lbl.upcast_ref::<gtk::Widget>());
+            append_row(title, lbl.upcast_ref::<gtk::Widget>(), mid);
         }
     };
     let append_file = {
@@ -297,7 +382,8 @@ fn build_ui(
                 .borrow_mut()
                 .file_rows
                 .insert(xid.to_string(), s.clone());
-            append_row(title, boxx.upcast_ref::<gtk::Widget>());
+            // A transfer is not a message in the log, so no delete menu.
+            append_row(title, boxx.upcast_ref::<gtk::Widget>(), None);
         }
     };
 
@@ -372,6 +458,7 @@ fn build_ui(
         let backend = Rc::clone(&backend);
         let conv_title = conv_title.clone();
         let verify_btn = verify_btn.clone();
+        let clear_btn = clear_btn.clone();
         let msg_list = msg_list.clone();
         let append_text = append_text.clone();
         let refresh_peers = refresh_peers.clone();
@@ -402,6 +489,7 @@ fn build_ui(
             }
             conv_title.set_text(&name);
             verify_btn.set_sensitive(true);
+            clear_btn.set_sensitive(true);
             while let Some(child) = msg_list.first_child() {
                 msg_list.remove(&child);
             }
@@ -412,7 +500,7 @@ fn build_ui(
                 } else {
                     name.clone()
                 };
-                append_text(&title, &m.text);
+                append_text(&title, &m.text, Some(m.mid));
             }
         });
     }
@@ -433,7 +521,11 @@ fn build_ui(
                 return;
             };
             entry.set_text("");
-            append_text("You · ◷", &text);
+// The mid only exists once the core has accepted the message, and
+            // this row goes up before that so typing feels instant — so a
+            // just-sent line gets its delete menu when the conversation is
+            // next opened, from history.
+            append_text("You · ◷", &text, None);
             let core = Arc::clone(&backend.core);
             backend.rt.spawn(async move {
                 let _ = core.send_message(peer, &text).await;
@@ -603,6 +695,268 @@ fn build_ui(
         });
     }
 
+    // ---- look again now --------------------------------------------------
+    // A HELLO beacon; peers answer with their own, which arrive as PeerSeen
+    // and rebuild the roster through the usual path. Nothing to poll here.
+    {
+        let backend = Rc::clone(&backend);
+        refresh_btn.connect_clicked(move |_| {
+            let core = Arc::clone(&backend.core);
+            backend.rt.spawn(async move {
+                core.announce().await;
+            });
+        });
+    }
+
+    // ---- clear conversation ---------------------------------------------
+    // Asks first, because there is no undo: the engine zeroes the pages it
+    // frees and checkpoints the log. Every word here is careful to promise
+    // only what happens — this machine's copy, nobody else's.
+    {
+        let state = Rc::clone(&state);
+        let backend = Rc::clone(&backend);
+        let window_weak = window.downgrade();
+        let msg_list = msg_list.clone();
+        let append_text = append_text.clone();
+        clear_btn.connect_clicked(move |_| {
+            let Some(peer) = state.borrow().selected else {
+                return;
+            };
+            let name = state
+                .borrow()
+                .peers
+                .iter()
+                .find(|(id, ..)| *id == peer)
+                .map(|(_, n, _)| n.clone())
+                .unwrap_or_else(|| "them".into());
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
+            let dlg = gtk::Window::builder()
+                .transient_for(&window)
+                .modal(true)
+                .title("Clear chat")
+                .default_width(420)
+                .build();
+            let v = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            v.set_margin_top(18);
+            v.set_margin_bottom(18);
+            v.set_margin_start(18);
+            v.set_margin_end(18);
+            let info = gtk::Label::new(Some(&format!(
+                "Delete every message with {name} from this machine?\n\n\
+                 This can't be undone. {name} keeps their own copy — Lantern \
+                 can only delete what's stored here. Files you've already \
+                 sent or received stay on disk."
+            )));
+            info.set_wrap(true);
+            info.set_xalign(0.0);
+            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            buttons.set_halign(gtk::Align::End);
+            let cancel = gtk::Button::with_label("Cancel");
+            let delete = gtk::Button::with_label("Delete on this machine");
+            delete.add_css_class("destructive-action");
+            buttons.append(&cancel);
+            buttons.append(&delete);
+            v.append(&info);
+            v.append(&buttons);
+            dlg.set_child(Some(&v));
+
+            {
+                let dlg_weak = dlg.downgrade();
+                cancel.connect_clicked(move |_| {
+                    if let Some(d) = dlg_weak.upgrade() {
+                        d.close();
+                    }
+                });
+            }
+            let backend = Rc::clone(&backend);
+            let msg_list = msg_list.clone();
+            let append_text = append_text.clone();
+            let dlg_weak = dlg.downgrade();
+            delete.connect_clicked(move |_| {
+                let n = backend.core.clear_history(&peer);
+                while let Some(child) = msg_list.first_child() {
+                    msg_list.remove(&child);
+                }
+                // Say what happened where the conversation used to be —
+                // an empty pane alone doesn't tell you it worked.
+                append_text(
+                    "Lantern",
+                    &if n == 0 {
+                        format!("Nothing was stored for {name} — already empty here.")
+                    } else {
+                        format!(
+                            "Deleted {n} message{} from this machine. \
+                             {name} still has their copy.",
+                            if n == 1 { "" } else { "s" }
+                        )
+                    },
+                    None,
+                );
+                if let Some(d) = dlg_weak.upgrade() {
+                    d.close();
+                }
+            });
+            dlg.present();
+        });
+    }
+
+    // ---- updates ---------------------------------------------------------
+    // Same mechanism as the macOS shell, because it's the same core: fetch,
+    // fast-forward, install.sh, reopen — refused outright if the checkout has
+    // uncommitted work in it. The app has to quit for the install to replace
+    // the binary it's running from, so this hands off and closes.
+    {
+        let backend = Rc::clone(&backend);
+        let window_weak = window.downgrade();
+        let app = app.clone();
+        update_btn.connect_clicked(move |_| {
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
+            let build = lantern_core::update::BuildInfo::current();
+            let dlg = gtk::Window::builder()
+                .transient_for(&window)
+                .modal(true)
+                .title("Lantern updates")
+                .default_width(460)
+                .build();
+            let v = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            v.set_margin_top(18);
+            v.set_margin_bottom(18);
+            v.set_margin_start(18);
+            v.set_margin_end(18);
+            let build_lbl = gtk::Label::new(Some(&format!(
+                "Build {} · {}{}",
+                build.commit,
+                build.date,
+                match &build.repo {
+                    Some(p) => format!(" · built from {}", p.display()),
+                    None => String::new(),
+                }
+            )));
+            build_lbl.set_wrap(true);
+            build_lbl.set_xalign(0.0);
+            build_lbl.add_css_class("dim-label");
+            let status = gtk::Label::new(Some("Asking GitHub…"));
+            status.set_wrap(true);
+            status.set_xalign(0.0);
+            let commits = gtk::Label::new(None);
+            commits.set_wrap(true);
+            commits.set_xalign(0.0);
+            commits.add_css_class("dim-label");
+            commits.set_visible(false);
+            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            buttons.set_halign(gtk::Align::End);
+            let close = gtk::Button::with_label("Close");
+            let apply = gtk::Button::with_label("Update and reopen");
+            apply.add_css_class("suggested-action");
+            apply.set_visible(false);
+            buttons.append(&close);
+            buttons.append(&apply);
+            v.append(&build_lbl);
+            v.append(&status);
+            v.append(&commits);
+            v.append(&buttons);
+            dlg.set_child(Some(&v));
+
+            {
+                let dlg_weak = dlg.downgrade();
+                close.connect_clicked(move |_| {
+                    if let Some(d) = dlg_weak.upgrade() {
+                        d.close();
+                    }
+                });
+            }
+
+            // The check does network I/O; run it on the runtime and bring the
+            // answer back to the main context.
+            let core = Arc::clone(&backend.core);
+            let (tx, rx) = async_channel::bounded::<(String, bool, Vec<String>)>(1);
+            backend.rt.spawn(async move {
+                let c = core.check_update().await;
+                let _ = tx.send((c.summary(), c.can_update(), c.commits)).await;
+            });
+            {
+                let status = status.clone();
+                let commits_lbl = commits.clone();
+                let apply = apply.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    if let Ok((summary, can_update, lines)) = rx.recv().await {
+                        status.set_text(&summary);
+                        if !lines.is_empty() {
+                            commits_lbl.set_text(&lines.join("\n"));
+                            commits_lbl.set_visible(true);
+                        }
+                        apply.set_visible(can_update);
+                    }
+                });
+            }
+
+            let backend = Rc::clone(&backend);
+            let app = app.clone();
+            let status_for_apply = status.clone();
+            let commits_for_apply = commits.clone();
+            apply.connect_clicked(move |apply| {
+                match backend.core.start_update() {
+                    Ok(()) => {
+                        apply.set_visible(false);
+                        commits_for_apply.set_visible(false);
+                        status_for_apply.set_text(
+                            "Updating. Lantern will close, rebuild itself from \
+                             GitHub, and reopen — a few minutes. Progress is in \
+                             ~/.lantern/update.log.",
+                        );
+                        // Out of the updater's way: it can't replace a running
+                        // binary, and on Linux the OS refuses outright.
+                        let app = app.clone();
+                        glib::timeout_add_seconds_local_once(3, move || app.quit());
+                    }
+                    Err(reason) => status_for_apply.set_text(&reason),
+                }
+            });
+            dlg.present();
+        });
+    }
+
+    // ---- how the last update went ---------------------------------------
+    // The app that asked for an update is never the app that sees it finish,
+    // so this run reports it — once.
+    if let Some(last) = lantern_core::update::take_unseen_result(backend.core.data_dir()) {
+        let banner = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        banner.set_margin_top(8);
+        banner.set_margin_bottom(8);
+        banner.set_margin_start(12);
+        banner.set_margin_end(12);
+        let text = if last.succeeded() {
+            format!("✓ {}", last.message)
+        } else {
+            format!(
+                "⚠ The last update didn't finish: {} Your previous Lantern is \
+                 what's running. Details in ~/.lantern/update.log.",
+                last.message
+            )
+        };
+        let lbl = gtk::Label::new(Some(&text));
+        lbl.set_wrap(true);
+        lbl.set_xalign(0.0);
+        lbl.set_hexpand(true);
+        let dismiss = gtk::Button::from_icon_name("window-close-symbolic");
+        dismiss.add_css_class("flat");
+        dismiss.set_tooltip_text(Some("Dismiss"));
+        banner.append(&lbl);
+        banner.append(&dismiss);
+        let banner_weak = banner.downgrade();
+        let right_weak = right.downgrade();
+        dismiss.connect_clicked(move |_| {
+            if let (Some(b), Some(r)) = (banner_weak.upgrade(), right_weak.upgrade()) {
+                r.remove(&b);
+            }
+        });
+        right.prepend(&banner);
+    }
+
     // ---- core events → UI ----------------------------------------------
     if let Some(rx) = event_rx {
         let state = Rc::clone(&state);
@@ -624,10 +978,10 @@ fn build_ui(
                         drop(st);
                         refresh_peers();
                     }
-                    CoreEvent::MessageReceived { peer, peer_name, text, .. } => {
+                    CoreEvent::MessageReceived { peer, peer_name, text, mid, .. } => {
                         let open = state.borrow().selected == Some(peer);
                         if open {
-                            append_text(&peer_name, &text);
+                            append_text(&peer_name, &text, Some(mid));
                         } else {
                             *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
                             refresh_peers();
@@ -656,6 +1010,13 @@ fn build_ui(
                             lbl.set_text(&format!("✓ saved to {dir}"));
                         }
                     }
+                    CoreEvent::TransferProgress {
+                        xid, done, total, bps, eta_s, ..
+                    } => {
+                        if let Some(lbl) = state.borrow().file_rows.get(&xid.to_string()) {
+                            lbl.set_text(&progress_line(done, total, bps, eta_s));
+                        }
+                    }
                     CoreEvent::ChunksSent { xid, sent, total } => {
                         if let Some(lbl) =
                             state.borrow().file_rows.get(&xid.to_string())
@@ -680,7 +1041,7 @@ fn build_ui(
                         }
                     }
                     CoreEvent::TrustWarning { detail, .. } => {
-                        append_text("⚠ Trust warning", &detail);
+                        append_text("⚠ Trust warning", &detail, None);
                     }
                     _ => {}
                 }
@@ -690,6 +1051,38 @@ fn build_ui(
 
     window.set_icon_name(Some("lantern"));
     window.present();
+}
+
+/// "12.0 MB of 40.0 MB · 8.4 MB/s · 3 s left" — speed and time left are
+/// dropped rather than guessed when the engine hasn't measured them yet.
+fn progress_line(done: u64, total: u64, bps: Option<u64>, eta_s: Option<u64>) -> String {
+    let mut line = format!("{} of {}", human_size(done), human_size(total));
+    if let Some(b) = bps.filter(|b| *b > 0) {
+        line.push_str(&format!(" · {}/s", human_size(b)));
+    }
+    if let Some(s) = eta_s.filter(|s| *s > 0) {
+        line.push_str(&if s < 60 {
+            format!(" · {s} s left")
+        } else {
+            format!(" · {} min left", s / 60)
+        });
+    }
+    line
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 /// `/home/u/Downloads` → `~/Downloads`, so a status line stays readable.

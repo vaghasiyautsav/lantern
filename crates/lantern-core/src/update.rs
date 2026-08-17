@@ -301,6 +301,29 @@ pub fn last_state(data_dir: &Path) -> Option<UpdateState> {
     })
 }
 
+/// The outcome of an update this machine hasn't been told about yet, marking
+/// it as told.
+///
+/// An app cannot watch its own update finish — it quits partway through — so
+/// the result is reported by whichever run comes next. Once. Repeating
+/// "Updated to abc1234" at every launch for the rest of the week would train
+/// people to ignore the one message that matters, so the acknowledgement is
+/// recorded beside the state file.
+pub fn take_unseen_result(data_dir: &Path) -> Option<UpdateState> {
+    let state = last_state(data_dir)?;
+    if state.is_running() || state.started.is_empty() {
+        return None;
+    }
+    let seen_path = data_dir.join("update.seen");
+    if std::fs::read_to_string(&seen_path).ok().as_deref() == Some(state.started.as_str()) {
+        return None;
+    }
+    // Written before returning: a shell that crashes while showing this
+    // should not show it again forever.
+    let _ = std::fs::write(&seen_path, &state.started);
+    Some(state)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateState {
     /// "running" · "ok" · "failed"
@@ -398,6 +421,41 @@ mod tests {
         // Garbage must degrade to "unknown", not panic or unwrap.
         std::fs::write(state_path(&dir), "not json at all").unwrap();
         assert_eq!(last_state(&dir).unwrap().state, "unknown");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_outcome_is_reported_once_and_a_running_update_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("lantern-seen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Mid-update: there's no outcome to report yet.
+        std::fs::write(
+            state_path(&dir),
+            r#"{"state":"running","step":"build","message":"building","commit":"","started":"1786000001"}"#,
+        )
+        .unwrap();
+        assert!(take_unseen_result(&dir).is_none());
+
+        std::fs::write(
+            state_path(&dir),
+            r#"{"state":"ok","step":"done","message":"Updated to abc1234","commit":"abc1234","started":"1786000001"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            take_unseen_result(&dir).map(|s| s.commit),
+            Some("abc1234".to_string())
+        );
+        // Second launch: already said.
+        assert!(take_unseen_result(&dir).is_none());
+
+        // A later update is a different outcome, and gets reported.
+        std::fs::write(
+            state_path(&dir),
+            r#"{"state":"failed","step":"merge","message":"diverged","commit":"","started":"1786000999"}"#,
+        )
+        .unwrap();
+        assert!(take_unseen_result(&dir).is_some_and(|s| s.failed()));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

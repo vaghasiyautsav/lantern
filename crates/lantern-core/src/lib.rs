@@ -18,7 +18,6 @@ use lantern_store::{Store, StoredMessage};
 use lantern_transport::{peer_identity, Transport};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 mod rate;
 pub mod update;
@@ -26,6 +25,10 @@ pub mod update;
 use rate::RateMeter;
 
 pub use lantern_crypto::{safety_words, short_hex};
+/// Used throughout this crate, and re-exported because shells handle message
+/// and transfer ids constantly — no reason for each to depend on `uuid` just
+/// to name the type.
+pub use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub enum CoreEvent {

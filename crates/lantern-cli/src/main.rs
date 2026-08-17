@@ -294,6 +294,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 other => other.report(target.trim()),
             }
+        } else if line == "/refresh" {
+            // Peers answer a HELLO with their own beacon, so one announce
+            // refills the roster without waiting for the next heartbeat.
+            core.announce().await;
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let peers = core.peers().await;
+            let online = peers.iter().filter(|p| p.online).count();
+            println!("said hello — {} peer(s), {online} online", peers.len());
         } else if line == "/update" || line == "/update now" {
             let check = core.check_update().await;
             println!("{}", check.summary());
@@ -357,8 +365,8 @@ async fn main() -> anyhow::Result<()> {
         } else {
             println!(
                 "commands: /peers · /msg <name> <text> · /send <name> <path> · \
-                 /verify <name> · /trust <name> · /clear <name> · /whoami · \
-                 /version · /update [now] · /quit"
+                 /verify <name> · /trust <name> · /clear <name> · /refresh · \
+                 /whoami · /version · /update [now] · /quit"
             );
         }
     }
