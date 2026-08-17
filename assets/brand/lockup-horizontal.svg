@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="661" height="200"
+     viewBox="0 0 660.78 200">
+  <g transform="scale(0.195312)">
+<defs>
+    <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#20284a"/>
+      <stop offset="0.5" stop-color="#171e38"/>
+      <stop offset="1"   stop-color="#0d1124"/>
+    </linearGradient>
+
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0"    stop-color="#ffd9a0" stop-opacity="0.48"/>
+      <stop offset="0.35" stop-color="#ffb454" stop-opacity="0.22"/>
+      <stop offset="0.7"  stop-color="#8f7ce0" stop-opacity="0.06"/>
+      <stop offset="1"    stop-color="#4a5aa8" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- The globe, lit -->
+    <radialGradient id="fire" cx="0.5" cy="0.55" r="0.6">
+      <stop offset="0"    stop-color="#fff6e0"/>
+      <stop offset="0.4"  stop-color="#ffce75"/>
+      <stop offset="0.8"  stop-color="#ff9e3d"/>
+      <stop offset="1"    stop-color="#ef7c2a"/>
+    </radialGradient>
+
+    <!-- Painted steel: the deep laltain green, lit by its own lamp -->
+    <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#47695c"/>
+      <stop offset="0.5" stop-color="#33504a"/>
+      <stop offset="1"   stop-color="#1e3230"/>
+    </linearGradient>
+
+    <clipPath id="squircle">
+      <rect x="0" y="0" width="1024" height="1024" rx="232" ry="232"/>
+    </clipPath>
+
+    <clipPath id="globeclip">
+      <path d="M 430 400
+               C 372 460 358 540 372 610
+               C 384 668 440 700 512 700
+               C 584 700 640 668 652 610
+               C 666 540 652 460 594 400
+               Z"/>
+    </clipPath>
+
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <!-- night -->
+    <rect width="1024" height="1024" fill="url(#field)"/>
+
+    <!-- radiance -->
+    <circle cx="512" cy="520" r="470" fill="url(#glow)"/>
+
+    <!-- bail handle: one wire arc, hung from nothing but night -->
+    <path d="M 408 372 C 396 210 628 210 616 372"
+          fill="none" stroke="#3c5a52" stroke-width="17" stroke-linecap="round"/>
+
+    <!-- halo behind the globe -->
+    <ellipse cx="512" cy="540" rx="220" ry="220" fill="#ff9e3d"
+             opacity="0.30" filter="url(#soft)"/>
+
+    <!-- the globe: barrel glass, widest at the belly -->
+    <path d="M 430 400
+             C 372 460 358 540 372 610
+             C 384 668 440 700 512 700
+             C 584 700 640 668 652 610
+             C 666 540 652 460 594 400
+             Z"
+          fill="url(#fire)"/>
+    <!-- white heart low in the globe, where the wick burns -->
+    <circle cx="512" cy="588" r="66" fill="#fffdf5" opacity="0.9"/>
+    <!-- glass highlight -->
+    <path d="M 428 448 C 408 508 406 570 420 622" fill="none"
+          stroke="#fff6e0" stroke-width="14" stroke-linecap="round" opacity="0.4"/>
+
+    <!-- wire guard: the crossed wires that keep the glass safe -->
+    <g clip-path="url(#globeclip)" stroke="#22352f" stroke-width="8"
+       fill="none" opacity="0.4" stroke-linecap="round">
+      <path d="M 386 470 C 470 540 554 592 646 620"/>
+      <path d="M 638 470 C 554 540 470 592 378 620"/>
+    </g>
+
+    <!-- top: flat cap disc, vented dome, collar -->
+    <rect x="462" y="288" width="100" height="22" rx="11" fill="url(#steel)"/>
+    <path d="M 434 356 Q 512 296 590 356 L 590 372 L 434 372 Z" fill="url(#steel)"/>
+    <g fill="#141f1e" opacity="0.6">
+      <circle cx="472" cy="352" r="6"/>
+      <circle cx="500" cy="346" r="6"/>
+      <circle cx="528" cy="346" r="6"/>
+      <circle cx="556" cy="352" r="6"/>
+    </g>
+    <rect x="418" y="372" width="188" height="30" rx="15" fill="url(#steel)"/>
+
+    <!-- side frame tubes: the hurricane trapezoid -->
+    <path d="M 432 396 C 402 500 390 610 394 706" fill="none"
+          stroke="url(#steel)" stroke-width="26" stroke-linecap="round"/>
+    <path d="M 592 396 C 622 500 634 610 630 706" fill="none"
+          stroke="url(#steel)" stroke-width="26" stroke-linecap="round"/>
+
+    <!-- burner collar under the globe -->
+    <rect x="452" y="694" width="120" height="26" rx="13" fill="#33504a"/>
+
+    <!-- fuel tank: the drum that fed a whole evening -->
+    <path d="M 386 716
+             C 386 706 638 706 638 716
+             L 644 776
+             C 644 800 380 800 380 776 Z"
+          fill="url(#steel)"/>
+    <!-- filler cap, remembered from every real laltain -->
+    <ellipse cx="602" cy="712" rx="20" ry="12" fill="#47695c"/>
+    <!-- base rim -->
+    <rect x="360" y="792" width="304" height="34" rx="17" fill="url(#steel)"/>
+
+    <!-- warm rim-light where the steel faces its own flame -->
+    <g stroke="#e8945e" fill="none" stroke-linecap="round" opacity="0.5">
+      <path d="M 442 402 C 414 500 402 606 406 700" stroke-width="6"/>
+      <path d="M 582 402 C 610 500 622 606 618 700" stroke-width="6"/>
+      <path d="M 400 722 C 460 712 564 712 624 722" stroke-width="7"/>
+    </g>
+  </g>
+
+  </g>
+  <g transform="translate(256,30) scale(0.7000)"
+     fill="#eef1f6">
+  <path transform="translate(0.00,158.73) scale(0.158730,-0.158730)" d="M68 0V706H225V0ZM189 0V138H538V0Z"/>
+  <path transform="translate(87.78,158.73) scale(0.158730,-0.158730)" d="M257 -10Q190 -10 137.5 23.0Q85 56 54.5 113.0Q24 170 24 243Q24 316 54.5 373.0Q85 430 137.5 463.0Q190 496 257 496Q306 496 345.5 477.0Q385 458 410.0 424.5Q435 391 438 348V138Q435 95 410.5 61.5Q386 28 346.0 9.0Q306 -10 257 -10ZM288 128Q337 128 367.0 160.5Q397 193 397 243Q397 277 383.5 303.0Q370 329 345.5 343.5Q321 358 289 358Q257 358 232.5 343.5Q208 329 193.5 303.0Q179 277 179 243Q179 210 193.0 184.0Q207 158 232.0 143.0Q257 128 288 128ZM391 0V131L414 249L391 367V486H541V0Z"/>
+  <path transform="translate(180.95,158.73) scale(0.158730,-0.158730)" d="M375 0V277Q375 315 351.5 338.5Q328 362 292 362Q267 362 248.0 351.5Q229 341 218.0 321.5Q207 302 207 277L148 306Q148 363 173.0 406.0Q198 449 242.5 472.5Q287 496 343 496Q397 496 438.5 470.5Q480 445 504.0 403.0Q528 361 528 311V0ZM54 0V486H207V0Z"/>
+  <path transform="translate(270.48,158.73) scale(0.158730,-0.158730)" d="M123 0V687H276V0ZM13 356V486H386V356Z"/>
+  <path transform="translate(332.54,158.73) scale(0.158730,-0.158730)" d="M294 -11Q215 -11 153.5 21.5Q92 54 57.0 112.0Q22 170 22 243Q22 316 56.5 373.5Q91 431 150.0 464.0Q209 497 283 497Q355 497 410.0 466.0Q465 435 496.5 380.0Q528 325 528 254Q528 241 526.5 226.5Q525 212 521 193L102 192V297L456 298L390 254Q389 296 377.0 323.5Q365 351 341.5 365.5Q318 380 284 380Q248 380 221.5 363.5Q195 347 180.5 317.0Q166 287 166 244Q166 201 181.5 170.5Q197 140 225.5 123.5Q254 107 293 107Q329 107 358.0 119.5Q387 132 409 157L493 73Q457 31 406.0 10.0Q355 -11 294 -11Z"/>
+  <path transform="translate(418.25,158.73) scale(0.158730,-0.158730)" d="M54 0V486H207V0ZM207 267 143 317Q162 402 207.0 449.0Q252 496 332 496Q367 496 393.5 485.5Q420 475 440 453L349 338Q339 349 324.0 355.0Q309 361 290 361Q252 361 229.5 337.5Q207 314 207 267Z"/>
+  <path transform="translate(487.46,158.73) scale(0.158730,-0.158730)" d="M375 0V277Q375 315 351.5 338.5Q328 362 292 362Q267 362 248.0 351.5Q229 341 218.0 321.5Q207 302 207 277L148 306Q148 363 173.0 406.0Q198 449 242.5 472.5Q287 496 343 496Q397 496 438.5 470.5Q480 445 504.0 403.0Q528 361 528 311V0ZM54 0V486H207V0Z"/>
+  </g>
+</svg>
