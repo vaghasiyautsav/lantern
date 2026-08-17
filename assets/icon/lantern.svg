@@ -1,43 +1,37 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <!--
-    Lantern icon — "Kept Flame", Indian form.
-    A diya: the clay lamp lit at Diwali and kept in every home. One vessel,
-    one flame. Beneath it, a rangoli arc of dots — many small lights warmed
-    by one flame; the peers on the network. Nothing else.
+    Lantern icon — "Kept Flame", Indian form: the akash kandil.
+    The star lantern hung at the threshold during Diwali: lit paper,
+    eight points, streamers in the night breeze. One glowing star,
+    kept close. Nothing else.
   -->
   <defs>
-    <!-- Night field -->
     <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0"   stop-color="#20284a"/>
       <stop offset="0.5" stop-color="#171e38"/>
       <stop offset="1"   stop-color="#0d1124"/>
     </linearGradient>
 
-    <!-- Patient radiance -->
     <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0"    stop-color="#ffd9a0" stop-opacity="0.50"/>
-      <stop offset="0.3"  stop-color="#ffb454" stop-opacity="0.26"/>
-      <stop offset="0.6"  stop-color="#8f7ce0" stop-opacity="0.08"/>
-      <stop offset="1"    stop-color="#4a5aa8" stop-opacity="0"/>
+      <stop offset="0"   stop-color="#ffd9a0" stop-opacity="0.45"/>
+      <stop offset="0.35" stop-color="#ffb454" stop-opacity="0.20"/>
+      <stop offset="0.7" stop-color="#8f7ce0" stop-opacity="0.06"/>
+      <stop offset="1"   stop-color="#4a5aa8" stop-opacity="0"/>
     </radialGradient>
 
-    <!-- Flame: white heart through gold to saffron -->
-    <linearGradient id="flame" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"    stop-color="#ff9e3d"/>
-      <stop offset="0.35" stop-color="#ffc35e"/>
-      <stop offset="0.75" stop-color="#ffe9b0"/>
-      <stop offset="1"    stop-color="#fff6e0"/>
-    </linearGradient>
-    <radialGradient id="flameheart" cx="0.5" cy="0.72" r="0.5">
-      <stop offset="0"   stop-color="#fffdf5" stop-opacity="0.95"/>
-      <stop offset="1"   stop-color="#fffdf5" stop-opacity="0"/>
+    <!-- Lit paper: white-gold heart to saffron to crimson point-tips -->
+    <radialGradient id="paper" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0"    stop-color="#fff3d8"/>
+      <stop offset="0.3"  stop-color="#ffce75"/>
+      <stop offset="0.62" stop-color="#ff9e3d"/>
+      <stop offset="0.85" stop-color="#ef6c2a"/>
+      <stop offset="1"    stop-color="#d84f26"/>
     </radialGradient>
 
-    <!-- Terracotta vessel, lit from above by its own flame -->
-    <linearGradient id="clay" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"    stop-color="#a45238"/>
-      <stop offset="0.35" stop-color="#7e3a27"/>
-      <stop offset="1"    stop-color="#451f14"/>
+    <linearGradient id="tassel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#ffb454" stop-opacity="0.9"/>
+      <stop offset="0.7" stop-color="#ff9e3d" stop-opacity="0.5"/>
+      <stop offset="1"   stop-color="#ff9e3d" stop-opacity="0"/>
     </linearGradient>
 
     <clipPath id="squircle">
@@ -45,7 +39,7 @@
     </clipPath>
 
     <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur stdDeviation="24"/>
+      <feGaussianBlur stdDeviation="26"/>
     </filter>
   </defs>
 
@@ -53,55 +47,46 @@
     <!-- night -->
     <rect width="1024" height="1024" fill="url(#field)"/>
 
-    <!-- radiance, centred on the flame -->
-    <circle cx="512" cy="452" r="480" fill="url(#glow)"/>
+    <!-- radiance -->
+    <circle cx="512" cy="470" r="470" fill="url(#glow)"/>
 
-    <!-- flame halo -->
-    <ellipse cx="512" cy="440" rx="150" ry="180" fill="#ff9e3d"
-             opacity="0.30" filter="url(#soft)"/>
+    <!-- cord and loop -->
+    <circle cx="512" cy="78" r="16" fill="none" stroke="#4d5788" stroke-width="12"/>
+    <line x1="512" y1="94" x2="512" y2="208" stroke="#4d5788" stroke-width="10"
+          stroke-linecap="round"/>
 
-    <!-- the flame: a single almond, tip drawn upward -->
-    <path d="M 512 268
-             C 560 352 596 420 596 486
-             C 596 552 560 592 512 592
-             C 464 592 428 552 428 486
-             C 428 420 464 352 512 268 Z"
-          fill="url(#flame)"/>
-    <!-- white heart low in the flame, where the wick feeds it -->
-    <ellipse cx="512" cy="520" rx="58" ry="72" fill="url(#flameheart)"/>
+    <!-- halo behind the star -->
+    <circle cx="512" cy="470" r="200" fill="#ff9e3d" opacity="0.30" filter="url(#soft)"/>
 
-    <!-- wick -->
-    <rect x="504" y="586" width="16" height="30" rx="8" fill="#3a1c10"/>
+    <!-- the kandil: eight points — tall, wide, and four short diagonals -->
+    <path d="M 512 210
+             L 547 385 L 624 358 L 597 435 L 742 470
+             L 597 505 L 624 582 L 547 555 L 512 730
+             L 477 555 L 400 582 L 427 505 L 282 470
+             L 427 435 L 400 358 L 477 385 Z"
+          fill="url(#paper)"/>
 
-    <!-- the diya: shallow clay boat, tips gently upturned -->
-    <path d="M 232 614
-             C 260 600 330 622 512 622
-             C 694 622 764 600 792 614
-             C 788 640 756 690 700 722
-             C 646 752 576 766 512 766
-             C 448 766 378 752 324 722
-             C 268 690 236 640 232 614 Z"
-          fill="url(#clay)"/>
-    <!-- rim, lit by the flame -->
-    <path d="M 232 614
-             C 260 600 330 622 512 622
-             C 694 622 764 600 792 614"
-          fill="none" stroke="#e8945e" stroke-width="10"
-          stroke-linecap="round" opacity="0.85"/>
-    <!-- warm pool of light inside the bowl -->
-    <ellipse cx="512" cy="632" rx="180" ry="16" fill="#ffb454" opacity="0.35"/>
-
-    <!-- rangoli: many small lights warmed by one flame -->
-    <g fill="#e8b04b">
-      <circle cx="512" cy="852" r="11" opacity="0.55"/>
-      <circle cx="428" cy="846" r="7"  opacity="0.42"/>
-      <circle cx="596" cy="846" r="7"  opacity="0.42"/>
-      <circle cx="348" cy="830" r="9"  opacity="0.34"/>
-      <circle cx="676" cy="830" r="9"  opacity="0.34"/>
-      <circle cx="274" cy="804" r="6"  opacity="0.26"/>
-      <circle cx="750" cy="804" r="6"  opacity="0.26"/>
-      <circle cx="208" cy="770" r="8"  opacity="0.18"/>
-      <circle cx="816" cy="770" r="8"  opacity="0.18"/>
+    <!-- fold lines: the paper's craft, barely there -->
+    <g stroke="#a83a1e" stroke-width="5" opacity="0.28" stroke-linecap="round">
+      <line x1="512" y1="470" x2="512" y2="222"/>
+      <line x1="512" y1="470" x2="512" y2="718"/>
+      <line x1="512" y1="470" x2="294" y2="470"/>
+      <line x1="512" y1="470" x2="730" y2="470"/>
+      <line x1="512" y1="470" x2="616" y2="366"/>
+      <line x1="512" y1="470" x2="616" y2="574"/>
+      <line x1="512" y1="470" x2="408" y2="366"/>
+      <line x1="512" y1="470" x2="408" y2="574"/>
     </g>
+
+    <!-- the flame heart at the star's centre -->
+    <circle cx="512" cy="470" r="72" fill="#fff3d8" opacity="0.85"/>
+    <circle cx="512" cy="470" r="44" fill="#fffdf5"/>
+
+    <!-- streamers, hanging from the star's lower points -->
+    <rect x="500" y="726" width="24" height="178" rx="12" fill="url(#tassel)"/>
+    <rect x="391" y="576" width="18" height="142" rx="9" fill="url(#tassel)"
+          transform="rotate(-8 400 580)"/>
+    <rect x="615" y="576" width="18" height="142" rx="9" fill="url(#tassel)"
+          transform="rotate(8 624 580)"/>
   </g>
 </svg>

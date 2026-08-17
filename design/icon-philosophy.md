@@ -47,17 +47,21 @@ kept close, made perfect.
 
 ---
 
-## The Indian form: the diya
+## The Indian form: the akash kandil
 
-The final mark realizes Kept Flame through the **diya** — the terracotta
-oil lamp lit at Diwali and kept, one small flame at a time, in every home.
-No form on earth says "a light that is owned, not rented" more plainly, or
-with fewer strokes: a shallow clay boat, a single almond of fire with its
-white heart low where the wick feeds it, a rim caught in its own light.
+The final mark realizes Kept Flame through the **akash kandil** — the
+star lantern hung at the threshold through Diwali, lit paper glowing
+from a single lamp inside. It is India's lantern, and it answers the
+app's name directly: a light hung out so that others can find the house.
 
-Beneath it, an arc of small gold points — drawn from **rangoli**, the
-dot-patterns laid at thresholds to welcome. In this mark they carry the
-network's meaning: many small lights on the same floor, warmed by one
-flame. The nearest are brightest; they fade with distance, as peers do.
-Nothing else is permitted. Clay, fire, and welcome — the whole app,
-in three ideas older than writing.
+Eight points — tall, wide, and four short diagonals — with the white-gold
+heart at the centre where the flame lives, saffron deepening to crimson
+at the tips the way lit paper darkens toward its folds. Fold lines barely
+present: the craft of the paper, felt more than seen. A cord and loop
+above, because a kandil is *hung*, deliberately, where the lane can see
+it. Streamers below, caught mid-sway, fading like the light they trail.
+
+An earlier study used the diya; the kandil supersedes it. A diya is a
+light kept at your own feet. A kandil is a light raised for the
+neighborhood — and this app is the neighborhood's. One star, hung out,
+glowing for whoever is near. Nothing else.
