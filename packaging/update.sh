@@ -90,6 +90,18 @@ Set LANTERN_SRC to your clone, e.g.  LANTERN_SRC=~/dev/lantern lantern-update"
 command -v git >/dev/null 2>&1 || fail start "git isn't installed."
 [ -d "$REPO/.git" ] || fail start "No git checkout at $REPO."
 
+# This script is normally started by the app, detached, with no terminal
+# attached to it. A git that decides it needs a credential would block on a
+# prompt nobody can see or answer, and the update would sit at "running"
+# forever with no error to show. Make every such case fail instead: no
+# terminal prompt, ssh in batch mode with a connect timeout, and a stalled
+# HTTPS transfer given up on rather than waited out.
+export GIT_TERMINAL_PROMPT=0
+export SSH_ASKPASS_REQUIRE=never
+export GIT_HTTP_LOW_SPEED_LIMIT=1000
+export GIT_HTTP_LOW_SPEED_TIME=20
+export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
+
 # 1. Refuse to touch a dirty tree ------------------------------------------
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
     fail start "There are uncommitted changes in $REPO. Lantern won't touch them — commit or stash them first:

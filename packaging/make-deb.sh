@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-VERSION=0.1.0
+VERSION=0.1.1
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 STAGE=$(mktemp -d)/lantern-deb
 

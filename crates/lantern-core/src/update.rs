@@ -91,6 +91,25 @@ impl UpdateCheck {
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
+        // An engine launched from Finder or a desktop launcher has no
+        // terminal. Without this git does not fail when it needs a
+        // credential — it *blocks*, forever, on a username prompt nobody can
+        // answer. The check never returns, and whatever is waiting on it (the
+        // macOS shell's update sheet, over the localhost API) spins with no
+        // way out. Fail instead, so the caller can say why.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // The same hole one layer down: ssh must not sit on a passphrase
+        // prompt, and must not summon a graphical asker either.
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        // And a connection that is accepted but never answered has to end on
+        // its own — a fetch to a black hole would otherwise hang as surely as
+        // any prompt.
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+        .env("GIT_HTTP_LOW_SPEED_TIME", "20")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5              -o ServerAliveCountMax=3",
+        )
         .arg("-C")
         .arg(repo)
         .args(args)

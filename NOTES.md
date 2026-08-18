@@ -75,7 +75,7 @@ checkpointed), **live transfer speed + ETA** (`CoreEvent::TransferProgress`,
 `core::rate`), **update from GitHub** (`core::update` +
 `packaging/update.sh`, also the standalone `lantern-update`), **look-again**
 (`BeaconType::Ping` via `core.refresh()` / `POST /api/refresh`, behind a
-refresh button in every shell). 39 tests workspace-wide, clippy
+refresh button in every shell). 40 tests workspace-wide, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
@@ -123,11 +123,15 @@ compile this crate (no GTK4), so write it on Linux or expect a fixup pass.
 
 ## CI — `.github/workflows/ci.yml` (18 Aug 2026)
 
-Four jobs: `check` (test + clippy, the bar above, with `-D warnings` on
-the clippy invocation only — putting it in `RUSTFLAGS` would fail the build
-on a *dependency's* warning), `linux` → `.deb`, `macos` → `.dmg`, `windows` →
-`.exe`. Tagging `v*` publishes all three to a GitHub release via the
-preinstalled `gh`, so no third-party release action and no extra token.
+Five jobs: `check` (test + clippy, the bar above, with `-D warnings` on the
+clippy invocation only — putting it in `RUSTFLAGS` would fail the build on a
+*dependency's* warning), `linux` → `.deb`, `macos` → `.dmg`, `windows` →
+`.zip` (cross-built on Linux by `packaging/make-windows.sh`), and
+`windows-msvc`, which builds natively and ships nothing — it proves the
+engine compiles with Microsoft's toolchain, a different claim from "we can
+package it". Tagging `v*` publishes the three packages to a GitHub release
+via the preinstalled `gh`, so no third-party release action and no extra
+token.
 
 The matrix also closes a hole this project keeps falling into: a Mac session
 cannot compile `apps/linux-native`, a Linux session cannot compile the
@@ -460,6 +464,47 @@ person's problem).
 `install.sh` unlinks each binary before copying it. Overwriting a *running*
 executable fails with `ETXTBSY`, and since the updater normally runs while
 Lantern is open, that was a guaranteed failure on the common path.
+
+### Fixed 18 Aug 2026 — the update check could hang forever
+
+**Symptom:** on macOS, "check for updates" left the sheet spinning and the
+app looking wedged.
+
+**Cause:** `update::git()` ran git with the environment it inherited. An
+engine launched from Finder or a desktop launcher has **no terminal**, so
+when git decided it needed a credential it did not fail — it blocked, on a
+username prompt nobody could see or answer. `check_blocking` never returned,
+so the localhost API request never returned, so the sheet spun. `ssh` could
+stall the same way on a passphrase prompt, and a connection accepted but
+never answered had nothing to end it either.
+
+**Fix:** every git invocation now runs with `GIT_TERMINAL_PROMPT=0`,
+`SSH_ASKPASS_REQUIRE=never`, `GIT_SSH_COMMAND` carrying `BatchMode=yes` and
+`ConnectTimeout=10`, and the HTTP low-speed limits. Each turns a hang into an
+error the caller can show. `packaging/update.sh` exports the same set — it
+runs detached during an apply, where a silent block would leave the state
+file reading "running" forever with nothing to report.
+
+**Keep this in mind for anything that shells out** from a GUI-launched
+process: the absence of a terminal turns "prompt the user" into "wait
+forever". It is not specific to git.
+
+### Windows packaging — 18 Aug 2026
+
+The v0.1.0 release attached three loose `.exe` files, because the CI job
+uploaded binaries rather than a package: a Windows user's first experience
+would have been a console that appears to do nothing. CI now runs
+`packaging/make-windows.sh`, the same script a person runs by hand, which
+cross-builds with mingw and produces `lantern-windows-x64.zip` carrying
+`Start-Lantern.cmd` and a README. The native MSVC job stays as
+`windows-msvc` and ships nothing — it exists to prove the engine compiles
+with Microsoft's toolchain, which is a different claim from "we can package
+it".
+
+**The version is hand-maintained in five places** — `Cargo.toml`,
+`packaging/make-deb.sh`, `packaging/make-dmg.sh`, and twice in `install.sh`.
+Nothing checks that they agree. Bump them together or a `.deb` will claim a
+version the binary inside it does not.
 
 ## Open defects
 
