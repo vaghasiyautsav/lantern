@@ -17,6 +17,7 @@ fn config(name: &str, dir: &std::path::Path, my_port: u16, other_port: u16) -> C
         broadcast: false,
         quic_port: 0,
         in_memory_store: false,
+        group: String::new(),
         auto_accept_limit: None,
         // Stay inside the test's tempdir — never the real Downloads folder.
         download_dir: None,

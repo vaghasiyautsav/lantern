@@ -75,7 +75,7 @@ checkpointed), **live transfer speed + ETA** (`CoreEvent::TransferProgress`,
 `core::rate`), **update from GitHub** (`core::update` +
 `packaging/update.sh`, also the standalone `lantern-update`), **look-again**
 (`BeaconType::Ping` via `core.refresh()` / `POST /api/refresh`, behind a
-refresh button in every shell). 43 tests workspace-wide, clippy
+refresh button in every shell). 45 tests workspace-wide, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
@@ -547,6 +547,34 @@ run ever hangs rather than fails, look for exactly this shape.
 unread seeding (the core APIs are there; shells behave as before with
 `auto_accept_limit: None`). ipmsg features still open: groups/multi-send,
 sealed messages, inline images, offline send queue (Phase 4), cross-subnet.
+
+### 18 Aug 2026, late — sealed, groups, inline images, offline queue
+
+All four rode wire fields that existed since day one; no protocol change.
+
+- **Sealed messages** (`send_sealed` / `open_message`). The receive event
+  carries `sealed: true` and an **empty text** — the words are on disk for
+  the shell to reveal, but must not sit in a lock-screen notification the
+  seal was meant to keep closed. Opening sends `Ack{kind:"opened"}`; the
+  sender's copy flips to state 2 and `MessageOpened` fires. GTK: lock
+  toggle in the composer, envelope button in the thread. CLI: `/seal`.
+- **Groups**: `CoreConfig.group` rides the beacon's `group` field;
+  `PeerSeen`/`PeerView` carry it; roster clusters by it. `send_to_group`
+  fans one line out; CLI: `/msg @group text`. GTK sets it from
+  `LANTERN_GROUP` (a settings UI when someone wants one).
+- **Offline queue**: **the message row is the queue.** Outgoing rows at
+  state 0 are exactly what never got a delivery ack, so a beacon sighting
+  runs `flush_undelivered` — re-sends with the same mid, harmless because
+  the receiver's INSERT OR IGNORE dedups and still acks. No new table, no
+  scheduler. Text only: files stay fail-loud on purpose.
+- **Inline images** (GTK): an image *is* a file transfer — ipmsg's are too —
+  so the only new thing is rendering: image extensions get a picture bubble
+  (click opens the viewer), and Ctrl-V with an image on the clipboard saves
+  a PNG under `<data>/outbox/` and sends it as a file. Text paste falls
+  through untouched.
+
+Not carried to macOS/web: seal/open UI, group config, image bubbles (the
+JSON already carries `sealed`, `group`, `opened`).
 
 ## Open defects
 

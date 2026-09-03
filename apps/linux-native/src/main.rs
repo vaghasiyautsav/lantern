@@ -48,6 +48,7 @@ struct PeerRow {
     state: lantern_core::Presence,
     /// Refreshed by the 30 s roster poll; a beacon sighting sets it true.
     online: bool,
+    group: String,
 }
 
 #[derive(Default)]
@@ -107,6 +108,7 @@ fn main() -> glib::ExitCode {
             discovery_port,
             beacon_targets: targets,
             broadcast,
+            group: std::env::var("LANTERN_GROUP").unwrap_or_default(),
             quic_port: 0,
             in_memory_store: false,
             // Files from verified peers fetch straight away; a stranger's
@@ -215,6 +217,15 @@ fn fmt_size(bytes: u64) -> String {
 }
 
 /// `/home/u/Downloads` → `~/Downloads`, so a status line stays readable.
+/// Good enough for "show it in the chat": the extensions people actually
+/// paste and drop. Anything else stays a file card.
+fn is_image(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+    )
+}
+
 fn abbreviate_home(path: &std::path::Path) -> String {
     let Some(home) = std::env::var_os("HOME") else {
         return path.display().to_string();
@@ -473,6 +484,11 @@ fn build_ui(
     composer.set_margin_end(10);
     let attach_btn = gtk::Button::from_icon_name("mail-attachment-symbolic");
     attach_btn.set_tooltip_text(Some("Send a file"));
+    let seal_btn = gtk::ToggleButton::new();
+    seal_btn.set_icon_name("channel-secure-symbolic");
+    seal_btn.set_tooltip_text(Some(
+        "Seal — they see a closed envelope until they open it, and you see when they do",
+    ));
     let entry = gtk::Entry::builder()
         .placeholder_text("Message…")
         .hexpand(true)
@@ -481,6 +497,7 @@ fn build_ui(
     send_btn.add_css_class("suggested-action");
     send_btn.set_sensitive(false);
     composer.append(&attach_btn);
+    composer.append(&seal_btn);
     composer.append(&entry);
     composer.append(&send_btn);
     right.append(&composer);
@@ -653,6 +670,56 @@ fn build_ui(
         }
     };
 
+    // A sealed message shows as a closed envelope until clicked. The text
+    // is already on disk (history has it); withholding is presentation plus
+    // the opened-ack — which is the part the sender actually sees.
+    let append_sealed = {
+        let append_row = append_row.clone();
+        let backend = Rc::clone(&backend);
+        move |sender: &str, key: &str, ts: u64, mid: lantern_core::Uuid, peer: [u8; 32]| {
+            let btn = gtk::Button::with_label("🔒 Sealed message — click to open");
+            btn.add_css_class("flat");
+            let backend = Rc::clone(&backend);
+            btn.connect_clicked(move |b| {
+                let core = Arc::clone(&backend.core);
+                backend.rt.spawn(async move {
+                    core.open_message(mid).await;
+                });
+                // ponytail: text looked up from the last 200; a seal older
+                // than that reveals on the next conversation open instead.
+                let text = backend
+                    .core
+                    .history(&peer, 200)
+                    .into_iter()
+                    .find(|m| m.mid == mid)
+                    .map(|m| m.text)
+                    .unwrap_or_else(|| "(reopen the conversation to read)".into());
+                b.set_label(&text);
+                b.set_sensitive(false);
+            });
+            append_row(false, sender, key, ts, None, btn.upcast_ref::<gtk::Widget>());
+        }
+    };
+
+    // An image lands as a picture in the thread, not a file card — ipmsg's
+    // inline images ride its file transfer too; the only difference is the
+    // rendering.
+    let append_picture = {
+        let append_row = append_row.clone();
+        move |outgoing: bool, sender: &str, key: &str, ts: u64, path: &std::path::Path| {
+            let pic = gtk::Picture::for_filename(path);
+            pic.set_can_shrink(true);
+            pic.set_height_request(220);
+            let click = gtk::GestureClick::new();
+            let uri = format!("file://{}", path.display());
+            click.connect_released(move |_, _, _, _| {
+                let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+            });
+            pic.add_controller(click);
+            append_row(outgoing, sender, key, ts, None, pic.upcast_ref::<gtk::Widget>());
+        }
+    };
+
     let append_file = {
         let append_row = append_row.clone();
         let state = Rc::clone(&state);
@@ -806,15 +873,20 @@ fn build_ui(
                 } else {
                     n.set_text(&p.name);
                 }
+                let where_ = if p.group.is_empty() {
+                    p.host.clone()
+                } else {
+                    format!("{} · {}", p.group, p.host)
+                };
                 let sub = match (p.online, p.state) {
-                    (false, _) => format!("{} · offline", p.host),
+                    (false, _) => format!("{where_} · offline"),
                     (true, lantern_core::Presence::Away) => {
-                        format!("{} · away", p.host)
+                        format!("{where_} · away")
                     }
                     (true, lantern_core::Presence::Dnd) => {
-                        format!("{} · do not disturb", p.host)
+                        format!("{where_} · do not disturb")
                     }
-                    (true, _) => p.host.clone(),
+                    (true, _) => where_,
                 };
                 let h = gtk::Label::new(Some(&sub));
                 h.set_halign(gtk::Align::Start);
@@ -861,6 +933,7 @@ fn build_ui(
         let stack = stack.clone();
         let entry = entry.clone();
         let clear_btn = clear_btn.clone();
+        let append_sealed = append_sealed.clone();
         let append_text = append_text.clone();
         let refresh_peers = refresh_peers.clone();
         let pin_to_bottom = pin_to_bottom.clone();
@@ -934,6 +1007,8 @@ fn build_ui(
                         Some(m.state >= 1),
                         &m.text,
                     );
+                } else if m.sealed {
+                    append_sealed(&peer.name, &hex::encode(peer.id), m.ts, m.mid, peer.id);
                 } else {
                     append_text(
                         false,
@@ -962,6 +1037,7 @@ fn build_ui(
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
         let entry = entry.clone();
+        let seal_btn = seal_btn.clone();
         let append_text = append_text.clone();
         let flash = flash.clone();
         let pin_to_bottom = pin_to_bottom.clone();
@@ -975,15 +1051,28 @@ fn build_ui(
                 return;
             };
             entry.set_text("");
+            let sealed = seal_btn.is_active();
+            seal_btn.set_active(false); // one seal per press, like ipmsg
             let now = glib::real_time() as u64 / 1000;
-            append_text(true, &backend.my_name, "me-self", now, Some(false), &text);
+            append_text(
+                true,
+                &backend.my_name,
+                "me-self",
+                now,
+                Some(false),
+                &if sealed { format!("🔒 {text}") } else { text.clone() },
+            );
             // Sending always follows, even if we were reading history.
             pin_to_bottom();
             let core = Arc::clone(&backend.core);
             let (tx, rx) = async_channel::bounded::<Option<String>>(1);
             backend.rt.spawn(async move {
-                let err = core.send_message(peer, &text).await.err().map(|e| e.to_string());
-                let _ = tx.send(err).await;
+                let r = if sealed {
+                    core.send_sealed(peer, &text).await
+                } else {
+                    core.send_message(peer, &text).await
+                };
+                let _ = tx.send(r.err().map(|e| e.to_string())).await;
             });
             let flash = flash.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -997,6 +1086,7 @@ fn build_ui(
         let do_send = do_send.clone();
         entry.connect_activate(move |_| do_send());
     }
+
     {
         let do_send = do_send.clone();
         send_btn.connect_clicked(move |_| do_send());
@@ -1009,8 +1099,10 @@ fn build_ui(
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
         let append_file = append_file.clone();
+        let append_picture = append_picture.clone();
         let flash = flash.clone();
         move |path: std::path::PathBuf| {
+            let path_ui = path.clone();
             let Some(peer) = state.borrow().selected else {
                 return;
             };
@@ -1033,6 +1125,7 @@ fn build_ui(
                 let _ = tx.send(r).await;
             });
             let append_file = append_file.clone();
+            let append_picture = append_picture.clone();
             let flash = flash.clone();
             let pin_to_bottom = pin_to_bottom.clone();
             let my_name = backend.my_name.clone();
@@ -1043,6 +1136,9 @@ fn build_ui(
                         append_file(
                             true, &my_name, "me-self", now, &xid, &name, size, "sending…",
                         );
+                        if is_image(&path_ui) {
+                            append_picture(true, &my_name, "me-self", now, &path_ui);
+                        }
                         pin_to_bottom();
                     }
                     Ok(Err(e)) => flash(&format!("Couldn't send {name} — {e}")),
@@ -1071,6 +1167,39 @@ fn build_ui(
                 send_path(path);
             });
         });
+    }
+
+    {
+        let send_path = send_path.clone();
+        let backend = Rc::clone(&backend);
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key.connect_key_pressed(move |_, keyval, _, modifier| {
+            if keyval != gdk::Key::v || !modifier.contains(gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let Some(display) = gdk::Display::default() else {
+                return glib::Propagation::Proceed;
+            };
+            let clipboard = display.clipboard();
+            // Only claim the paste when it is an image; text falls through
+            // to the entry's own handler.
+            if !clipboard.formats().contains_type(gdk::Texture::static_type()) {
+                return glib::Propagation::Proceed;
+            }
+            let dir = backend.data_dir.join("outbox");
+            let send_path = send_path.clone();
+            clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| {
+                let Ok(Some(texture)) = res else { return };
+                let _ = std::fs::create_dir_all(&dir);
+                let file = dir.join(format!("pasted-{}.png", glib::real_time()));
+                if texture.save_to_png(&file).is_ok() {
+                    send_path(file);
+                }
+            });
+            glib::Propagation::Stop
+        });
+        entry.add_controller(key);
     }
 
     // ---- drop files onto the conversation --------------------------------
@@ -1494,6 +1623,8 @@ fn build_ui(
         let refresh_peers = refresh_peers.clone();
         let append_text = append_text.clone();
         let append_file = append_file.clone();
+        let append_sealed = append_sealed.clone();
+        let append_picture = append_picture.clone();
         let set_file_state = set_file_state.clone();
         let set_file_progress = set_file_progress.clone();
         let app = app.clone();
@@ -1501,7 +1632,7 @@ fn build_ui(
         glib::MainContext::default().spawn_local(async move {
             while let Ok(ev) = rx.recv().await {
                 match ev {
-                    CoreEvent::PeerSeen { id, name, host, addr, state: pstate, .. } => {
+                    CoreEvent::PeerSeen { id, name, host, addr, state: pstate, group, .. } => {
                         let mut st = state.borrow_mut();
                         if let Some(p) = st.peers.iter_mut().find(|p| p.id == id) {
                             p.name = name;
@@ -1509,6 +1640,7 @@ fn build_ui(
                             p.addr = addr.to_string();
                             p.state = pstate;
                             p.online = true;
+                            p.group = group;
                         } else {
                             st.peers.push(PeerRow {
                                 id,
@@ -1517,9 +1649,15 @@ fn build_ui(
                                 addr: addr.to_string(),
                                 state: pstate,
                                 online: true,
+                                group,
                             });
-                            st.peers.sort_by(|a, b| a.name.cmp(&b.name));
                         }
+                        // Groups cluster together, like the roster they came
+                        // from; ungrouped peers sort after any group.
+                        st.peers.sort_by(|a, b| {
+                            (a.group.is_empty(), &a.group, &a.name)
+                                .cmp(&(b.group.is_empty(), &b.group, &b.name))
+                        });
                         drop(st);
                         refresh_peers();
                     }
@@ -1557,11 +1695,15 @@ fn build_ui(
                             },
                         );
                     }
-                    CoreEvent::MessageReceived { peer, peer_name, text, ts, .. } => {
+                    CoreEvent::MessageReceived { peer, peer_name, text, ts, mid, sealed, .. } => {
                         let open = state.borrow().selected == Some(peer);
                         if open {
                             backend.core.mark_read(&peer);
-                            append_text(false, &peer_name, &hex::encode(peer), ts, None, &text);
+                            if sealed {
+                                append_sealed(&peer_name, &hex::encode(peer), ts, mid, peer);
+                            } else {
+                                append_text(false, &peer_name, &hex::encode(peer), ts, None, &text);
+                            }
                         } else {
                             *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
                             refresh_peers();
@@ -1570,7 +1712,13 @@ fn build_ui(
                             // window is not already in front of the user.
                             if !window.is_active() {
                                 let n = gio::Notification::new(&peer_name);
-                                n.set_body(Some(&text));
+                                // A sealed message's whole point is that its
+                                // text is not lying on the lock screen.
+                                n.set_body(Some(if sealed {
+                                    "sent a sealed message"
+                                } else {
+                                    &text
+                                }));
                                 app.send_notification(Some("lantern-message"), &n);
                             }
                         }
@@ -1595,7 +1743,18 @@ fn build_ui(
                             refresh_peers();
                         }
                     }
-                    CoreEvent::FileReceived { xid, path, .. } => {
+                    CoreEvent::FileReceived { xid, path, peer, .. } => {
+                        if is_image(&path) {
+                            let who = state
+                                .borrow()
+                                .peers
+                                .iter()
+                                .find(|p| p.id == peer)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| "them".into());
+                            let now = glib::real_time() as u64 / 1000;
+                            append_picture(false, &who, &hex::encode(peer), now, &path);
+                        }
                         // Report where it actually went, rather than a
                         // literal that goes stale the moment the download
                         // directory is configurable.

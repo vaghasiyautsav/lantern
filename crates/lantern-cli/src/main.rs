@@ -6,7 +6,8 @@
 //! lantern run --name Mira --data-dir /tmp/mira \
 //!     --discovery-port 4001 --targets 4001,4002
 //! ```
-//! Commands on stdin: /peers · /msg <name-prefix> <text> · /refresh ·
+//! Commands on stdin: /peers · /msg <name-prefix|@group> <text> ·
+//! /seal <name-prefix> <text> · /refresh ·
 //! /clear <name-prefix> (delete this machine's history with them) ·
 //! /whoami · /quit
 
@@ -36,6 +37,9 @@ struct Args {
     /// Pass `--broadcast=false` for isolated same-host tests.
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     broadcast: bool,
+    /// Group label to announce (like ipmsg's group). Empty = none.
+    #[arg(long, default_value = "")]
+    group: String,
     /// Keep the message log in memory only.
     #[arg(long, default_value_t = false)]
     ephemeral: bool,
@@ -75,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         discovery_port: args.discovery_port,
         beacon_targets: targets,
         broadcast: args.broadcast,
+        group: args.group.clone(),
         quic_port: 0,
         in_memory_store: args.ephemeral,
         // Headless: nobody is present to click a consent dialog, so offers
@@ -110,11 +115,20 @@ async fn main() -> anyhow::Result<()> {
                         println!("EVENT session {}", hex::encode(&id[..6]));
                     }
                 }
-                CoreEvent::MessageReceived { peer_name, text, mid, .. } => {
+                CoreEvent::MessageReceived { peer_name, text, mid, sealed, .. } => {
                     if script {
                         println!("EVENT msg {mid} {peer_name} {text}");
+                    } else if sealed {
+                        println!("{peer_name}: [sealed message — open in a GUI shell]");
                     } else {
                         println!("{peer_name}: {text}");
+                    }
+                }
+                CoreEvent::MessageOpened { mid } => {
+                    if script {
+                        println!("EVENT opened {mid}");
+                    } else {
+                        println!("  ✓ opened");
                     }
                 }
                 CoreEvent::MessageDelivered { mid } => {
@@ -210,11 +224,19 @@ async fn main() -> anyhow::Result<()> {
         if line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("/msg ") {
+        if let Some(rest) = line.strip_prefix("/msg ").or_else(|| line.strip_prefix("/seal ")) {
+            let sealed = line.starts_with("/seal ");
             let Some((target, text)) = rest.split_once(' ') else {
-                println!("usage: /msg <name-prefix> <text>");
+                println!("usage: /msg <name-prefix|@group> <text>  ·  /seal <name-prefix> <text>");
                 continue;
             };
+            // "@builders hello" fans one line out to everyone announcing
+            // that group label.
+            if let Some(group) = target.strip_prefix('@') {
+                let sent = core.send_to_group(group, text).await;
+                println!("→ @{group}: {text}  ({} member(s))", sent.len());
+                continue;
+            }
             let peers = core.peers().await;
             let matched: Vec<_> = peers
                 .iter()
@@ -222,7 +244,11 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             match matched.as_slice() {
                 [] => println!("no peer matching '{target}'"),
-                [p] => match core.send_message(p.id, text).await {
+                [p] => match if sealed {
+                    core.send_sealed(p.id, text).await
+                } else {
+                    core.send_message(p.id, text).await
+                } {
                     Ok(mid) => {
                         if args.script {
                             println!("SENT {mid}");

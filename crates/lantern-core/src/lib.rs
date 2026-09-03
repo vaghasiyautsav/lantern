@@ -46,6 +46,8 @@ pub enum CoreEvent {
         state: PresenceState,
         /// Their free-text status line, usually empty.
         status: String,
+        /// Group label from their beacon, empty when none.
+        group: String,
     },
     SessionEstablished {
         id: [u8; 32],
@@ -54,11 +56,18 @@ pub enum CoreEvent {
         peer: [u8; 32],
         peer_name: String,
         mid: Uuid,
+        /// Empty when `sealed` — the text is on disk, but a shell must not
+        /// flash it in a notification the seal was meant to keep closed.
         text: String,
         ts: u64,
         reply_to: Option<Uuid>,
+        sealed: bool,
     },
     MessageDelivered {
+        mid: Uuid,
+    },
+    /// The peer broke the seal on a message we sent sealed.
+    MessageOpened {
         mid: Uuid,
     },
     TrustWarning {
@@ -249,6 +258,8 @@ pub struct CoreConfig {
     /// 0 = ephemeral.
     pub quic_port: u16,
     pub in_memory_store: bool,
+    /// Group label announced in beacons; rosters cluster on it. Empty = none.
+    pub group: String,
     /// Auto-fetch cap for offers from **unverified** peers; verified peers
     /// are never gated. `None` accepts everything, today's behaviour.
     pub auto_accept_limit: Option<u64>,
@@ -275,6 +286,7 @@ struct PeerInfo {
     /// As announced in their last beacon.
     state: PresenceState,
     status: String,
+    group: String,
     /// When the most recent signed beacon from this identity arrived.
     /// Drives presence: an entry is kept forever (so history and trust
     /// survive), but goes offline once the beacons stop.
@@ -297,6 +309,7 @@ pub struct PeerView {
     pub online: bool,
     pub state: PresenceState,
     pub status: String,
+    pub group: String,
 }
 
 #[derive(Clone)]
@@ -430,6 +443,7 @@ impl Core {
                     online: age < OFFLINE_AFTER,
                     state: p.state,
                     status: p.status.clone(),
+                    group: p.group.clone(),
                 }
             })
             .collect()
@@ -612,7 +626,7 @@ impl Core {
             id: self.identity.public_bytes(),
             name: self.config.display_name.clone(),
             host: hostname(),
-            group: String::new(),
+            group: self.config.group.clone(),
             device: DeviceClass::Desktop,
             port: self.transport.local_port(),
             state: me.state,
@@ -661,6 +675,42 @@ impl Core {
         text: &str,
         reply_to: Option<Uuid>,
     ) -> anyhow::Result<Uuid> {
+        self.send_inner(peer, text, reply_to, false).await
+    }
+
+    /// A sealed message: delivered like any other, but shells show a closed
+    /// envelope until the receiver opens it — and the sender hears when that
+    /// happens (`MessageOpened`).
+    pub async fn send_sealed(&self, peer: [u8; 32], text: &str) -> anyhow::Result<Uuid> {
+        self.send_inner(peer, text, None, true).await
+    }
+
+    /// One line to everyone announcing this group label. Best-effort per
+    /// member: an unreachable member's copy queues like any other message.
+    pub async fn send_to_group(&self, group: &str, text: &str) -> Vec<([u8; 32], Uuid)> {
+        let members: Vec<[u8; 32]> = self
+            .peers()
+            .await
+            .into_iter()
+            .filter(|p| !group.is_empty() && p.group == group)
+            .map(|p| p.id)
+            .collect();
+        let mut out = Vec::new();
+        for m in members {
+            if let Ok(mid) = self.send_message(m, text).await {
+                out.push((m, mid));
+            }
+        }
+        out
+    }
+
+    async fn send_inner(
+        &self,
+        peer: [u8; 32],
+        text: &str,
+        reply_to: Option<Uuid>,
+        sealed: bool,
+    ) -> anyhow::Result<Uuid> {
         let mid = Uuid::new_v4();
         let ts = now_ms();
         let frame = ControlFrame::Msg {
@@ -669,7 +719,7 @@ impl Core {
             text: text.to_string(),
             fmt: "plain".into(),
             reply_to,
-            sealed: false,
+            sealed,
             receipt: false,
         };
 
@@ -681,15 +731,71 @@ impl Core {
             text: text.to_string(),
             state: 0,
             reply_to,
+            sealed: false, // never sealed to its own author
         })?;
 
-        let session = self.ensure_session(peer).await?;
-        session
-            .outbox
-            .send(frame)
-            .await
-            .map_err(|_| anyhow::anyhow!("session closed"))?;
+        // Offline queue: the row above IS the queue. If the peer cannot be
+        // reached right now, the message stays at state 0 (shells already
+        // show ◷) and flush_undelivered retries when their next beacon
+        // arrives. Files stay fail-loud — only text queues.
+        match self.ensure_session(peer).await {
+            Ok(session) => {
+                session
+                    .outbox
+                    .send(frame)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("session closed"))?;
+            }
+            Err(e) => {
+                debug!("peer unreachable, queued {mid}: {e}");
+            }
+        }
         Ok(mid)
+    }
+
+    /// Re-send everything still waiting for its delivery ack. Called when a
+    /// beacon shows the peer is reachable again; the receiver's INSERT OR
+    /// IGNORE on mid makes a duplicate re-send harmless, and its ack still
+    /// comes back to flip our state to delivered.
+    async fn flush_undelivered(&self, peer: [u8; 32]) {
+        let queued = self.store.lock().unwrap().undelivered(&peer).unwrap_or_default();
+        if queued.is_empty() {
+            return;
+        }
+        let Ok(session) = self.ensure_session(peer).await else {
+            return;
+        };
+        for m in queued {
+            let _ = session
+                .outbox
+                .send(ControlFrame::Msg {
+                    mid: m.mid,
+                    ts: m.ts,
+                    text: m.text,
+                    fmt: "plain".into(),
+                    reply_to: m.reply_to,
+                    sealed: false,
+                    receipt: false,
+                })
+                .await;
+        }
+    }
+
+    /// Break the seal on a received message: reveal locally and tell the
+    /// sender it was opened. Idempotent — a second call does nothing.
+    pub async fn open_message(&self, mid: Uuid) {
+        let peer = self.store.lock().unwrap().open_message(&mid).unwrap_or(None);
+        let Some(peer) = peer else { return };
+        if let Ok(session) = self.ensure_session(peer).await {
+            let _ = session
+                .outbox
+                .send(ControlFrame::Ack {
+                    mid,
+                    kind: "opened".into(),
+                    ts: now_ms(),
+                })
+                .await;
+        }
     }
 
     /// Send a file, chunked and resumable (§2.5, single-file form).
@@ -957,7 +1063,7 @@ impl Core {
                         }
                     };
                     match frame {
-                        ControlFrame::Msg { mid, ts, text, reply_to, .. } => {
+                        ControlFrame::Msg { mid, ts, text, reply_to, sealed, .. } => {
                             let peer_name = {
                                 let g = inner.lock().await;
                                 g.roster
@@ -973,6 +1079,7 @@ impl Core {
                                 text: text.clone(),
                                 state: 1,
                                 reply_to,
+                                sealed,
                             });
                             let _ = outbox_for_acks
                                 .send(ControlFrame::Ack {
@@ -986,15 +1093,21 @@ impl Core {
                                     peer,
                                     peer_name,
                                     mid,
-                                    text,
+                                    text: if sealed { String::new() } else { text },
                                     ts,
                                     reply_to,
+                                    sealed,
                                 })
                                 .await;
                         }
-                        ControlFrame::Ack { mid, .. } => {
-                            let _ = store.lock().unwrap().set_message_state(&mid, 1);
-                            let _ = events.send(CoreEvent::MessageDelivered { mid }).await;
+                        ControlFrame::Ack { mid, kind, .. } => {
+                            if kind == "opened" {
+                                let _ = store.lock().unwrap().set_message_state(&mid, 2);
+                                let _ = events.send(CoreEvent::MessageOpened { mid }).await;
+                            } else {
+                                let _ = store.lock().unwrap().set_message_state(&mid, 1);
+                                let _ = events.send(CoreEvent::MessageDelivered { mid }).await;
+                            }
                         }
                         ControlFrame::OfferFile { xid, name, size, chunk_size, root, chunks } => {
                             // Validate the manifest's internal consistency
@@ -1332,6 +1445,7 @@ impl Core {
                             last_beacon: Instant::now(),
                             state: beacon.state,
                             status: beacon.status.clone(),
+                            group: beacon.group.clone(),
                         },
                     );
                     is_new
@@ -1401,6 +1515,9 @@ impl Core {
                     // Answer so the other side learns us quickly too.
                     self.announce().await;
                 }
+                // They are reachable: push anything that queued while they
+                // were not. Cheap when the queue is empty (one indexed query).
+                self.flush_undelivered(beacon.id).await;
                 let _ = self
                     .events
                     .send(CoreEvent::PeerSeen {
@@ -1411,6 +1528,7 @@ impl Core {
                         new: is_new,
                         state: beacon.state,
                         status: beacon.status,
+                        group: beacon.group,
                     })
                     .await;
             }
@@ -1489,6 +1607,7 @@ impl Core {
                                         last_beacon: Instant::now(),
                                         state: PresenceState::Active,
                                         status: String::new(),
+                                        group: String::new(),
                                     });
                             }
                             let _ = core

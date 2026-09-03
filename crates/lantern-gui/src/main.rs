@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         discovery_port: args.discovery_port,
         beacon_targets: targets,
         broadcast: args.broadcast,
+        group: String::new(), // group UI not built in the web shell yet
         quic_port: 0,
         in_memory_store: false,
         auto_accept_limit: None, // consent UI not built in the web shell yet
@@ -152,21 +153,24 @@ async fn main() -> anyhow::Result<()> {
 
 fn event_json(ev: &CoreEvent) -> serde_json::Value {
     match ev {
-        CoreEvent::PeerSeen { id, name, host, addr, new, state, status } => json!({
+        CoreEvent::PeerSeen { id, name, host, addr, new, state, status, group } => json!({
             "type": "peer", "id": hex::encode(id), "name": name,
             "host": host, "addr": addr.to_string(), "new": new,
-            "state": *state as u8, "status": status
+            "state": *state as u8, "status": status, "group": group
         }),
         CoreEvent::SessionEstablished { id } => {
             json!({ "type": "session", "id": hex::encode(id) })
         }
-        CoreEvent::MessageReceived { peer, peer_name, mid, text, ts, reply_to } => json!({
+        CoreEvent::MessageReceived { peer, peer_name, mid, text, ts, reply_to, sealed } => json!({
             "type": "msg", "peer": hex::encode(peer), "peer_name": peer_name,
             "mid": mid.to_string(), "text": text, "ts": ts,
-            "reply_to": reply_to.map(|r| r.to_string())
+            "reply_to": reply_to.map(|r| r.to_string()), "sealed": sealed
         }),
         CoreEvent::MessageDelivered { mid } => {
             json!({ "type": "delivered", "mid": mid.to_string() })
+        }
+        CoreEvent::MessageOpened { mid } => {
+            json!({ "type": "opened", "mid": mid.to_string() })
         }
         CoreEvent::TrustWarning { id, detail } => json!({
             "type": "trust-warning", "id": hex::encode(id), "detail": detail

@@ -26,6 +26,9 @@ pub struct StoredMessage {
     pub state: u8,
     /// The message this one answers, if any.
     pub reply_to: Option<Uuid>,
+    /// Arrived sealed and has not been opened yet. Sender copies are never
+    /// sealed to their author.
+    pub sealed: bool,
 }
 
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
@@ -40,6 +43,7 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
         text: row.get(4)?,
         state: row.get::<_, i64>(5)? as u8,
         reply_to: reply_bytes.and_then(|b| Uuid::from_slice(&b).ok()),
+        sealed: row.get::<_, i64>(7).unwrap_or(0) != 0,
     })
 }
 
@@ -104,6 +108,12 @@ impl Store {
             .exists([])?;
         if !has_reply_to {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN reply_to BLOB")?;
+        }
+        let has_sealed = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'sealed'")?
+            .exists([])?;
+        if !has_sealed {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0")?;
         }
         let has_read = conn
             .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'read'")?
@@ -213,13 +223,47 @@ impl Store {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT m.mid, m.peer_id, m.outgoing, m.ts, m.body, m.state, m.reply_to
+            SELECT m.mid, m.peer_id, m.outgoing, m.ts, m.body, m.state, m.reply_to, m.sealed
             FROM messages_fts f JOIN messages m ON m.msg_rowid = f.rowid
             WHERE messages_fts MATCH '"' || replace(?1, '"', '""') || '"*'
             ORDER BY m.ts DESC LIMIT ?2
             "#,
         )?;
         let rows = stmt.query_map(params![query, limit as i64], row_to_message)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Break a seal. Returns the peer it came from if the message existed
+    /// and was still sealed — the cue to tell the sender it was opened.
+    pub fn open_message(&self, mid: &Uuid) -> Result<Option<[u8; 32]>, StoreError> {
+        let peer: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT peer_id FROM messages WHERE mid = ?1 AND sealed = 1",
+                params![mid.as_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .ok();
+        if peer.is_some() {
+            self.conn.execute(
+                "UPDATE messages SET sealed = 0 WHERE mid = ?1",
+                params![mid.as_bytes().as_slice()],
+            )?;
+        }
+        Ok(peer.and_then(|v| v.try_into().ok()))
+    }
+
+    /// Outgoing messages that never got their delivery ack, oldest first —
+    /// the send queue, persisted as ordinary rows rather than a new table.
+    pub fn undelivered(&self, peer: &[u8; 32]) -> Result<Vec<StoredMessage>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT mid, peer_id, outgoing, ts, body, state, reply_to, sealed
+            FROM messages WHERE peer_id = ?1 AND outgoing = 1 AND state = 0
+            ORDER BY ts ASC, msg_rowid ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![peer.as_slice()], row_to_message)?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
@@ -249,8 +293,8 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO messages
-                (mid, peer_id, outgoing, ts, body, state, reply_to, read)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?3)
+                (mid, peer_id, outgoing, ts, body, state, reply_to, read, sealed)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?3, ?8)
             "#,
             params![
                 m.mid.as_bytes().as_slice(),
@@ -259,7 +303,8 @@ impl Store {
                 m.ts,
                 m.text,
                 m.state as i64,
-                m.reply_to.map(|r| r.as_bytes().to_vec())
+                m.reply_to.map(|r| r.as_bytes().to_vec()),
+                m.sealed as i64
             ],
         )?;
         Ok(())
@@ -280,7 +325,7 @@ impl Store {
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT mid, peer_id, outgoing, ts, body, state, reply_to
+            SELECT mid, peer_id, outgoing, ts, body, state, reply_to, sealed
             FROM messages WHERE peer_id = ?1
             ORDER BY ts DESC, msg_rowid DESC LIMIT ?2
             "#,
@@ -380,6 +425,7 @@ mod tests {
                     text: text.into(),
                     state: 0,
                     reply_to: None,
+                    sealed: false,
                 })
                 .unwrap();
         }
@@ -454,6 +500,7 @@ mod tests {
             text: "hello".into(),
             state: 0,
             reply_to: None,
+            sealed: false,
         };
         store.insert_message(&m).unwrap();
         store.set_message_state(&m.mid, 1).unwrap();
@@ -484,6 +531,7 @@ mod tests {
             text: "did the build finish?".into(),
             state: 1,
             reply_to: None,
+            sealed: false,
         };
         let answer = StoredMessage {
             mid: Uuid::new_v4(),
@@ -493,6 +541,7 @@ mod tests {
             text: "yes — clean".into(),
             state: 0,
             reply_to: Some(first.mid),
+            sealed: false,
         };
         store.insert_message(&first).unwrap();
         store.insert_message(&answer).unwrap();
@@ -513,6 +562,7 @@ mod tests {
             text: text.into(),
             state: 1,
             reply_to: None,
+            sealed: false,
         }
     }
 
