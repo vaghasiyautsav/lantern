@@ -45,6 +45,9 @@ struct PeerRow {
     name: String,
     host: String,
     addr: String,
+    state: lantern_core::Presence,
+    /// Refreshed by the 30 s roster poll; a beacon sighting sets it true.
+    online: bool,
 }
 
 #[derive(Default)]
@@ -56,6 +59,8 @@ struct UiState {
     /// Unread arrivals per peer. Incremented when something lands for a
     /// peer that is not on screen; cleared when that peer is selected.
     unread: HashMap<[u8; 32], u32>,
+    /// While non-empty, the sidebar shows these matches instead of peers.
+    search_results: Vec<lantern_core::StoredMessage>,
 }
 
 fn main() -> glib::ExitCode {
@@ -104,6 +109,9 @@ fn main() -> glib::ExitCode {
             broadcast,
             quic_port: 0,
             in_memory_store: false,
+            // Files from verified peers fetch straight away; a stranger's
+            // offer over 25 MB waits for a click. See FileOfferPending.
+            auto_accept_limit: Some(25 * 1024 * 1024),
             download_dir: lantern_core::user_download_dir(),
         })
         .await
@@ -145,8 +153,17 @@ fn main() -> glib::ExitCode {
         .flags(flags)
         .build();
     let event_rx = Rc::new(RefCell::new(Some(event_rx)));
+    let window_slot: Rc<RefCell<Option<gtk::ApplicationWindow>>> =
+        Rc::new(RefCell::new(None));
     app.connect_activate(move |app| {
-        build_ui(app, Rc::clone(&backend), event_rx.borrow_mut().take());
+        // Second activation = the launcher was clicked while we run in the
+        // background. Bring the window back; never build the UI twice.
+        if let Some(w) = window_slot.borrow().as_ref() {
+            w.present();
+            return;
+        }
+        let w = build_ui(app, Rc::clone(&backend), event_rx.borrow_mut().take());
+        *window_slot.borrow_mut() = Some(w);
     });
     app.run()
 }
@@ -266,7 +283,7 @@ fn build_ui(
     app: &gtk::Application,
     backend: Rc<Backend>,
     event_rx: Option<async_channel::Receiver<CoreEvent>>,
-) {
+) -> gtk::ApplicationWindow {
     let state = Rc::new(RefCell::new(UiState::default()));
 
     let css = gtk::CssProvider::new();
@@ -305,6 +322,27 @@ fn build_ui(
     update_btn.set_tooltip_text(Some("Check for updates"));
     header.pack_start(&update_btn);
 
+    // ponytail: presence state only; the free-text status line the wire
+    // already carries gets an input when someone asks for it.
+    let away_btn = gtk::ToggleButton::new();
+    away_btn.set_icon_name("alarm-symbolic");
+    away_btn.set_tooltip_text(Some("Away — tell the network you're not looking"));
+    header.pack_start(&away_btn);
+    {
+        let backend = Rc::clone(&backend);
+        away_btn.connect_toggled(move |b| {
+            let state = if b.is_active() {
+                lantern_core::Presence::Away
+            } else {
+                lantern_core::Presence::Active
+            };
+            let core = Arc::clone(&backend.core);
+            backend.rt.spawn(async move {
+                core.set_presence(state, "").await;
+            });
+        });
+    }
+
     window.set_titlebar(Some(&header));
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -325,7 +363,17 @@ fn build_ui(
     empty_label.add_css_class("dim-label");
     empty_label.set_margin_top(24);
     empty_label.set_wrap(true);
+    // Search across every conversation, live while typing. While the entry
+    // has text, the sidebar shows matching messages; clearing it (or picking
+    // a result) restores the roster.
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search messages…"));
+    search_entry.set_margin_top(6);
+    search_entry.set_margin_start(6);
+    search_entry.set_margin_end(6);
+
     let left_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    left_box.append(&search_entry);
     left_box.append(&empty_label);
     left_box.append(&peers_scroll);
     peers_scroll.set_vexpand(true);
@@ -697,10 +745,42 @@ fn build_ui(
         let empty_label = empty_label.clone();
         move || {
             let st = state.borrow();
-            empty_label.set_visible(st.peers.is_empty());
             while let Some(child) = peer_list.first_child() {
                 peer_list.remove(&child);
             }
+            if !st.search_results.is_empty() {
+                empty_label.set_visible(false);
+                for m in &st.search_results {
+                    let who = st
+                        .peers
+                        .iter()
+                        .find(|p| p.id == m.peer_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| hex::encode(&m.peer_id[..4]));
+                    let row = gtk::Box::new(gtk::Orientation::Vertical, 1);
+                    row.set_margin_top(6);
+                    row.set_margin_bottom(6);
+                    row.set_margin_start(10);
+                    row.set_margin_end(8);
+                    let head = gtk::Label::new(Some(&format!(
+                        "{} · {}",
+                        if m.outgoing { "you" } else { who.as_str() },
+                        fmt_time(m.ts)
+                    )));
+                    head.add_css_class("caption-heading");
+                    head.set_halign(gtk::Align::Start);
+                    let body = gtk::Label::new(Some(&m.text));
+                    body.set_halign(gtk::Align::Start);
+                    body.add_css_class("dim-label");
+                    body.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    body.set_max_width_chars(30);
+                    row.append(&head);
+                    row.append(&body);
+                    peer_list.append(&row);
+                }
+                return;
+            }
+            empty_label.set_visible(st.peers.is_empty());
             // The list is rebuilt wholesale, so note where the selected peer
             // lands and restore it below — otherwise every beacon that
             // refreshes the roster would drop the open conversation.
@@ -726,10 +806,23 @@ fn build_ui(
                 } else {
                     n.set_text(&p.name);
                 }
-                let h = gtk::Label::new(Some(&p.host));
+                let sub = match (p.online, p.state) {
+                    (false, _) => format!("{} · offline", p.host),
+                    (true, lantern_core::Presence::Away) => {
+                        format!("{} · away", p.host)
+                    }
+                    (true, lantern_core::Presence::Dnd) => {
+                        format!("{} · do not disturb", p.host)
+                    }
+                    (true, _) => p.host.clone(),
+                };
+                let h = gtk::Label::new(Some(&sub));
                 h.set_halign(gtk::Align::Start);
                 h.add_css_class("dim-label");
                 h.add_css_class("lantern-meta");
+                if !p.online {
+                    row.set_opacity(0.5);
+                }
                 text_col.append(&n);
                 text_col.append(&h);
                 row.append(&text_col);
@@ -771,12 +864,26 @@ fn build_ui(
         let append_text = append_text.clone();
         let refresh_peers = refresh_peers.clone();
         let pin_to_bottom = pin_to_bottom.clone();
+        let search_entry = search_entry.clone();
         peer_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             let idx = row.index();
             let peer = {
                 let st = state.borrow();
-                st.peers.get(idx as usize).cloned()
+                if let Some(m) = st.search_results.get(idx as usize) {
+                    // A search hit: open that conversation. Clearing the
+                    // entry restores the roster (and re-enters here via the
+                    // reselect in refresh_peers).
+                    // ponytail: opens the conversation, does not scroll to
+                    // the matched message; add anchors when someone misses it.
+                    let target = st.peers.iter().find(|p| p.id == m.peer_id).cloned();
+                    drop(st);
+                    state.borrow_mut().search_results.clear();
+                    search_entry.set_text("");
+                    target
+                } else {
+                    st.peers.get(idx as usize).cloned()
+                }
             };
             let Some(peer) = peer else { return };
             // refresh_peers() restores this selection after every rebuild.
@@ -792,6 +899,7 @@ fn build_ui(
                 st.unread.remove(&peer.id);
                 st.file_rows.clear();
             }
+            backend.core.mark_read(&peer.id);
             // Clear the badge on the next loop turn — refresh_peers() rebuilds
             // the very ListBox currently emitting this signal.
             glib::idle_add_local_once(refresh_peers.clone());
@@ -1329,8 +1437,60 @@ fn build_ui(
     }
 
     // ---- core events → UI ----------------------------------------------
+    {
+        let state = Rc::clone(&state);
+        let backend = Rc::clone(&backend);
+        let refresh_peers = refresh_peers.clone();
+        search_entry.connect_search_changed(move |e| {
+            let q = e.text().to_string();
+            state.borrow_mut().search_results = backend.core.search(&q, 50);
+            refresh_peers();
+        });
+    }
+
+    // Badges come from the store, so three unread messages are still three
+    // unread messages after a restart — they used to live and die with RAM.
+    {
+        let mut st = state.borrow_mut();
+        for (peer, n) in backend.core.unread_counts() {
+            st.unread.insert(peer, n);
+        }
+    }
+
+    // Roster poll: beacons only ever say "here" — nobody sends a beacon to
+    // say they vanished. Every 30 s ask the core, whose online flag is
+    // derived from beacon age, and let rows go grey.
+    {
+        let state = Rc::clone(&state);
+        let backend = Rc::clone(&backend);
+        let refresh_peers = refresh_peers.clone();
+        glib::timeout_add_seconds_local(30, move || {
+            let core = Arc::clone(&backend.core);
+            let (tx, rx) = async_channel::bounded(1);
+            backend.rt.spawn(async move {
+                let _ = tx.send(core.peers().await).await;
+            });
+            let state = Rc::clone(&state);
+            let refresh_peers = refresh_peers.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let Ok(live) = rx.recv().await else { return };
+                let mut st = state.borrow_mut();
+                for p in st.peers.iter_mut() {
+                    if let Some(v) = live.iter().find(|v| v.id == p.id) {
+                        p.online = v.online;
+                        p.state = v.state;
+                    }
+                }
+                drop(st);
+                refresh_peers();
+            });
+            glib::ControlFlow::Continue
+        });
+    }
+
     if let Some(rx) = event_rx {
         let state = Rc::clone(&state);
+        let backend = Rc::clone(&backend);
         let refresh_peers = refresh_peers.clone();
         let append_text = append_text.clone();
         let append_file = append_file.clone();
@@ -1341,27 +1501,66 @@ fn build_ui(
         glib::MainContext::default().spawn_local(async move {
             while let Ok(ev) = rx.recv().await {
                 match ev {
-                    CoreEvent::PeerSeen { id, name, host, addr, .. } => {
+                    CoreEvent::PeerSeen { id, name, host, addr, state: pstate, .. } => {
                         let mut st = state.borrow_mut();
                         if let Some(p) = st.peers.iter_mut().find(|p| p.id == id) {
                             p.name = name;
                             p.host = host;
                             p.addr = addr.to_string();
+                            p.state = pstate;
+                            p.online = true;
                         } else {
                             st.peers.push(PeerRow {
                                 id,
                                 name,
                                 host,
                                 addr: addr.to_string(),
+                                state: pstate,
+                                online: true,
                             });
                             st.peers.sort_by(|a, b| a.name.cmp(&b.name));
                         }
                         drop(st);
                         refresh_peers();
                     }
+                    CoreEvent::FileOfferPending { peer_name, xid, name, size, .. } => {
+                        // A stranger's file over the cap: nothing has been
+                        // fetched. Ask, in words that say who and how big.
+                        let dialog = gtk::AlertDialog::builder()
+                            .modal(true)
+                            .message(format!(
+                                "{peer_name} wants to send you \"{name}\" ({})",
+                                fmt_size(size)
+                            ))
+                            .detail(
+                                "They are not verified. Accept only if you \
+                                 expected this — nothing downloads until you \
+                                 say so.",
+                            )
+                            .buttons(["Decline", "Accept"])
+                            .cancel_button(0)
+                            .default_button(0)
+                            .build();
+                        let backend = Rc::clone(&backend);
+                        dialog.choose(
+                            gtk::Window::NONE,
+                            None::<&gio::Cancellable>,
+                            move |answer| {
+                                let core = Arc::clone(&backend.core);
+                                backend.rt.spawn(async move {
+                                    if answer == Ok(1) {
+                                        let _ = core.accept_file(xid).await;
+                                    } else {
+                                        core.decline_file(xid).await;
+                                    }
+                                });
+                            },
+                        );
+                    }
                     CoreEvent::MessageReceived { peer, peer_name, text, ts, .. } => {
                         let open = state.borrow().selected == Some(peer);
                         if open {
+                            backend.core.mark_read(&peer);
                             append_text(false, &peer_name, &hex::encode(peer), ts, None, &text);
                         } else {
                             *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
@@ -1448,7 +1647,25 @@ fn build_ui(
     }
 
     window.set_icon_name(Some("lantern"));
-    window.present();
+
+    // ipmsg's "popups arrive with no window open" is nothing but a resident
+    // process. Same here: closing the window hides it, the engine keeps
+    // receiving, notifications keep firing, and clicking the launcher brings
+    // the window back (see connect_activate). The hold() keeps GTK's main
+    // loop alive with zero visible windows; Quit is the app menu's job.
+    let hold = app.hold();
+    window.connect_close_request(move |w| {
+        let _ = &hold;
+        w.set_visible(false);
+        glib::Propagation::Stop
+    });
+
+    // Started by the autostart entry at login: stay in the background until
+    // a message or a launcher click warrants a window.
+    if std::env::var_os("LANTERN_START_HIDDEN").is_none() {
+        window.present();
+    }
+    window
 }
 
 /// The core's identity fingerprint (helper — core exposes id bytes).

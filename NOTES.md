@@ -75,7 +75,7 @@ checkpointed), **live transfer speed + ETA** (`CoreEvent::TransferProgress`,
 `core::rate`), **update from GitHub** (`core::update` +
 `packaging/update.sh`, also the standalone `lantern-update`), **look-again**
 (`BeaconType::Ping` via `core.refresh()` / `POST /api/refresh`, behind a
-refresh button in every shell). 40 tests workspace-wide, clippy
+refresh button in every shell). 43 tests workspace-wide, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
@@ -505,6 +505,48 @@ it".
 `packaging/make-deb.sh`, `packaging/make-dmg.sh`, and twice in `install.sh`.
 Nothing checks that they agree. Bump them together or a `.deb` will claim a
 version the binary inside it does not.
+
+### 18 Aug 2026, evening — the ipmsg-gap batch
+
+Measured against IP Messenger's help doc and built better where its design
+was worth beating:
+
+- **Resident background mode (Linux).** ipmsg's "popups with no window
+  open" is just a resident tray process; same here now. Closing the GTK
+  window hides it (`app.hold()` keeps the loop alive), the launcher click
+  re-presents it via `connect_activate`, and install.sh writes an autostart
+  entry that starts it hidden (`LANTERN_START_HIDDEN=1`). Notifications
+  already fired when unfocused, so messages now pop from login onwards.
+- **Presence.** `Core::set_presence` announces Away/Dnd + a status line —
+  the beacon fields existed from day one, nothing ever set them. GTK: away
+  toggle in the header; rows show away/dnd/offline and dim offline (30 s
+  roster poll, since nobody beacons "I left"). PeerSeen and PeerView carry
+  `state`/`status` now.
+- **Unread survives restart** — counts derive from a `read` column, seeded
+  at startup (`unread_counts`), cleared by `mark_read` when a conversation
+  opens. RAM-only badges died with the process.
+- **FTS5 search** across all conversations (`Store::search`, triggers keep
+  the index in step). The input is one quoted phrase-prefix — hostile input
+  is a term, never FTS syntax. **The delete trigger is load-bearing**: FTS
+  keeps its own copy of the text, so without it a secure-deleted message
+  stayed greppable in the index. GTK: sidebar search; a hit opens that
+  conversation.
+- **Transfer consent, better than ipmsg's.** Theirs gates every download on
+  a click; ours integrates TOFU: verified peers fetch as before, a
+  *stranger's* offer over `auto_accept_limit` (GTK: 25 MB) is held —
+  `FileOfferPending` → `accept_file`/`decline_file`. Without a cap, anyone
+  on the LAN could fill every disk. `reply_to_offer` is the one shared
+  accept path so resume can't drift between auto and consent.
+
+Also fixed here: `make_beacon` locked the presence mutex twice inside one
+struct literal — both temporary guards live to the end of the expression,
+std's Mutex is not reentrant, so every announce() self-deadlocked. If a test
+run ever hangs rather than fails, look for exactly this shape.
+
+**Not carried to macOS/web yet:** consent dialog, search UI, away toggle,
+unread seeding (the core APIs are there; shells behave as before with
+`auto_accept_limit: None`). ipmsg features still open: groups/multi-send,
+sealed messages, inline images, offline send queue (Phase 4), cross-subnet.
 
 ## Open defects
 

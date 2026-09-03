@@ -14,7 +14,10 @@ use lantern_discovery::{now_ms, Discovered, Discovery, DiscoveryConfig, OFFLINE_
 use lantern_proto::{
     read_frame, write_frame, Beacon, BeaconType, ControlFrame, DeviceClass, PresenceState,
 };
-use lantern_store::{Store, StoredMessage};
+use lantern_store::Store;
+// Shells page history and render search hits; no reason to depend on the
+// store crate just to name the row type.
+pub use lantern_store::StoredMessage;
 use lantern_transport::{peer_identity, Transport};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
@@ -25,6 +28,7 @@ pub mod update;
 use rate::RateMeter;
 
 pub use lantern_crypto::{safety_words, short_hex};
+pub use lantern_proto::PresenceState as Presence;
 /// Used throughout this crate, and re-exported because shells handle message
 /// and transfer ids constantly — no reason for each to depend on `uuid` just
 /// to name the type.
@@ -38,6 +42,10 @@ pub enum CoreEvent {
         host: String,
         addr: SocketAddr,
         new: bool,
+        /// As the peer announced it: Active, Away, Dnd…
+        state: PresenceState,
+        /// Their free-text status line, usually empty.
+        status: String,
     },
     SessionEstablished {
         id: [u8; 32],
@@ -58,6 +66,17 @@ pub enum CoreEvent {
         detail: String,
     },
     FileOffered {
+        peer: [u8; 32],
+        peer_name: String,
+        xid: Uuid,
+        name: String,
+        size: u64,
+    },
+    /// An offer that will not be fetched until someone says so: the sender
+    /// is unverified and the file is over `auto_accept_limit`. Answer with
+    /// `accept_file` / `decline_file`. Without this gate, anyone on the LAN
+    /// could fill the disk of every machine running Lantern.
+    FileOfferPending {
         peer: [u8; 32],
         peer_name: String,
         xid: Uuid,
@@ -230,6 +249,9 @@ pub struct CoreConfig {
     /// 0 = ephemeral.
     pub quic_port: u16,
     pub in_memory_store: bool,
+    /// Auto-fetch cap for offers from **unverified** peers; verified peers
+    /// are never gated. `None` accepts everything, today's behaviour.
+    pub auto_accept_limit: Option<u64>,
     /// Where received files are placed. `None` keeps them inside the data
     /// directory (`<data_dir>/downloads`), which is what tests and embedders
     /// want — a test must never write into the real user's Downloads folder.
@@ -238,11 +260,21 @@ pub struct CoreConfig {
     pub download_dir: Option<PathBuf>,
 }
 
+/// What we announce about ourselves, set by the user, read by every beacon.
+#[derive(Clone, Default)]
+struct MyPresence {
+    state: PresenceState,
+    status: String,
+}
+
 struct PeerInfo {
     name: String,
     host: String,
     /// ip from the beacon's source, port from the beacon's `port` field.
     quic_addr: SocketAddr,
+    /// As announced in their last beacon.
+    state: PresenceState,
+    status: String,
     /// When the most recent signed beacon from this identity arrived.
     /// Drives presence: an entry is kept forever (so history and trust
     /// survive), but goes offline once the beacons stop.
@@ -263,6 +295,8 @@ pub struct PeerView {
     /// Sending to an offline peer will time out, so shells should say so
     /// up front rather than let the user watch a spinner.
     pub online: bool,
+    pub state: PresenceState,
+    pub status: String,
 }
 
 #[derive(Clone)]
@@ -282,6 +316,8 @@ struct Inner {
     warned: std::collections::HashSet<[u8; 32]>,
     /// When we last answered a Ping. Rate limit — see the discovery loop.
     last_ping_reply: Option<std::time::Instant>,
+    /// Offers awaiting a human decision: xid → (peer, that session's outbox).
+    pending_consent: HashMap<Uuid, ([u8; 32], mpsc::Sender<ControlFrame>)>,
 }
 
 pub struct Core {
@@ -294,6 +330,9 @@ pub struct Core {
     seq: std::sync::atomic::AtomicU64,
     boot: [u8; 8],
     config: CoreConfig,
+    /// What our beacons announce; behind a sync mutex because make_beacon
+    /// is sync and the critical section is a clone.
+    presence: std::sync::Mutex<MyPresence>,
 }
 
 impl Core {
@@ -334,11 +373,13 @@ impl Core {
                 accept_waiters: HashMap::new(),
                 warned: std::collections::HashSet::new(),
                 last_ping_reply: None,
+                pending_consent: HashMap::new(),
             })),
             events: event_tx,
             seq: std::sync::atomic::AtomicU64::new(1),
             boot,
             config,
+            presence: std::sync::Mutex::new(MyPresence::default()),
         });
 
         core.clone().spawn_discovery_loop();
@@ -387,6 +428,8 @@ impl Core {
                     quic_addr: p.quic_addr,
                     since_beacon: Some(age),
                     online: age < OFFLINE_AFTER,
+                    state: p.state,
+                    status: p.status.clone(),
                 }
             })
             .collect()
@@ -398,6 +441,100 @@ impl Core {
             .unwrap()
             .history(peer, limit)
             .unwrap_or_default()
+    }
+
+    /// Change what our beacons announce, and tell the LAN straight away
+    /// rather than letting the change ride the next heartbeat.
+    pub async fn set_presence(&self, state: PresenceState, status: &str) {
+        {
+            let mut p = self.presence.lock().unwrap();
+            p.state = state;
+            p.status = status.to_string();
+        }
+        self.announce().await;
+    }
+
+    /// Everything from this peer is now seen (their conversation is on
+    /// screen). Returns how many messages flipped to read.
+    pub fn mark_read(&self, peer: &[u8; 32]) -> usize {
+        self.store.lock().unwrap().mark_read(peer).unwrap_or(0)
+    }
+
+    /// Unread incoming messages per peer, derived from the store so badges
+    /// survive a restart instead of living and dying with the process.
+    pub fn unread_counts(&self) -> Vec<([u8; 32], u32)> {
+        self.store.lock().unwrap().unread_counts().unwrap_or_default()
+    }
+
+    /// Full-text search across every conversation, newest first.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<StoredMessage> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        self.store.lock().unwrap().search(query, limit).unwrap_or_default()
+    }
+
+    /// Fetch an offer that was held for consent (FileOfferPending).
+    pub async fn accept_file(&self, xid: Uuid) -> anyhow::Result<()> {
+        let (peer, outbox, manifest, peer_name) = {
+            let mut g = self.inner.lock().await;
+            let (peer, outbox) = g
+                .pending_consent
+                .remove(&xid)
+                .ok_or_else(|| anyhow::anyhow!("no offer waiting on consent"))?;
+            let m = g
+                .pending_offers
+                .get(&xid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("offer vanished"))?;
+            let n = g
+                .roster
+                .get(&peer)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| hex::encode(&peer[..4]));
+            (peer, outbox, m, n)
+        };
+        // From here it is an ordinary accepted offer.
+        let _ = self
+            .events
+            .send(CoreEvent::FileOffered {
+                peer,
+                peer_name,
+                xid,
+                name: manifest.name.clone(),
+                size: manifest.size,
+            })
+            .await;
+        reply_to_offer(
+            &self.inner,
+            &outbox,
+            &self.events,
+            &self.config.data_dir.join("partial"),
+            &self.download_dir(),
+            peer,
+            xid,
+            &manifest,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Refuse an offer that was held for consent. The sender is told, so
+    /// their card says declined instead of hanging on "sending…".
+    pub async fn decline_file(&self, xid: Uuid) {
+        let outbox = {
+            let mut g = self.inner.lock().await;
+            g.pending_offers.remove(&xid);
+            g.pending_consent.remove(&xid).map(|(_, o)| o)
+        };
+        if let Some(outbox) = outbox {
+            let _ = outbox
+                .send(ControlFrame::DeclineFile {
+                    xid,
+                    reason: Some("declined by the receiver".into()),
+                })
+                .await;
+        }
     }
 
     /// Delete one message from this machine's history. Returns whether a
@@ -464,6 +601,11 @@ impl Core {
     }
 
     fn make_beacon(&self, beacon_type: BeaconType) -> Beacon {
+        // One lock, cloned out. Locking twice inside the struct literal —
+        // once for state, once for status — self-deadlocks: both temporary
+        // guards live to the end of the expression, and std's Mutex is not
+        // reentrant. Cost a hung announce() on every test.
+        let me = self.presence.lock().unwrap().clone();
         Beacon {
             beacon_type,
             flags: 0,
@@ -473,8 +615,8 @@ impl Core {
             group: String::new(),
             device: DeviceClass::Desktop,
             port: self.transport.local_port(),
-            state: PresenceState::Active,
-            status: String::new(),
+            state: me.state,
+            status: me.status,
             avatar: None,
             caps: 0b0000_0011, // text + file-v1 (files pending Phase 3)
             seq: self
@@ -804,6 +946,7 @@ impl Core {
             let outbox_for_acks = outbox_tx.clone();
             let downloads_dir = self.download_dir();
             let partial_dir = self.config.data_dir.join("partial");
+            let auto_accept_limit = self.config.auto_accept_limit;
             tokio::spawn(async move {
                 loop {
                     let frame = match read_frame(&mut recv).await {
@@ -883,17 +1026,6 @@ impl Core {
                                 root: root32,
                                 chunk_hashes: chunks.as_chunks::<32>().0.to_vec(),
                             };
-                            let total = manifest.chunk_count();
-
-                            // Resume: what do we already hold for this content?
-                            let need = match PartialState::open(&partial_dir, &root32) {
-                                Ok(ps) => ps.need(total),
-                                Err(e) => {
-                                    warn!("partial state unavailable: {e}");
-                                    (0..total).collect()
-                                }
-                            };
-
                             let peer_name = {
                                 let mut g = inner.lock().await;
                                 g.pending_offers.insert(xid, manifest.clone());
@@ -902,6 +1034,34 @@ impl Core {
                                     .map(|p| p.name.clone())
                                     .unwrap_or_else(|| hex::encode(&peer[..4]))
                             };
+
+                            // Consent gate. A verified peer is someone whose
+                            // safety words were read aloud — their files
+                            // fetch as before. A stranger's offer above the
+                            // cap waits for a human: without this, anyone on
+                            // the LAN could quietly fill the disk.
+                            let verified =
+                                store.lock().unwrap().is_verified(&peer).unwrap_or(false);
+                            if !verified
+                                && auto_accept_limit.is_some_and(|cap| size > cap)
+                            {
+                                inner
+                                    .lock()
+                                    .await
+                                    .pending_consent
+                                    .insert(xid, (peer, outbox_for_acks.clone()));
+                                let _ = events
+                                    .send(CoreEvent::FileOfferPending {
+                                        peer,
+                                        peer_name,
+                                        xid,
+                                        name,
+                                        size,
+                                    })
+                                    .await;
+                                continue;
+                            }
+
                             let _ = events
                                 .send(CoreEvent::FileOffered {
                                     peer,
@@ -912,55 +1072,17 @@ impl Core {
                                 })
                                 .await;
 
-                            if need.is_empty() {
-                                // Everything already on disk: finalize now.
-                                inner.lock().await.pending_offers.remove(&xid);
-                                let done = PartialState::open(&partial_dir, &root32)
-                                    .and_then(|ps| {
-                                        ps.finalize(&downloads_dir, &manifest.name)
-                                    });
-                                match done {
-                                    Ok(path) => {
-                                        let _ = outbox_for_acks
-                                            .send(ControlFrame::AcceptFile {
-                                                xid,
-                                                need: vec![],
-                                            })
-                                            .await;
-                                        let _ = outbox_for_acks
-                                            .send(ControlFrame::XferDone {
-                                                xid,
-                                                ok: true,
-                                                err: None,
-                                            })
-                                            .await;
-                                        let _ = events
-                                            .send(CoreEvent::FileReceived {
-                                                peer,
-                                                xid,
-                                                name: manifest.name.clone(),
-                                                path,
-                                                size,
-                                            })
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        // Partial claimed complete but can't
-                                        // finalize — re-request everything.
-                                        warn!("finalize from partial failed: {e}");
-                                        let _ = outbox_for_acks
-                                            .send(ControlFrame::AcceptFile {
-                                                xid,
-                                                need: (0..total).collect(),
-                                            })
-                                            .await;
-                                    }
-                                }
-                            } else {
-                                let _ = outbox_for_acks
-                                    .send(ControlFrame::AcceptFile { xid, need })
-                                    .await;
-                            }
+                            reply_to_offer(
+                                &inner,
+                                &outbox_for_acks,
+                                &events,
+                                &partial_dir,
+                                &downloads_dir,
+                                peer,
+                                xid,
+                                &manifest,
+                            )
+                            .await;
                         }
                         ControlFrame::AcceptFile { xid, need } => {
                             if let Some(tx) =
@@ -1208,6 +1330,8 @@ impl Core {
                             host: beacon.host.clone(),
                             quic_addr,
                             last_beacon: Instant::now(),
+                            state: beacon.state,
+                            status: beacon.status.clone(),
                         },
                     );
                     is_new
@@ -1285,6 +1409,8 @@ impl Core {
                         host: beacon.host,
                         addr: quic_addr,
                         new: is_new,
+                        state: beacon.state,
+                        status: beacon.status,
                     })
                     .await;
             }
@@ -1361,6 +1487,8 @@ impl Core {
                                         host: host.clone(),
                                         quic_addr: conn.remote_address(),
                                         last_beacon: Instant::now(),
+                                        state: PresenceState::Active,
+                                        status: String::new(),
                                     });
                             }
                             let _ = core
@@ -1438,6 +1566,75 @@ fn sanitize_filename(name: &str) -> anyhow::Result<String> {
 ///
 /// `None` means "no sensible answer" (no `HOME`), and the caller should fall
 /// back to the data directory rather than guessing.
+/// Answer an offer we are taking: work out which chunks are still needed,
+/// request them — or, when the partial store already holds everything,
+/// finalize on the spot. One implementation for both the auto-accept path
+/// and a consent answer, so resume behaviour cannot drift between them.
+#[allow(clippy::too_many_arguments)]
+async fn reply_to_offer(
+    inner: &Arc<Mutex<Inner>>,
+    outbox: &mpsc::Sender<ControlFrame>,
+    events: &mpsc::Sender<CoreEvent>,
+    partial_dir: &std::path::Path,
+    downloads_dir: &std::path::Path,
+    peer: [u8; 32],
+    xid: Uuid,
+    manifest: &Manifest,
+) {
+    let total = manifest.chunk_count();
+    // Resume: what do we already hold for this content?
+    let need = match PartialState::open(partial_dir, &manifest.root) {
+        Ok(ps) => ps.need(total),
+        Err(e) => {
+            warn!("partial state unavailable: {e}");
+            (0..total).collect()
+        }
+    };
+
+    if need.is_empty() {
+        // Everything already on disk: finalize now.
+        inner.lock().await.pending_offers.remove(&xid);
+        let done = PartialState::open(partial_dir, &manifest.root)
+            .and_then(|ps| ps.finalize(downloads_dir, &manifest.name));
+        match done {
+            Ok(path) => {
+                let _ = outbox
+                    .send(ControlFrame::AcceptFile { xid, need: vec![] })
+                    .await;
+                let _ = outbox
+                    .send(ControlFrame::XferDone {
+                        xid,
+                        ok: true,
+                        err: None,
+                    })
+                    .await;
+                let _ = events
+                    .send(CoreEvent::FileReceived {
+                        peer,
+                        xid,
+                        name: manifest.name.clone(),
+                        path,
+                        size: manifest.size,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                // Partial claimed complete but can't finalize —
+                // re-request everything.
+                warn!("finalize from partial failed: {e}");
+                let _ = outbox
+                    .send(ControlFrame::AcceptFile {
+                        xid,
+                        need: (0..total).collect(),
+                    })
+                    .await;
+            }
+        }
+    } else {
+        let _ = outbox.send(ControlFrame::AcceptFile { xid, need }).await;
+    }
+}
+
 pub fn user_download_dir() -> Option<PathBuf> {
     // Windows has no HOME; the profile directory is USERPROFILE, and the
     // folder is not localised on disk the way XDG's is.

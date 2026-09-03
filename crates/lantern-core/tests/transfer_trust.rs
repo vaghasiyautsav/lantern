@@ -16,6 +16,7 @@ fn config(name: &str, dir: &std::path::Path, my_port: u16, other_port: u16) -> C
         broadcast: false,
         quic_port: 0,
         in_memory_store: false,
+        auto_accept_limit: None,
         // Stay inside the test's tempdir — never the real Downloads folder.
         download_dir: None,
     }
@@ -140,4 +141,59 @@ async fn impostor_raises_trust_warning() {
     assert!(detail.contains("NEW key"), "warning says what happened: {detail}");
 
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// A stranger's file over the cap waits for consent; a click fetches it,
+/// and verifying the peer removes the gate entirely.
+#[tokio::test]
+async fn oversized_offer_from_a_stranger_waits_for_consent() {
+    let tmp = std::env::temp_dir().join(format!("lantern-consent-{}", std::process::id()));
+    std::fs::remove_dir_all(&tmp).ok();
+    let (port_a, port_b) = (24211u16, 24212u16);
+
+    let mut cfg_bob = config("Bob", &tmp.join("b"), port_b, port_a);
+    cfg_bob.auto_accept_limit = Some(1024 * 1024); // 1 MiB cap
+    let (alice, mut ev_a) = Core::start(config("Alice", &tmp.join("a"), port_a, port_b))
+        .await
+        .unwrap();
+    let (bob, mut ev_b) = Core::start(cfg_bob).await.unwrap();
+    alice.announce().await;
+    bob.announce().await;
+    wait_for(&mut ev_a, 10, |e| {
+        matches!(e, CoreEvent::PeerSeen { name, .. } if name == "Bob")
+    })
+    .await;
+
+    let payload: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 13) as u8).collect();
+    let src = tmp.join("big.bin");
+    std::fs::write(&src, &payload).unwrap();
+
+    // Unverified Alice, 2 MiB > 1 MiB cap: held, nothing fetched.
+    alice.send_file(bob.identity_id(), &src).await.unwrap();
+    let pending = wait_for(&mut ev_b, 10, |e| {
+        matches!(e, CoreEvent::FileOfferPending { name, .. } if name == "big.bin")
+    })
+    .await;
+    let CoreEvent::FileOfferPending { xid, .. } = pending else {
+        unreachable!()
+    };
+
+    // Consent: the ordinary offer/receive flow runs from here.
+    bob.accept_file(xid).await.unwrap();
+    wait_for(&mut ev_b, 20, |e| matches!(e, CoreEvent::FileReceived { .. })).await;
+
+    // Verified peers skip the gate: same file sails straight through.
+    bob.set_verified(&alice.identity_id(), true);
+    alice.send_file(bob.identity_id(), &src).await.unwrap();
+    let ev = wait_for(&mut ev_b, 10, |e| {
+        matches!(
+            e,
+            CoreEvent::FileOffered { .. } | CoreEvent::FileOfferPending { .. }
+        )
+    })
+    .await;
+    assert!(
+        matches!(ev, CoreEvent::FileOffered { .. }),
+        "a verified peer must not be gated"
+    );
 }

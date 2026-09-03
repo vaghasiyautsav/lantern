@@ -77,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
         broadcast: args.broadcast,
         quic_port: 0,
         in_memory_store: args.ephemeral,
+        // Headless: nobody is present to click a consent dialog, so offers
+        // are fetched as before. Cap when the CLI grows an accept command.
+        auto_accept_limit: None,
         download_dir: lantern_core::user_download_dir(),
     })
     .await?;
@@ -93,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             match ev {
-                CoreEvent::PeerSeen { id, name, host, addr, new } => {
+                CoreEvent::PeerSeen { id, name, host, addr, new, .. } => {
                     if new {
                         if script {
                             println!("EVENT peer-new {} {} {}", hex::encode(&id[..6]), name, addr);
@@ -123,6 +126,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 CoreEvent::TrustWarning { detail, .. } => {
                     println!("⚠ TRUST: {detail}");
+                }
+                CoreEvent::FileOfferPending { peer_name, name, size, .. } => {
+                    println!("⇣ {peer_name} offers {name} ({}) — held; no consent UI here", human_size(size));
                 }
                 CoreEvent::FileOffered { peer_name, name, size, .. } => {
                     if script {

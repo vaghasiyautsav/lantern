@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         broadcast: args.broadcast,
         quic_port: 0,
         in_memory_store: false,
+        auto_accept_limit: None, // consent UI not built in the web shell yet
         download_dir: lantern_core::user_download_dir(),
     })
     .await?;
@@ -151,9 +152,10 @@ async fn main() -> anyhow::Result<()> {
 
 fn event_json(ev: &CoreEvent) -> serde_json::Value {
     match ev {
-        CoreEvent::PeerSeen { id, name, host, addr, new } => json!({
+        CoreEvent::PeerSeen { id, name, host, addr, new, state, status } => json!({
             "type": "peer", "id": hex::encode(id), "name": name,
-            "host": host, "addr": addr.to_string(), "new": new
+            "host": host, "addr": addr.to_string(), "new": new,
+            "state": *state as u8, "status": status
         }),
         CoreEvent::SessionEstablished { id } => {
             json!({ "type": "session", "id": hex::encode(id) })
@@ -168,6 +170,11 @@ fn event_json(ev: &CoreEvent) -> serde_json::Value {
         }
         CoreEvent::TrustWarning { id, detail } => json!({
             "type": "trust-warning", "id": hex::encode(id), "detail": detail
+        }),
+        CoreEvent::FileOfferPending { peer, peer_name, xid, name, size } => json!({
+            "type": "file-offer-pending", "peer": hex::encode(peer),
+            "peer_name": peer_name, "xid": xid.to_string(),
+            "name": name, "size": size
         }),
         CoreEvent::FileOffered { peer, peer_name, xid, name, size } => json!({
             "type": "file-offered", "peer": hex::encode(peer), "peer_name": peer_name,

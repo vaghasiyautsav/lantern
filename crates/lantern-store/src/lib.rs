@@ -28,6 +28,21 @@ pub struct StoredMessage {
     pub reply_to: Option<Uuid>,
 }
 
+fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
+    let mid_bytes: Vec<u8> = row.get(0)?;
+    let pid: Vec<u8> = row.get(1)?;
+    let reply_bytes: Option<Vec<u8>> = row.get(6)?;
+    Ok(StoredMessage {
+        mid: Uuid::from_slice(&mid_bytes).unwrap_or_default(),
+        peer_id: pid.try_into().unwrap_or([0; 32]),
+        outgoing: row.get::<_, i64>(2)? != 0,
+        ts: row.get::<_, i64>(3)? as u64,
+        text: row.get(4)?,
+        state: row.get::<_, i64>(5)? as u8,
+        reply_to: reply_bytes.and_then(|b| Uuid::from_slice(&b).ok()),
+    })
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -90,6 +105,34 @@ impl Store {
         if !has_reply_to {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN reply_to BLOB")?;
         }
+        let has_read = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'read'")?
+            .exists([])?;
+        if !has_read {
+            // Everything already on disk was seen in whatever UI stored it;
+            // only messages that arrive after this build count as unread.
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 1")?;
+        }
+        // Full-text index over message bodies, kept in step by triggers so
+        // every write path — including deletes, which matter because FTS
+        // keeps its own copy of the text and secure_delete on the base table
+        // alone would leave deleted messages greppable in the index.
+        conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+                USING fts5(body, content='messages', content_rowid='msg_rowid');
+            CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, body) VALUES (new.msg_rowid, new.body);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, body)
+                    VALUES ('delete', old.msg_rowid, old.body);
+            END;
+            INSERT INTO messages_fts(rowid, body)
+                SELECT msg_rowid, body FROM messages
+                WHERE msg_rowid NOT IN (SELECT rowid FROM messages_fts);
+            "#,
+        )?;
         Ok(())
     }
 
@@ -139,6 +182,47 @@ impl Store {
             .collect())
     }
 
+    /// Everything from this peer is now seen. Returns how many flipped.
+    pub fn mark_read(&self, peer: &[u8; 32]) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE messages SET read = 1 WHERE peer_id = ?1 AND read = 0",
+            params![peer.as_slice()],
+        )?)
+    }
+
+    /// Unread incoming messages per peer — what a roster shows as badges,
+    /// surviving a restart because it is derived from the store, not RAM.
+    pub fn unread_counts(&self) -> Result<Vec<([u8; 32], u32)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer_id, COUNT(*) FROM messages
+             WHERE read = 0 AND outgoing = 0 GROUP BY peer_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, u32>(1)?))
+        })?;
+        Ok(rows
+            .filter_map(Result::ok)
+            .filter_map(|(id, n)| id.try_into().ok().map(|id| (id, n)))
+            .collect())
+    }
+
+    /// Full-text search over every conversation, newest first. The input is
+    /// wrapped as one quoted FTS5 phrase with a prefix star, so typing is
+    /// matched literally as it grows — and hostile input cannot reach FTS5's
+    /// query syntax, whose errors would otherwise surface for a stray quote.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT m.mid, m.peer_id, m.outgoing, m.ts, m.body, m.state, m.reply_to
+            FROM messages_fts f JOIN messages m ON m.msg_rowid = f.rowid
+            WHERE messages_fts MATCH '"' || replace(?1, '"', '""') || '"*'
+            ORDER BY m.ts DESC LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![query, limit as i64], row_to_message)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     pub fn set_verified(&self, id: &[u8; 32], verified: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE peers SET verified = ?2 WHERE id = ?1",
@@ -165,8 +249,8 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO messages
-                (mid, peer_id, outgoing, ts, body, state, reply_to)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                (mid, peer_id, outgoing, ts, body, state, reply_to, read)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?3)
             "#,
             params![
                 m.mid.as_bytes().as_slice(),
@@ -201,20 +285,7 @@ impl Store {
             ORDER BY ts DESC, msg_rowid DESC LIMIT ?2
             "#,
         )?;
-        let rows = stmt.query_map(params![peer_id.as_slice(), limit as i64], |row| {
-            let mid_bytes: Vec<u8> = row.get(0)?;
-            let pid: Vec<u8> = row.get(1)?;
-            let reply_bytes: Option<Vec<u8>> = row.get(6)?;
-            Ok(StoredMessage {
-                mid: Uuid::from_slice(&mid_bytes).unwrap_or_default(),
-                peer_id: pid.try_into().unwrap_or([0; 32]),
-                outgoing: row.get::<_, i64>(2)? != 0,
-                ts: row.get::<_, i64>(3)? as u64,
-                text: row.get(4)?,
-                state: row.get::<_, i64>(5)? as u8,
-                reply_to: reply_bytes.and_then(|b| Uuid::from_slice(&b).ok()),
-            })
-        })?;
+        let rows = stmt.query_map(params![peer_id.as_slice(), limit as i64], row_to_message)?;
         let mut out: Vec<StoredMessage> = rows.filter_map(Result::ok).collect();
         out.reverse(); // oldest first
         Ok(out)
@@ -322,6 +393,51 @@ mod tests {
         assert!(store.is_verified(&peer).unwrap());
         // Clearing an already-empty conversation is a no-op, not a failure.
         assert_eq!(store.clear_history(&peer).unwrap(), 0);
+    }
+
+        /// Their `msg` is outgoing; unread only counts what arrives.
+    fn incoming(peer: [u8; 32], ts: u64, text: &str) -> StoredMessage {
+        StoredMessage { outgoing: false, ..msg(peer, ts, text) }
+    }
+
+    #[test]
+    fn unread_counts_survive_via_store_and_clear_on_mark_read() {
+        let store = Store::open_in_memory().unwrap();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        store.record_peer(&a, "A", "h", 1).unwrap();
+        store.record_peer(&b, "B", "h", 1).unwrap();
+        store.insert_message(&incoming(a, 2000, "one")).unwrap();
+        store.insert_message(&incoming(a, 2001, "two")).unwrap();
+        store.insert_message(&msg(a, 2002, "mine — never unread")).unwrap();
+        store.insert_message(&incoming(b, 2003, "theirs")).unwrap();
+
+        let mut counts = store.unread_counts().unwrap();
+        counts.sort();
+        assert_eq!(counts, vec![(a, 2), (b, 1)]);
+
+        assert_eq!(store.mark_read(&a).unwrap(), 2);
+        assert_eq!(store.unread_counts().unwrap(), vec![(b, 1)]);
+    }
+
+    #[test]
+    fn search_finds_prefixes_and_forgets_deleted_text() {
+        let store = Store::open_in_memory().unwrap();
+        let peer = [3u8; 32];
+        store.record_peer(&peer, "P", "h", 1).unwrap();
+        store.insert_message(&incoming(peer, 2000, "the quarterly report is late")).unwrap();
+        let doomed = msg(peer, 2001, "secret rendezvous location");
+        store.insert_message(&doomed).unwrap();
+
+        // Prefix while typing, and hostile input is a term, not syntax.
+        assert_eq!(store.search("quart", 10).unwrap().len(), 1);
+        assert_eq!(store.search("report\" OR \"", 10).unwrap().len(), 0);
+
+        // A deleted message must leave the index too — FTS keeps its own
+        // copy of the text, so without the delete trigger it would still be
+        // findable after secure_delete wiped the base row.
+        store.delete_message(&doomed.mid).unwrap();
+        assert!(store.search("rendezvous", 10).unwrap().is_empty());
     }
 
     #[test]

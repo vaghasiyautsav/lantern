@@ -121,6 +121,16 @@ StartupWMClass=local.lantern.gtk
 EOF
     update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
     echo "Added Lantern to your application launcher."
+
+    # Start at login, hidden. This is how "messages pop up even though the
+    # app isn't open" works — the same way it works in every tray messenger:
+    # the process is resident from login, only the window comes and goes.
+    # Delete this file to opt out.
+    mkdir -p "$HOME/.config/autostart"
+    sed 's|^Exec=.*|Exec=env LANTERN_START_HIDDEN=1 '"$HOME"'/.lantern/bin/lantern-gtk|' \
+        "$HOME/.local/share/applications/local.lantern.gtk.desktop" \
+        > "$HOME/.config/autostart/local.lantern.gtk.desktop"
+    echo "Lantern will start in the background at login (delete ~/.config/autostart/local.lantern.gtk.desktop to disable)."
 fi
 
 # 5. macOS app bundle ---------------------------------------------------------
