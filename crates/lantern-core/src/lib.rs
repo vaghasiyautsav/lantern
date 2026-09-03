@@ -881,10 +881,7 @@ impl Core {
                                 size,
                                 chunk_size,
                                 root: root32,
-                                chunk_hashes: chunks
-                                    .chunks_exact(32)
-                                    .map(|c| <[u8; 32]>::try_from(c).unwrap())
-                                    .collect(),
+                                chunk_hashes: chunks.as_chunks::<32>().0.to_vec(),
                             };
                             let total = manifest.chunk_count();
 
