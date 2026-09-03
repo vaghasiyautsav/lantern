@@ -117,6 +117,9 @@ impl Store {
         // every write path — including deletes, which matter because FTS
         // keeps its own copy of the text and secure_delete on the base table
         // alone would leave deleted messages greppable in the index.
+        let has_fts = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'")?
+            .exists([])?;
         conn.execute_batch(
             r#"
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
@@ -128,11 +131,17 @@ impl Store {
                 INSERT INTO messages_fts(messages_fts, rowid, body)
                     VALUES ('delete', old.msg_rowid, old.body);
             END;
-            INSERT INTO messages_fts(rowid, body)
-                SELECT msg_rowid, body FROM messages
-                WHERE msg_rowid NOT IN (SELECT rowid FROM messages_fts);
             "#,
         )?;
+        if !has_fts {
+            // First time this database has the index: history predates the
+            // triggers, so index it now. This has to be FTS5's own rebuild
+            // command — an external-content table answers a plain SELECT
+            // from the content table, not from its index, so "insert the
+            // rows not already in messages_fts" sees every row as present
+            // and indexes nothing.
+            conn.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")?;
+        }
         Ok(())
     }
 
@@ -438,6 +447,42 @@ mod tests {
         // findable after secure_delete wiped the base row.
         store.delete_message(&doomed.mid).unwrap();
         assert!(store.search("rendezvous", 10).unwrap().is_empty());
+    }
+
+    /// A database that predates the search index: everything already in it
+    /// must be searchable after the upgrade, not just what arrives later.
+    #[test]
+    fn upgrade_indexes_existing_history() {
+        let dir = std::env::temp_dir().join(format!("lantern-fts-upgrade-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let peer = [4u8; 32];
+
+        // Old build: rows written before the index and its triggers existed.
+        {
+            let store = Store::open(&path).unwrap();
+            store.record_peer(&peer, "P", "h", 1).unwrap();
+            store.insert_message(&incoming(peer, 2000, "the quarterly report is late")).unwrap();
+            store.insert_message(&msg(peer, 2001, "invoice attached")).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TRIGGER messages_ai; DROP TRIGGER messages_ad; DROP TABLE messages_fts;",
+                )
+                .unwrap();
+        }
+
+        // New build opens it and migrates.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.search("quart", 10).unwrap().len(), 1);
+        assert_eq!(store.search("invoice", 10).unwrap().len(), 1);
+        // And the triggers are live again for anything new.
+        store.insert_message(&incoming(peer, 2002, "fresh after upgrade")).unwrap();
+        assert_eq!(store.search("fresh", 10).unwrap().len(), 1);
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
