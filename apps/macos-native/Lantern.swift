@@ -138,12 +138,16 @@ struct HistoryMessage: Codable {
     var text: String
     var state: Int
     var reply_to: String?
+    /// Arrived sealed and not yet opened. Optional so pre-seal engines parse.
+    var sealed: Bool?
 }
 
 // MARK: - Chat items
 
 enum ChatKind: Equatable {
     case text(String)
+    /// A closed envelope; the words stay on the engine until opened.
+    case sealed
     /// `fraction` is how far along the transfer is, 0…1, and nil while the
     /// engine has nothing measured to report — the card then shows an
     /// indeterminate bar rather than a made-up position.
@@ -195,6 +199,8 @@ final class Model: ObservableObject {
     @Published var draft: String = ""
     /// The message the composer is currently answering, if any.
     @Published var replyingTo: ChatItem?
+    /// Composer lock: the next message goes sealed. One seal per press.
+    @Published var seal = false
     @Published var showVerify = false
     @Published var engineUp = false
     /// A look-again is in flight; the button spins rather than allowing five
@@ -311,7 +317,9 @@ final class Model: ObservableObject {
             items = hist.map {
                 ChatItem(
                     id: $0.mid, outgoing: $0.outgoing, ts: $0.ts,
-                    kind: .text($0.text), delivered: $0.state >= 1,
+                    kind: ($0.sealed ?? false) && !$0.outgoing
+                        ? .sealed : .text($0.text),
+                    delivered: $0.state >= 1,
                     replyTo: $0.reply_to)
             }
         }
@@ -347,11 +355,14 @@ final class Model: ObservableObject {
             return
         }
         let answering = replyingTo?.id
+        let sealNow = seal
+        seal = false
         draft = ""
         replyingTo = nil
         Task {
             var body: [String: Any] = ["peer": peer, "text": text]
             if let answering { body["reply_to"] = answering }
+            if sealNow { body["sealed"] = true }
             let r = await postJSON("/api/msg", body)
             if let mid = r?["mid"] as? String {
                 items.append(ChatItem(
@@ -578,6 +589,16 @@ final class Model: ObservableObject {
         }
     }
 
+    /// Break a seal: the engine reveals it and tells the sender; the
+    /// envelope becomes the text when history reloads.
+    func openSealed(_ mid: String) {
+        guard let peer = selected else { return }
+        Task {
+            _ = await postJSON("/api/open/\(mid)", [:])
+            await loadHistory(peer)
+        }
+    }
+
     // -- live events ------------------------------------------------------
 
     func connectWS() {
@@ -624,22 +645,46 @@ final class Model: ObservableObject {
             let ts = (ev["ts"] as? NSNumber)?.uint64Value ?? nowMS()
             let who = (ev["peer_name"] as? String)
                 ?? peers.first { $0.id == peer }?.name ?? "Someone"
+            let sealed = ev["sealed"] as? Bool ?? false
             if peer == selected {
                 items.append(ChatItem(
                     id: mid, outgoing: false, ts: ts,
-                    kind: .text(text), delivered: true,
+                    kind: sealed ? .sealed : .text(text), delivered: true,
                     replyTo: ev["reply_to"] as? String))
             } else {
                 unread[peer, default: 0] += 1
                 updateBadge()
             }
             NSSound(named: "Pop")?.play()
-            Notifier.notify(title: who, body: text)
+            // A sealed message's whole point is that its words are not
+            // sitting in a notification.
+            Notifier.notify(
+                title: who, body: sealed ? "sent a sealed message" : text)
 
-        case "delivered":
+        case "delivered", "opened":
             if let mid = ev["mid"] as? String,
                let i = items.firstIndex(where: { $0.id == mid }) {
                 items[i].delivered = true
+            }
+
+        case "file-offer-pending":
+            // A stranger's file over the engine's cap: nothing has been
+            // fetched. NSAlert keeps this working in every layout without
+            // threading bindings through the views.
+            let who = ev["peer_name"] as? String ?? "Someone"
+            let name = ev["name"] as? String ?? "a file"
+            let size = (ev["size"] as? NSNumber)?.uint64Value ?? 0
+            let xid = ev["xid"] as? String ?? ""
+            let alert = NSAlert()
+            alert.messageText = "\(who) wants to send \"\(name)\" (\(fmtSize(size)))"
+            alert.informativeText = "They are not verified. Accept only if "
+                + "you expected this — nothing downloads until you say so."
+            alert.addButton(withTitle: "Decline")
+            alert.addButton(withTitle: "Accept")
+            let accept = alert.runModal() == .alertSecondButtonReturn
+            Task {
+                _ = await postJSON(
+                    "/api/xfer/\(xid)/\(accept ? "accept" : "decline")", [:])
             }
 
         case "file-offered":
@@ -902,6 +947,8 @@ struct MessageRow: View {
     /// The message this one answers, already resolved against the timeline.
     var quoted: QuotedMessage?
     var onReply: () -> Void = {}
+    /// Break the seal on a sealed message.
+    var onOpenSealed: () -> Void = {}
     /// Jump to the quoted original.
     var onJumpToQuoted: () -> Void = {}
     /// Delete this message from this Mac.
@@ -1011,6 +1058,13 @@ struct MessageRow: View {
                                 .fill(bubbleColor))
                         .frame(maxWidth: maxBubble,
                                alignment: item.outgoing ? .trailing : .leading)
+
+                case .sealed:
+                    Button(action: onOpenSealed) {
+                        Label("Sealed message — click to open",
+                              systemImage: "envelope.fill")
+                    }
+                    .buttonStyle(.bordered)
 
                 case .file(let name, let size, let status, let done,
                            let failed, let fraction):
@@ -1536,6 +1590,9 @@ struct ConversationView: View {
                                         model.replyingTo = item
                                         composerFocused = true
                                     },
+                                    onOpenSealed: {
+                                        model.openSealed(item.id)
+                                    },
                                     onJumpToQuoted: {
                                         if let rid = item.replyTo {
                                             jump(to: rid, proxy)
@@ -1606,6 +1663,19 @@ struct ConversationView: View {
                     }
                     .buttonStyle(.plain)
                     .help("Send a file to \(peer.name)")
+
+                    Button {
+                        model.seal.toggle()
+                    } label: {
+                        Image(systemName: model.seal ? "lock.fill" : "lock.open")
+                            .font(.system(size: 14))
+                            .foregroundColor(model.seal ? .accentColor : .secondary)
+                            .frame(width: 26, height: 26)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Seal — \(peer.name) sees a closed envelope until "
+                        + "they open it, and you see when they do")
 
                     TextField("Message \(peer.name)…  (or drop files here)",
                               text: $model.draft, axis: .vertical)

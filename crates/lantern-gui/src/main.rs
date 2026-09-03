@@ -42,6 +42,9 @@ struct Args {
     /// same-machine testing.
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     broadcast: bool,
+    /// Group label announced in beacons (like ipmsg's group). Empty = none.
+    #[arg(long, default_value = "")]
+    group: String,
     /// Localhost port for the interface.
     #[arg(long, default_value_t = 3999)]
     gui_port: u16,
@@ -91,10 +94,11 @@ async fn main() -> anyhow::Result<()> {
         discovery_port: args.discovery_port,
         beacon_targets: targets,
         broadcast: args.broadcast,
-        group: String::new(), // group UI not built in the web shell yet
+        group: args.group.clone(),
         quic_port: 0,
         in_memory_store: false,
-        auto_accept_limit: None, // consent UI not built in the web shell yet
+        // The web UI can consent now, so gate strangers' big files.
+        auto_accept_limit: Some(25 * 1024 * 1024),
         download_dir: lantern_core::user_download_dir(),
     })
     .await?;
@@ -134,6 +138,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/filepath", post(send_filepath))
         .route("/api/trust", post(trust))
+        // Break a seal: reveals locally and tells the sender it was opened.
+        .route("/api/open/{mid}", post(open_message))
+        // Consent answers for a held offer (file-offer-pending).
+        .route("/api/xfer/{xid}/accept", post(xfer_accept))
+        .route("/api/xfer/{xid}/decline", post(xfer_decline))
+        .route("/api/search", get(search))
+        .route("/api/mark-read/{id}", post(mark_read))
+        .route("/api/unread", get(unread))
+        .route("/api/presence", post(presence))
         .route("/api/refresh", post(refresh))
         .route("/api/version", get(version))
         // A check fetches from GitHub — a side effect, so it's a POST.
@@ -230,6 +243,13 @@ async fn peers(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
                 "verified": app.core.is_verified(&p.id),
                 "words": Core::words_for(&p.id),
                 "online": p.online,
+                "state": match p.state {
+                    lantern_core::Presence::Away => "away",
+                    lantern_core::Presence::Dnd => "dnd",
+                    _ => "active",
+                },
+                "status": p.status,
+                "group": p.group,
                 "since_beacon_s": p.since_beacon.map(|d| d.as_secs()),
             })
         })
@@ -261,6 +281,7 @@ async fn history(
                 "text": m.text,
                 "state": m.state,
                 "reply_to": m.reply_to.map(|r| r.to_string()),
+                "sealed": m.sealed,
             })
         })
         .collect();
@@ -291,6 +312,111 @@ async fn delete_message(
     Json(json!({"deleted": app.core.delete_message(&mid)})).into_response()
 }
 
+async fn open_message(
+    State(app): State<Arc<App>>,
+    AxPath(mid): AxPath<String>,
+) -> impl IntoResponse {
+    let Ok(mid) = Uuid::parse_str(&mid) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad mid"}))).into_response();
+    };
+    app.core.open_message(mid).await;
+    Json(json!({"ok": true})).into_response()
+}
+
+async fn xfer_accept(
+    State(app): State<Arc<App>>,
+    AxPath(xid): AxPath<String>,
+) -> impl IntoResponse {
+    let Ok(xid) = Uuid::parse_str(&xid) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad xid"}))).into_response();
+    };
+    match app.core.accept_file(xid).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::GONE,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn xfer_decline(
+    State(app): State<Arc<App>>,
+    AxPath(xid): AxPath<String>,
+) -> impl IntoResponse {
+    let Ok(xid) = Uuid::parse_str(&xid) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad xid"}))).into_response();
+    };
+    app.core.decline_file(xid).await;
+    Json(json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: String,
+}
+
+async fn search(
+    State(app): State<Arc<App>>,
+    Query(p): Query<SearchParams>,
+) -> Json<serde_json::Value> {
+    let hits: Vec<_> = app
+        .core
+        .search(&p.q, 50)
+        .into_iter()
+        .map(|m| {
+            json!({
+                "mid": m.mid.to_string(),
+                "peer": hex::encode(m.peer_id),
+                "outgoing": m.outgoing,
+                "ts": m.ts,
+                "text": m.text,
+            })
+        })
+        .collect();
+    Json(json!(hits))
+}
+
+async fn mark_read(
+    State(app): State<Arc<App>>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    let Some(pid) = parse_id(&id) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad id"}))).into_response();
+    };
+    Json(json!({"read": app.core.mark_read(&pid)})).into_response()
+}
+
+async fn unread(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let list: Vec<_> = app
+        .core
+        .unread_counts()
+        .into_iter()
+        .map(|(id, n)| json!({"peer": hex::encode(id), "n": n}))
+        .collect();
+    Json(json!(list))
+}
+
+#[derive(Deserialize)]
+struct PresenceReq {
+    away: bool,
+    #[serde(default)]
+    status: String,
+}
+
+async fn presence(
+    State(app): State<Arc<App>>,
+    Json(req): Json<PresenceReq>,
+) -> Json<serde_json::Value> {
+    let state = if req.away {
+        lantern_core::Presence::Away
+    } else {
+        lantern_core::Presence::Active
+    };
+    app.core.set_presence(state, &req.status).await;
+    Json(json!({"ok": true}))
+}
+
 #[derive(Deserialize)]
 struct MsgReq {
     peer: String,
@@ -298,6 +424,9 @@ struct MsgReq {
     /// Optional mid this message answers.
     #[serde(default)]
     reply_to: Option<String>,
+    /// Deliver sealed: the receiver sees an envelope until they open it.
+    #[serde(default)]
+    sealed: bool,
 }
 
 async fn send_msg(
@@ -310,7 +439,12 @@ async fn send_msg(
     // An unparseable reply_to is dropped rather than rejected: the message
     // itself is still worth sending.
     let reply_to = req.reply_to.as_deref().and_then(|r| Uuid::parse_str(r).ok());
-    match app.core.send_reply(pid, &req.text, reply_to).await {
+    let sent = if req.sealed {
+        app.core.send_sealed(pid, &req.text).await
+    } else {
+        app.core.send_reply(pid, &req.text, reply_to).await
+    };
+    match sent {
         Ok(mid) => Json(json!({"mid": mid.to_string()})).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,

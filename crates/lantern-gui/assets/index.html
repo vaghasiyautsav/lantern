@@ -105,6 +105,7 @@ body{
 .ibtn{width:30px;height:30px;border:0;border-radius:var(--r-sm);background:transparent;
   color:var(--text-2);cursor:pointer;display:grid;place-items:center;font-size:15px}
 .ibtn:hover{background:var(--surface-sunken);color:var(--text-1)}
+.ibtn.active{background:var(--accent-soft);color:var(--accent)}
 .hint{font-size:11px;color:var(--text-3);margin-right:8px}
 .send{height:30px;padding:0 var(--s4);border:0;border-radius:var(--r-sm);
   background:var(--accent);color:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
@@ -186,6 +187,7 @@ body{
         <textarea id="input" placeholder="Message…  (drop a file anywhere to send it)" rows="1"></textarea>
         <div class="cbar">
           <button class="ibtn" id="attach" title="Send a file">📎</button>
+          <button class="ibtn" id="seal" title="Seal — they see a closed envelope until they open it, and you see when they do">🔒</button>
           <input type="file" id="file-input" hidden>
           <div class="spacer"></div>
           <span class="hint">⏎ send · ⇧⏎ newline</span>
@@ -271,6 +273,8 @@ function progressLine(ev){
 
 async function boot(){
   ME = await api('/api/me');
+  // Badges survive a restart: they come from the store, not this tab.
+  for(const u of await api('/api/unread')) UNREAD[u.peer] = u.n;
   $('me-line').textContent = ME.name + ' · ' + ME.short + '…';
   $('me-words').innerHTML = ME.words.map((w,i)=>`<span>${i+1} <b>${w}</b></span>`).join('');
   $('net-line').textContent = 'discovery active';
@@ -296,7 +300,7 @@ function renderRoster(){
       <div class="av" style="background:${avColor(p.id)}">${initials(p.name)}</div>
       <div style="min-width:0">
         <div class="pname">${esc(p.name)} ${p.verified?'<span class="vbadge" title="Verified">✓</span>':''}</div>
-        <div class="psub">${esc(p.host)} · ${esc(p.addr.split(':')[0])}</div>
+        <div class="psub">${p.group?esc(p.group)+' · ':''}${esc(p.host)}${p.online===false?' · offline':p.state==='away'?' · away':p.state==='dnd'?' · do not disturb':''}</div>
       </div>
       ${unread?`<div class="badge">${unread}</div>`:''}`;
     list.appendChild(el);
@@ -306,6 +310,7 @@ function renderRoster(){
 
 async function select(id){
   CURRENT = id; UNREAD[id] = 0;
+  api('/api/mark-read/'+id, {method:'POST'}).catch(()=>{});
   const p = PEERS.find(x=>x.id===id); if(!p) return;
   renderRoster();
   $('convbar').style.display = 'flex';
@@ -318,8 +323,11 @@ async function select(id){
   updateVerifyBtn(p);
   const hist = await api('/api/history/'+id);
   const t = $('thread'); t.innerHTML = '';
-  for(const m of hist) appendMsg(m.outgoing ? ME.name : p.name,
+  for(const m of hist){
+    if(m.sealed && !m.outgoing) appendSealed(p.name, id, m.ts, m.mid);
+    else appendMsg(m.outgoing ? ME.name : p.name,
       m.outgoing ? 'me' : id, m.text, m.ts, m.mid, m.outgoing, m.state);
+  }
   t.scrollTop = t.scrollHeight;
   $('input').focus();
 }
@@ -346,6 +354,23 @@ function appendMsg(name, colorKey, text, ts, mid, outgoing, state){
     </div>`;
   t.appendChild(el);
   t.scrollTop = t.scrollHeight;
+  return el;
+}
+
+/* A sealed message: envelope until clicked. Opening tells the sender —
+   that is the point — and the text comes from history, where it already
+   sits; the event stream deliberately never carried it. */
+function appendSealed(name, colorKey, ts, mid){
+  const el = appendMsg(name, colorKey, '', ts, mid, false, 1);
+  const body = el.querySelector('.mtext');
+  body.innerHTML = '<button class="vbtn">🔒 Sealed message — click to open</button>';
+  body.querySelector('button').onclick = async (e) => {
+    e.target.disabled = true;
+    await api('/api/open/'+mid, {method:'POST'});
+    const hist = await api('/api/history/'+CURRENT);
+    const m = hist.find(x=>x.mid===mid);
+    body.textContent = m ? m.text : '(reopen the conversation to read)';
+  };
   return el;
 }
 
@@ -398,12 +423,14 @@ async function sendCurrent(){
   if(!text || !CURRENT || sending) return;
   sending = true; $('send-btn').disabled = true;
   try{
+    const sealed = $('seal').classList.contains('active');
     const r = await api('/api/msg', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({peer: CURRENT, text})});
+      body: JSON.stringify({peer: CURRENT, text, sealed})});
     if(r.mid){
       $('input').value = '';
-      appendMsg(ME.name, 'me', text, Date.now(), r.mid, true, 0);
+      $('seal').classList.remove('active'); // one seal per press
+      appendMsg(ME.name, 'me', (sealed?'🔒 ':'')+text, Date.now(), r.mid, true, 0);
     } else banner('Send failed: '+(r.error||'unknown'));
   } finally { sending=false; $('send-btn').disabled=false; $('input').focus(); }
 }
@@ -436,7 +463,9 @@ function handleEvent(ev){
     case 'peer': refreshPeers(); break;
     case 'msg': {
       if(ev.peer === CURRENT){
-        appendMsg(ev.peer_name, ev.peer, ev.text, ev.ts, ev.mid, false, 1);
+        if(ev.sealed) appendSealed(ev.peer_name, ev.peer, ev.ts, ev.mid);
+        else appendMsg(ev.peer_name, ev.peer, ev.text, ev.ts, ev.mid, false, 1);
+        api('/api/mark-read/'+ev.peer, {method:'POST'}).catch(()=>{});
       } else {
         UNREAD[ev.peer] = (UNREAD[ev.peer]||0)+1; renderRoster();
       }
@@ -445,6 +474,23 @@ function handleEvent(ev){
     case 'delivered': {
       const el = document.querySelector(`[data-mid="${ev.mid}"] [data-ticks]`);
       if(el){ el.textContent='✓✓'; el.classList.remove('pending'); }
+      break;
+    }
+    case 'opened': {
+      // The seal we sent was broken — the part of sealing people care about.
+      const el = document.querySelector(`[data-mid="${ev.mid}"] [data-ticks]`);
+      if(el){ el.textContent='✓✓ opened'; el.classList.remove('pending'); }
+      break;
+    }
+    case 'file-offer-pending': {
+      // A stranger's file over the cap: nothing fetched until a click.
+      const who = esc(ev.peer_name), nm = esc(ev.name);
+      const b = $('banner');
+      b.innerHTML = `${who} wants to send "${nm}" (${fmtSize(ev.size)}) — they are not verified. `+
+        `<button class="vbtn" data-a>Accept</button> <button class="vbtn" data-d>Decline</button>`;
+      b.classList.add('show');
+      b.querySelector('[data-a]').onclick = async ()=>{ await api('/api/xfer/'+ev.xid+'/accept',{method:'POST'}); b.classList.remove('show'); };
+      b.querySelector('[data-d]').onclick = async ()=>{ await api('/api/xfer/'+ev.xid+'/decline',{method:'POST'}); b.classList.remove('show'); };
       break;
     }
     case 'file-offered': {
@@ -572,6 +618,7 @@ $('input').addEventListener('keydown', e=>{
   if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendCurrent(); }
 });
 $('send-btn').onclick = sendCurrent;
+$('seal').onclick = () => $('seal').classList.toggle('active');
 $('attach').onclick = () => $('file-input').click();
 $('file-input').onchange = e => { for(const f of e.target.files) sendFile(f); e.target.value=''; };
 

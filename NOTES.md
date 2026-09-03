@@ -573,8 +573,20 @@ All four rode wire fields that existed since day one; no protocol change.
   a PNG under `<data>/outbox/` and sends it as a file. Text paste falls
   through untouched.
 
-Not carried to macOS/web: seal/open UI, group config, image bubbles (the
-JSON already carries `sealed`, `group`, `opened`).
+**Carried to the web GUI (18 Aug, night)** — which is also the whole
+Windows app: seal toggle + envelope-with-open, consent banner
+(accept/decline for file-offer-pending), unread seeded from `/api/unread`,
+mark-read on open, presence/group in the roster, `--group` flag, and new
+endpoints `/api/open/{mid}`, `/api/xfer/{xid}/accept|decline`,
+`/api/search?q=`, `/api/unread`, `/api/mark-read/{id}`, `/api/presence`.
+The GUI now passes `auto_accept_limit: Some(25 MB)` since it can consent.
+
+**Carried to the SwiftUI shell (same night, edited blind from Linux —
+compiled by CI's swiftc, NOT yet run on a Mac):** seal toggle in the
+composer, sealed envelope + open (reloads history), opened acks mark
+delivered, consent via NSAlert, sealed notifications withhold the text.
+Still absent on macOS: search UI, away toggle, image bubbles, group config
+(the API is all there). First Mac session: run it, then update this line.
 
 ## Open defects
 
