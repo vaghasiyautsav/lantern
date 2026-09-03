@@ -1461,6 +1461,7 @@ struct ConversationView: View {
         let excerpt: String
         switch original.kind {
         case .text(let t): excerpt = t
+        case .sealed: excerpt = "🔒 sealed message"
         case .file(let name, _, _, _, _, _): excerpt = "📎 \(name)"
         }
         return QuotedMessage(
