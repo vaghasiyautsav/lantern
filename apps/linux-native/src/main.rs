@@ -32,16 +32,11 @@ struct Backend {
     data_dir: std::path::PathBuf,
 }
 
-/// The widgets of one file card, kept so events can update it in place,
-/// plus what is needed to turn per-chunk progress into a rate.
+/// The widgets of one file card, kept so events can update it in place.
 struct FileRow {
     status: gtk::Label,
     icon: gtk::Image,
     size: u64,
-    /// Bytes and the moment they were observed, from the last repaint.
-    last: Option<(u64, std::time::Instant)>,
-    /// Smoothed bytes/sec. Raw per-chunk deltas jitter far too much to read.
-    rate: f64,
 }
 
 #[derive(Clone)]
@@ -458,6 +453,17 @@ fn build_ui(
         }
     };
 
+    // An update replaces the running binaries, so the Lantern that starts one
+    // never sees it finish — this launch is the first that can say how it
+    // went. take_unseen_result reports each outcome exactly once.
+    if let Some(st) = lantern_core::update::take_unseen_result(&backend.data_dir) {
+        flash(&if st.succeeded() {
+            format!("Updated to {} while you were away.", st.commit)
+        } else {
+            format!("The last update failed at {}: {}", st.step, st.message)
+        });
+    }
+
     // Auto-scroll.
     //
     // Appending a row does not move the adjustment until GTK has allocated
@@ -633,8 +639,6 @@ fn build_ui(
                     status: s.clone(),
                     icon: icon.clone(),
                     size,
-                    last: None,
-                    rate: 0.0,
                 },
             );
             append_row(
@@ -661,41 +665,28 @@ fn build_ui(
         }
     };
 
-    // Live progress → "12.3 MB of 50.0 MB · 8.4 MB/s".
+    // Live progress → "12.3 MB of 50.0 MB · 8.4 MB/s · 12s left".
     //
-    // Repaints are throttled: chunks land far faster than anyone can read,
-    // and a number that changes every few milliseconds is unreadable anyway.
-    // The gap between repaints doubles as the interval the rate is measured
-    // over, which is why it is not simply "one chunk / one event".
+    // The rate and ETA come measured and smoothed from the core (see
+    // core::rate) — this shell used to run its own EMA here, which was the
+    // "four shells dividing badly in four different ways" the core module
+    // exists to prevent. Events are already clock-paced, so no throttling
+    // either. Render, nothing else.
     let set_file_progress = {
         let state = Rc::clone(&state);
-        move |xid: &str, bytes: u64, total: u64| {
-            let mut st = state.borrow_mut();
-            let Some(row) = st.file_rows.get_mut(xid) else {
+        move |xid: &str, bytes: u64, total: u64, bps: Option<u64>, eta_s: Option<u64>| {
+            let st = state.borrow();
+            let Some(row) = st.file_rows.get(xid) else {
                 return;
             };
-            let now = std::time::Instant::now();
-            let Some((prev_bytes, prev_at)) = row.last else {
-                row.last = Some((bytes, now));
-                return;
-            };
-            let dt = now.duration_since(prev_at).as_secs_f64();
-            if dt < 0.25 {
-                return;
+            let mut line = format!("{} of {}", fmt_size(bytes), fmt_size(total));
+            if let Some(bps) = bps {
+                line.push_str(&format!(" · {}/s", fmt_size(bps)));
             }
-            let instant = bytes.saturating_sub(prev_bytes) as f64 / dt;
-            row.rate = if row.rate == 0.0 {
-                instant
-            } else {
-                row.rate * 0.7 + instant * 0.3
-            };
-            row.last = Some((bytes, now));
-            row.status.set_text(&format!(
-                "{} of {} · {}/s",
-                fmt_size(bytes),
-                fmt_size(total),
-                fmt_size(row.rate as u64)
-            ));
+            if let Some(eta) = eta_s {
+                line.push_str(&format!(" · {eta}s left"));
+            }
+            row.status.set_text(&line);
         }
     };
 
@@ -1419,8 +1410,8 @@ fn build_ui(
                             "document-save-symbolic",
                         );
                     }
-                    CoreEvent::TransferProgress { xid, bytes, total, .. } => {
-                        set_file_progress(&xid.to_string(), bytes, total);
+                    CoreEvent::TransferProgress { xid, bytes, total, bps, eta_s, .. } => {
+                        set_file_progress(&xid.to_string(), bytes, total, bps, eta_s);
                     }
                     CoreEvent::ChunksSent { xid, sent, total } => {
                         if sent < total {
