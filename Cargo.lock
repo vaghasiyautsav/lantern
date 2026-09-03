@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-crypto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-discovery"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "if-addrs",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-gtk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-gui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "rusqlite",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-transport"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "lantern-crypto",

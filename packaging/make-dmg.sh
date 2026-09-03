@@ -59,8 +59,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Lantern</string>
   <key>CFBundleDisplayName</key><string>Lantern</string>
   <key>CFBundleIdentifier</key><string>local.lantern.gui</string>
-  <key>CFBundleVersion</key><string>0.1.1</string>
-  <key>CFBundleShortVersionString</key><string>0.1.1</string>
+  <key>CFBundleVersion</key><string>0.1.2</string>
+  <key>CFBundleShortVersionString</key><string>0.1.2</string>
   <key>CFBundleExecutable</key><string>Lantern</string>
   <key>CFBundleIconFile</key><string>Lantern</string>
   <key>CFBundlePackageType</key><string>APPL</string>
