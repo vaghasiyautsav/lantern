@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use lantern_crypto::Identity;
 use lantern_discovery::{now_ms, Discovered, Discovery, DiscoveryConfig, OFFLINE_AFTER};
+/// Whether beacons can leave this machine; see [`Core::link_status`].
+pub use lantern_discovery::LinkStatus;
 use lantern_proto::{
     read_frame, write_frame, Beacon, BeaconType, ControlFrame, DeviceClass, PresenceState,
 };
@@ -134,6 +136,14 @@ pub enum CoreEvent {
         bps: Option<u64>,
         /// Seconds left at the current rate, when that can be said at all.
         eta_s: Option<u64>,
+    },
+    /// Discovery's view of the network changed: beacons stopped leaving this
+    /// machine, or started again. `detail` is the OS's own error when
+    /// `Blocked`. Sent on change only, so a shell can show or clear one
+    /// banner without polling.
+    LinkChanged {
+        status: LinkStatus,
+        detail: Option<String>,
     },
 }
 
@@ -283,6 +293,10 @@ struct PeerInfo {
     host: String,
     /// ip from the beacon's source, port from the beacon's `port` field.
     quic_addr: SocketAddr,
+    /// Where their beacons come from — their discovery socket — so ours can
+    /// be sent straight back. `None` for a peer learned from an inbound
+    /// connection, whose source port is not a discovery port.
+    beacon_from: Option<SocketAddr>,
     /// As announced in their last beacon.
     state: PresenceState,
     status: String,
@@ -398,6 +412,7 @@ impl Core {
         core.clone().spawn_discovery_loop();
         core.clone().spawn_accept_loop();
         core.clone().spawn_heartbeat();
+        core.clone().spawn_link_watch();
 
         Ok((core, event_rx))
     }
@@ -1442,6 +1457,7 @@ impl Core {
                             name: beacon.name.clone(),
                             host: beacon.host.clone(),
                             quic_addr,
+                            beacon_from: Some(from),
                             last_beacon: Instant::now(),
                             state: beacon.state,
                             status: beacon.status.clone(),
@@ -1512,8 +1528,16 @@ impl Core {
                     info!("discovered {} ({})", beacon.name, from);
                 }
                 if is_new || answer_ping {
-                    // Answer so the other side learns us quickly too.
-                    self.announce().await;
+                    // Answer so the other side learns us quickly too — on
+                    // the broadcast as before, and straight back to them,
+                    // because a broadcast reply is exactly what a laptop on
+                    // Wi-Fi misses. One-for-one and on-link only, so the
+                    // unicast copy adds no amplification the limit above
+                    // hasn't already capped.
+                    let b = self.make_beacon(BeaconType::Hello);
+                    self.discovery
+                        .send_beacon_with(&b, self.identity.signing_key(), &[from])
+                        .await;
                 }
                 // They are reachable: push anything that queued while they
                 // were not. Cheap when the queue is empty (one indexed query).
@@ -1604,6 +1628,7 @@ impl Core {
                                         name: name.clone(),
                                         host: host.clone(),
                                         quic_addr: conn.remote_address(),
+                                        beacon_from: None,
                                         last_beacon: Instant::now(),
                                         state: PresenceState::Active,
                                         status: String::new(),
@@ -1630,15 +1655,120 @@ impl Core {
         });
     }
 
+    /// Where heartbeat copies go: every neighbour heard from recently.
+    async fn unicast_peers(&self) -> Vec<SocketAddr> {
+        let inner = self.inner.lock().await;
+        inner
+            .roster
+            .values()
+            .filter(|p| p.last_beacon.elapsed() < UNICAST_WINDOW)
+            .filter_map(|p| p.beacon_from)
+            .take(MAX_UNICAST_PEERS)
+            .collect()
+    }
+
+    /// The first beacon is a Ping, not a Hello. A peer only answers a Hello
+    /// from someone new to it, and the roster lives in memory on *their*
+    /// side too: restart Lantern here and everyone who already knew us
+    /// stays silent, so the sidebar sat empty until each of their
+    /// heartbeats happened along — up to 45 s, or longer when Wi-Fi dropped
+    /// one. A Ping is answered by everyone, at once.
+    ///
+    /// Each heartbeat after that also goes straight to every neighbour heard
+    /// from in the last [`UNICAST_WINDOW`], so a peer whose radio keeps
+    /// missing broadcasts still sees us as online.
     fn spawn_heartbeat(self: Arc<Self>) {
         tokio::spawn(async move {
+            self.refresh().await;
             loop {
-                self.announce().await;
                 tokio::time::sleep(lantern_discovery::HEARTBEAT).await;
+                let b = self.make_beacon(BeaconType::Hello);
+                let peers = self.unicast_peers().await;
+                self.discovery
+                    .send_beacon_with(&b, self.identity.signing_key(), &peers)
+                    .await;
             }
         });
     }
+
+    /// Watch for the three things that leave a roster wrong until the next
+    /// heartbeat: the machine waking from sleep, the network changing under
+    /// it, and beacons being refused outright. Any of them gets a Ping now.
+    ///
+    /// Sleep is detected by the wall clock running ahead of the monotonic
+    /// one, which on macOS does not advance while asleep. A woken laptop has
+    /// usually been marked offline by everyone else, and its own timers
+    /// resume where they paused, so without this it waits out the rest of a
+    /// heartbeat before saying anything.
+    ///
+    /// While the OS is refusing every LAN datagram (macOS Local Network
+    /// privacy, a firewall), the Ping is retried each tick. Nothing reaches
+    /// the wire while blocked, so this costs nobody anything — and the moment
+    /// someone allows Lantern, the roster fills within seconds instead of a
+    /// heartbeat later.
+    fn spawn_link_watch(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut last = (LinkStatus::Ok, None::<String>);
+            let mut mono = Instant::now();
+            let mut wall = std::time::SystemTime::now();
+            loop {
+                tokio::time::sleep(LINK_WATCH).await;
+                let mono_dt = mono.elapsed();
+                let wall_dt = wall.elapsed().unwrap_or_default();
+                mono = Instant::now();
+                wall = std::time::SystemTime::now();
+                let woke = wall_dt > mono_dt + Duration::from_secs(10);
+                let moved = self.discovery.rescan();
+                let blocked = last.0 == LinkStatus::Blocked;
+                if woke || moved || blocked {
+                    if woke || moved {
+                        info!(
+                            "{} — asking everyone to check in",
+                            if woke { "woke from sleep" } else { "network changed" }
+                        );
+                    }
+                    self.refresh().await;
+                }
+                let now = self.discovery.link_status();
+                if now != last {
+                    match now.0 {
+                        LinkStatus::Blocked => warn!(
+                            "the OS is refusing every LAN beacon: {}",
+                            now.1.as_deref().unwrap_or("?")
+                        ),
+                        LinkStatus::NoNetwork => info!("no LAN interface"),
+                        LinkStatus::Ok => info!("beacons are leaving this machine"),
+                    }
+                    let _ = self
+                        .events
+                        .send(CoreEvent::LinkChanged {
+                            status: now.0,
+                            detail: now.1.clone(),
+                        })
+                        .await;
+                    last = now;
+                }
+            }
+        });
+    }
+
+    /// Can beacons leave this machine? `Blocked` comes with the OS's error.
+    pub fn link_status(&self) -> (LinkStatus, Option<String>) {
+        self.discovery.link_status()
+    }
 }
+
+/// How long a peer keeps getting our heartbeat by unicast after we last
+/// heard from it. Long enough to ride out a run of lost broadcasts, short
+/// enough that a laptop which has left is not written to for ever at an
+/// address DHCP may since have given someone else.
+const UNICAST_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// A heartbeat is one datagram per neighbour; keep a busy LAN bounded.
+const MAX_UNICAST_PEERS: usize = 64;
+
+/// How often the link watch looks for sleep, a network change, or blocking.
+const LINK_WATCH: Duration = Duration::from_secs(5);
 
 /// Final-component-only, no separators, no traversal, nothing hidden,
 /// no Windows-reserved names. DESIGN.md §2.5 "Safety".

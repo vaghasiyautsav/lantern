@@ -206,6 +206,25 @@ async fn main() -> anyhow::Result<()> {
                         println!("  ✗ file refused: {}", err.unwrap_or_default());
                     }
                 }
+                CoreEvent::LinkChanged { status, detail } => {
+                    if script {
+                        println!("EVENT link {status:?}");
+                    } else {
+                        match status {
+                            lantern_core::LinkStatus::Ok => {
+                                println!("  ✓ beacons are leaving this machine again")
+                            }
+                            lantern_core::LinkStatus::NoNetwork => {
+                                println!("  ✗ no network — nobody can see this machine")
+                            }
+                            lantern_core::LinkStatus::Blocked => println!(
+                                "  ✗ the OS is refusing every LAN beacon ({}) — on macOS \
+                                 allow Lantern under Privacy & Security → Local Network",
+                                detail.unwrap_or_default()
+                            ),
+                        }
+                    }
+                }
             }
             let _ = std::io::stdout().flush();
             let _ = &core_events; // keep core alive in this task

@@ -80,10 +80,39 @@ pub struct SendOutcome {
     pub result: Result<usize, String>,
 }
 
+/// Can our beacons leave this machine at all?
+///
+/// Exists because the failure is otherwise invisible. On macOS, an app that
+/// Local Network privacy has not allowed gets `EHOSTUNREACH` for every LAN
+/// datagram — broadcast and unicast alike — while loopback still works, so
+/// the old "every send failed" warning never fired and the roster just
+/// stayed empty. Shells turn `Blocked` into something a person can fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinkStatus {
+    /// LAN beacons are going out (or nothing has been tried yet).
+    #[default]
+    Ok,
+    /// No interface with a LAN address: Wi-Fi off, cable out.
+    NoNetwork,
+    /// There is a network, and the OS refused every datagram to it — Local
+    /// Network privacy on macOS, an outbound firewall rule elsewhere.
+    Blocked,
+}
+
+/// What the last beacon round did on the LAN side. Loopback is left out on
+/// purpose: it always works, and counting it is what hid the macOS case.
+#[derive(Debug, Clone, Default)]
+struct Health {
+    lan_attempted: u32,
+    lan_sent: u32,
+    last_error: Option<String>,
+}
+
 pub struct Discovery {
     socket: Arc<UdpSocket>,
     config: DiscoveryConfig,
     targets: Mutex<net::TargetCache>,
+    health: Mutex<Health>,
 }
 
 impl Discovery {
@@ -96,7 +125,40 @@ impl Discovery {
             socket: Arc::new(socket),
             config,
             targets: Mutex::new(net::TargetCache::new()),
+            health: Mutex::new(Health::default()),
         })
+    }
+
+    /// Whether LAN beacons are leaving, and the OS's own words if not.
+    pub fn link_status(&self) -> (LinkStatus, Option<String>) {
+        if !self.config.broadcast {
+            return (LinkStatus::Ok, None);
+        }
+        if self.targets.lock().unwrap().subnets().is_empty() {
+            return (LinkStatus::NoNetwork, None);
+        }
+        let h = self.health.lock().unwrap();
+        if h.lan_attempted > 0 && h.lan_sent == 0 {
+            (LinkStatus::Blocked, h.last_error.clone())
+        } else {
+            (LinkStatus::Ok, None)
+        }
+    }
+
+    /// Re-enumerate interfaces now. True when the attached subnets changed,
+    /// which is the cue to ask everyone to check in again.
+    pub fn rescan(&self) -> bool {
+        self.targets.lock().unwrap().rescan()
+    }
+
+    /// Is `addr` somewhere we may unicast a beacon to? See [`net::is_on_link`].
+    pub fn is_on_link(&self, addr: &SocketAddr) -> bool {
+        match addr {
+            SocketAddr::V4(v4) => {
+                net::is_on_link(*v4.ip(), self.targets.lock().unwrap().subnets())
+            }
+            SocketAddr::V6(_) => false,
+        }
     }
 
     /// The addresses the next beacon will be sent to. Diagnostics only.
@@ -136,6 +198,26 @@ impl Discovery {
         beacon: &Beacon,
         signing_key: &SigningKey,
     ) -> Vec<SendOutcome> {
+        self.send_beacon_with(beacon, signing_key, &[]).await
+    }
+
+    /// One beacon, encoded once, to every broadcast target **and** straight
+    /// to each of `unicast`.
+    ///
+    /// The unicast copies are what make discovery dependable on Wi-Fi. An
+    /// access point sends broadcast frames once, at the slowest rate, with no
+    /// acknowledgement and no retry, and a sleeping laptop radio misses them
+    /// routinely; a unicast frame is acknowledged and retransmitted by the
+    /// radio itself. ipmsg answers a broadcast entry with a unicast reply for
+    /// the same reason. Copies go only to on-link neighbours, and since every
+    /// copy carries the same `seq`, the receiver's replay filter keeps exactly
+    /// one of them.
+    pub async fn send_beacon_with(
+        &self,
+        beacon: &Beacon,
+        signing_key: &SigningKey,
+        unicast: &[SocketAddr],
+    ) -> Vec<SendOutcome> {
         let bytes = match beacon.encode(signing_key) {
             Ok(b) => b,
             Err(e) => {
@@ -144,8 +226,16 @@ impl Discovery {
             }
         };
 
+        let mut dsts = self.current_targets();
+        for u in unicast {
+            if !dsts.contains(u) && self.is_on_link(u) {
+                dsts.push(*u);
+            }
+        }
+
         let mut outcomes = Vec::new();
-        for dst in self.current_targets() {
+        let mut lan = Health::default();
+        for dst in dsts {
             let result = self
                 .socket
                 .send_to(&bytes, dst)
@@ -157,14 +247,31 @@ impl Discovery {
                 // send, and one dead path must not stop the others.
                 Err(e) => debug!("beacon → {dst} failed: {e}"),
             }
+            if !dst.ip().is_loopback() {
+                lan.lan_attempted += 1;
+                match &result {
+                    Ok(_) => lan.lan_sent += 1,
+                    Err(e) => lan.last_error = Some(e.clone()),
+                }
+            }
             outcomes.push(SendOutcome { dst, result });
         }
 
-        if outcomes.iter().all(|o| o.result.is_err()) && !outcomes.is_empty() {
-            warn!(
-                "every beacon send failed ({} targets) — nobody will discover this node",
-                outcomes.len()
+        // Debug, not warn: the core's link watch reports the transition once,
+        // and while blocked it retries every few seconds — a warning per try
+        // would bury the log.
+        if lan.lan_attempted > 0 && lan.lan_sent == 0 {
+            debug!(
+                "every LAN beacon send failed ({} targets, last: {}) — nobody will \
+                 discover this node",
+                lan.lan_attempted,
+                lan.last_error.as_deref().unwrap_or("?")
             );
+        }
+        // A round with no LAN target says nothing new about the LAN; keep
+        // the last one that did.
+        if lan.lan_attempted > 0 {
+            *self.health.lock().unwrap() = lan;
         }
         outcomes
     }
@@ -286,6 +393,30 @@ mod tests {
             boot,
             ts: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn unicast_copies_go_only_to_neighbours() {
+        let d = Discovery::bind(DiscoveryConfig {
+            bind_port: 0,
+            target_ports: vec![],
+            broadcast: false,
+        })
+        .await
+        .unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let b = beacon_with(key.verifying_key().to_bytes(), [1; 8], 1);
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, d.local_port()));
+        // TEST-NET-3: never on anyone's link, so it must never be written to.
+        let far = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), 3939));
+        let sent: Vec<_> = d
+            .send_beacon_with(&b, &key, &[local, far])
+            .await
+            .into_iter()
+            .map(|o| o.dst)
+            .collect();
+        assert_eq!(sent, vec![local]);
+        assert_eq!(d.link_status().0, LinkStatus::Ok, "loopback-only mode is never 'blocked'");
     }
 
     #[test]

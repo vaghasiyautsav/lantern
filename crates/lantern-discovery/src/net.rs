@@ -97,10 +97,39 @@ pub fn broadcast_targets() -> Vec<Ipv4Addr> {
     out
 }
 
+/// The subnets this machine is directly attached to, as `(ip, netmask)`.
+///
+/// Loopback and `/32`s are left out: a `/32` (a Tailscale or WireGuard
+/// tunnel, typically) has no neighbours, so nothing behind it is "on the
+/// link" however close it may look.
+pub fn on_link_subnets() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    interfaces()
+        .into_iter()
+        .filter(|i| !i.loopback && u32::from(i.netmask) != u32::MAX && u32::from(i.netmask) != 0)
+        .map(|i| (i.ip, i.netmask))
+        .collect()
+}
+
+/// Is `ip` loopback, or on one of `subnets`? The gate for every unicast
+/// beacon: Lantern only ever writes directly to a neighbour it could have
+/// reached by broadcast anyway (invariant 7), never to an address that
+/// happened to send it a datagram from further away.
+pub fn is_on_link(ip: Ipv4Addr, subnets: &[(Ipv4Addr, Ipv4Addr)]) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    let ip = u32::from(ip);
+    subnets.iter().any(|(net, mask)| {
+        let mask = u32::from(*mask);
+        ip & mask == u32::from(*net) & mask
+    })
+}
+
 /// Interface list cached for [`REFRESH`], so the heartbeat does not call
 /// `getifaddrs` on every beacon.
 pub struct TargetCache {
     addrs: Vec<Ipv4Addr>,
+    subnets: Vec<(Ipv4Addr, Ipv4Addr)>,
     at: Instant,
 }
 
@@ -114,16 +143,36 @@ impl TargetCache {
     pub fn new() -> Self {
         Self {
             addrs: broadcast_targets(),
+            subnets: on_link_subnets(),
             at: Instant::now(),
         }
     }
 
     pub fn get(&mut self) -> &[Ipv4Addr] {
         if self.at.elapsed() >= REFRESH {
-            self.addrs = broadcast_targets();
-            self.at = Instant::now();
+            self.rescan();
         }
         &self.addrs
+    }
+
+    pub fn subnets(&mut self) -> &[(Ipv4Addr, Ipv4Addr)] {
+        if self.at.elapsed() >= REFRESH {
+            self.rescan();
+        }
+        &self.subnets
+    }
+
+    /// Re-enumerate now, regardless of age. Returns true when the set of
+    /// subnets changed — Wi-Fi joined another network, a cable went in, the
+    /// DHCP lease moved — which is exactly when waiting out a heartbeat
+    /// leaves the roster wrong for the better part of a minute.
+    pub fn rescan(&mut self) -> bool {
+        let subnets = on_link_subnets();
+        let changed = subnets != self.subnets;
+        self.addrs = broadcast_targets();
+        self.subnets = subnets;
+        self.at = Instant::now();
+        changed
     }
 }
 
@@ -184,6 +233,17 @@ mod tests {
             Ipv4Addr::BROADCAST,
             "255.255.255.255 is the fallback, so it goes last"
         );
+    }
+
+    #[test]
+    fn on_link_means_same_subnet_or_loopback() {
+        let subnets = [(Ipv4Addr::new(192, 168, 1, 42), Ipv4Addr::new(255, 255, 255, 0))];
+        assert!(is_on_link(Ipv4Addr::new(192, 168, 1, 7), &subnets));
+        assert!(is_on_link(Ipv4Addr::LOCALHOST, &subnets));
+        assert!(!is_on_link(Ipv4Addr::new(192, 168, 2, 7), &subnets));
+        // A tunnel peer is never a neighbour, whatever it sent us.
+        assert!(!is_on_link(Ipv4Addr::new(100, 64, 0, 9), &subnets));
+        assert!(!is_on_link(Ipv4Addr::new(192, 168, 1, 7), &[]));
     }
 
     #[test]

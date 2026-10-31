@@ -118,6 +118,13 @@ body{
   font-size:12.5px;border-bottom:1px solid #e0cfa0}
 @media (prefers-color-scheme: dark){.banner{background:#2a2318;color:#d0a95f;border-color:#4a3c1e}}
 .banner.show{display:block}
+/* why the roster is empty, when the answer is on this machine */
+.linknote{display:none;margin:0 var(--s3) var(--s2);padding:var(--s2) var(--s3);
+  border:1px solid #e0cfa0;border-radius:var(--r-sm);background:#fbf3e2;color:#8a6d3b;
+  font-size:12px;line-height:1.4}
+.linknote b{display:block;margin-bottom:2px}
+@media (prefers-color-scheme: dark){.linknote{background:#2a2318;color:#d0a95f;border-color:#4a3c1e}}
+.linknote.show{display:block}
 /* modal */
 .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);
   place-items:center;z-index:10}
@@ -155,6 +162,7 @@ body{
       <button class="ibtn" id="refresh-btn" style="width:22px;height:22px;font-size:12px"
         title="Look for people again now — Lantern also checks on its own">⟳</button>
     </div>
+    <div class="linknote" id="linknote"></div>
     <div class="rlist" id="rlist">
       <div class="empty-roster" id="empty-roster">
         Nobody else yet.<br><br>
@@ -279,6 +287,7 @@ async function boot(){
   $('me-words').innerHTML = ME.words.map((w,i)=>`<span>${i+1} <b>${w}</b></span>`).join('');
   $('net-line').textContent = 'discovery active';
   await refreshPeers();
+  api('/api/link').then(showLink).catch(()=>{});
   connectWS();
 }
 
@@ -452,6 +461,24 @@ function banner(text){
   clearTimeout(banner._t); banner._t = setTimeout(()=>b.classList.remove('show'), 8000);
 }
 
+// Beacons refused by the OS (macOS Local Network privacy, a firewall) or no
+// network at all: the one empty-roster cause this machine can fix itself.
+function showLink(l){
+  const n = $('linknote');
+  if(l.status === 'blocked'){
+    n.innerHTML = '<b>This machine is refusing Lantern\'s network traffic</b>'+
+      'Nobody here can see you, and you can\'t see them. On macOS, allow Lantern under '+
+      'System Settings → Privacy &amp; Security → Local Network; elsewhere, check the '+
+      'firewall allows UDP 3939. It reconnects by itself.';
+    n.title = l.detail ? 'The system said: '+l.detail : '';
+    n.classList.add('show');
+  } else if(l.status === 'no-network'){
+    n.innerHTML = '<b>Not connected to a network</b>People appear as soon as Wi-Fi or Ethernet is back.';
+    n.title = '';
+    n.classList.add('show');
+  } else n.classList.remove('show');
+}
+
 function connectWS(){
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onmessage = e => handleEvent(JSON.parse(e.data));
@@ -461,6 +488,7 @@ function connectWS(){
 function handleEvent(ev){
   switch(ev.type){
     case 'peer': refreshPeers(); break;
+    case 'link': showLink(ev); break;
     case 'msg': {
       if(ev.peer === CURRENT){
         if(ev.sealed) appendSealed(ev.peer_name, ev.peer, ev.ts, ev.mid);

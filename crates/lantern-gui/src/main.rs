@@ -88,6 +88,25 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
+    // Claim the interface port before starting the engine. The macOS app
+    // launches an engine every time it opens, and the extra one used to get
+    // as far as beaconing — announcing a brand-new QUIC port — before failing
+    // here and exiting. Every peer then dialled that dead port until the
+    // real engine's next heartbeat corrected it: messages timing out for
+    // most of a minute, for no visible reason. Now a duplicate stops before
+    // it touches the network.
+    let addr: SocketAddr = ([127, 0, 0, 1], args.gui_port).into();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "Lantern engine already running on localhost:{} ({e}) — leaving it be.",
+                args.gui_port
+            );
+            std::process::exit(0);
+        }
+    };
+
     let (core, mut events_rx) = Core::start(CoreConfig {
         data_dir: data_dir.clone(),
         display_name: name.clone(),
@@ -148,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/unread", get(unread))
         .route("/api/presence", post(presence))
         .route("/api/refresh", post(refresh))
+        .route("/api/link", get(link))
         .route("/api/version", get(version))
         // A check fetches from GitHub — a side effect, so it's a POST.
         .route("/api/update/check", post(update_check))
@@ -156,8 +176,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws", get(ws_upgrade))
         .with_state(app);
 
-    let addr: SocketAddr = ([127, 0, 0, 1], args.gui_port).into();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("Lantern GUI → http://localhost:{}", args.gui_port);
     println!("identity: {}", Core::words_for(&core.identity_id()).join(" · "));
     axum::serve(listener, router).await?;
@@ -212,7 +230,28 @@ fn event_json(ev: &CoreEvent) -> serde_json::Value {
             "type": "progress", "xid": xid.to_string(), "outgoing": outgoing,
             "bytes": bytes, "total": total, "bps": bps, "eta_s": eta_s
         }),
+        CoreEvent::LinkChanged { status, detail } => link_json(*status, detail.as_deref()),
     }
+}
+
+/// `{"type":"link","status":"ok"|"no-network"|"blocked","detail":…}` — the
+/// same shape for the live event and for `GET /api/link`, so a shell that
+/// connects late reads the state it missed the event for.
+fn link_json(status: lantern_core::LinkStatus, detail: Option<&str>) -> serde_json::Value {
+    json!({
+        "type": "link",
+        "status": match status {
+            lantern_core::LinkStatus::Ok => "ok",
+            lantern_core::LinkStatus::NoNetwork => "no-network",
+            lantern_core::LinkStatus::Blocked => "blocked",
+        },
+        "detail": detail,
+    })
+}
+
+async fn link(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let (status, detail) = app.core.link_status();
+    Json(link_json(status, detail.as_deref()))
 }
 
 async fn index() -> Html<&'static str> {
@@ -370,7 +409,10 @@ async fn search(
                 "peer": hex::encode(m.peer_id),
                 "outgoing": m.outgoing,
                 "ts": m.ts,
-                "text": m.text,
+                // A sealed hit is shown as found, not read out. The words
+                // are withheld here rather than trusted to every shell.
+                "text": if m.sealed && !m.outgoing { String::new() } else { m.text },
+                "sealed": m.sealed,
             })
         })
         .collect();
@@ -399,7 +441,11 @@ async fn unread(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
 
 #[derive(Deserialize)]
 struct PresenceReq {
+    #[serde(default)]
     away: bool,
+    /// "active" | "away" | "dnd". Wins over `away`, which older shells send.
+    #[serde(default)]
+    state: Option<String>,
     #[serde(default)]
     status: String,
 }
@@ -408,10 +454,12 @@ async fn presence(
     State(app): State<Arc<App>>,
     Json(req): Json<PresenceReq>,
 ) -> Json<serde_json::Value> {
-    let state = if req.away {
-        lantern_core::Presence::Away
-    } else {
-        lantern_core::Presence::Active
+    let state = match req.state.as_deref() {
+        Some("dnd") => lantern_core::Presence::Dnd,
+        Some("away") => lantern_core::Presence::Away,
+        Some(_) => lantern_core::Presence::Active,
+        None if req.away => lantern_core::Presence::Away,
+        None => lantern_core::Presence::Active,
     };
     app.core.set_presence(state, &req.status).await;
     Json(json!({"ok": true}))
