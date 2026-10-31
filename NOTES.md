@@ -63,7 +63,7 @@ cost more than the features did. So:
 6. **Say what you are mid-way through** in the Status section below before
    you stop. That is the only channel between the two machines.
 
-## Status (last update: 18 Aug 2026)
+## Status (last update: 31 Oct 2026 — see "31 Oct 2026" below)
 
 **Working, tested:** engine — signed-beacon discovery (see the 17 Aug fix
 below — cross-machine discovery was broken until then), identity-pinned
@@ -75,7 +75,7 @@ checkpointed), **live transfer speed + ETA** (`CoreEvent::TransferProgress`,
 `core::rate`), **update from GitHub** (`core::update` +
 `packaging/update.sh`, also the standalone `lantern-update`), **look-again**
 (`BeaconType::Ping` via `core.refresh()` / `POST /api/refresh`, behind a
-refresh button in every shell). 45 tests workspace-wide, clippy
+refresh button in every shell). 49 tests workspace-wide, clippy
 clean. Shells: **native SwiftUI app** (macOS, runs on Utsav's Mac), **native
 GTK4 app** (`apps/linux-native`, links core directly), localhost web GUI
 (`lantern-gui`, also the SwiftUI shell's local API), CLI. Installers:
@@ -112,14 +112,11 @@ palette — DESIGN §5.3); (4) ipmsg compat bridge (Phase 7 — start with a
 packet capture session); (5) a native Windows shell, if the .exe proves
 useful.
 
-**GTK shell, still to do** (18 Aug — two agents converged on this file the
-same day; the Linux-built version won, and these are what it doesn't have
-yet): **per-message delete** (`core.delete_message`, the macOS ⋯ menu's
-equivalent) and the **update panel** (`core::update` + `check_update` /
-`start_update` / `take_unseen_result`, which reports how the last update
-went — the app that starts one never sees it finish). Everything else is
-there: refresh, clear conversation, live transfer rate. A Mac session cannot
-compile this crate (no GTK4), so write it on Linux or expect a fixup pass.
+**GTK shell:** per-message delete and the update panel are both in now
+(31 Oct). **A Mac can compile it**: `brew install pkgconf gtk4`, then
+`PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig cargo build -p lantern-gtk` —
+it even runs, on GTK's own macOS backend. That's a compile-and-smoke check,
+not a substitute for running it on the Ubuntu box.
 
 ## CI — `.github/workflows/ci.yml` (18 Aug 2026)
 
@@ -585,8 +582,95 @@ The GUI now passes `auto_accept_limit: Some(25 MB)` since it can consent.
 compiled by CI's swiftc, NOT yet run on a Mac):** seal toggle in the
 composer, sealed envelope + open (reloads history), opened acks mark
 delivered, consent via NSAlert, sealed notifications withhold the text.
-Still absent on macOS: search UI, away toggle, image bubbles, group config
-(the API is all there). First Mac session: run it, then update this line.
+*(31 Oct: search, presence, image previews and group sections are in now —
+see below.)*
+
+## 31 Oct 2026 — "sometimes the Mac shows nobody", drag-and-drop, both shells
+
+**Symptom:** on the Mac, the sidebar was sometimes empty with the Linux box
+right there, and dropping a file on the chat did nothing.
+
+**Discovery — four causes, all fixed in core so every shell gets them:**
+
+1. **A restarted node was ignored.** A peer only answers a *Hello* from
+   someone new to it, and its roster is in memory — so after Lantern
+   restarted here (every update does that), everyone who already knew us
+   stayed silent, and the sidebar waited for each of their 45 s heartbeats.
+   The first beacon at startup is now a **Ping**, which everyone answers.
+   `tests/rediscovery.rs` restarts a node on a port the peer never beacons
+   to and fails if rediscovery takes longer than a quarter-heartbeat (it
+   fails against the old code: verified).
+2. **Wi-Fi drops broadcasts.** An AP sends broadcast frames once, at the
+   lowest rate, unacknowledged; a sleeping Mac radio misses them routinely.
+   Replies to a Ping or a newcomer now also go **straight back to the
+   sender by unicast**, and each heartbeat is also unicast to every
+   neighbour heard from in the last 15 min (`UNICAST_WINDOW`, cap 64).
+   Unicast frames are ACKed and retried by the radio. One datagram is
+   encoded once, so every copy has the same `seq` and the replay filter
+   keeps one. **Unicast goes only to on-link addresses** (`net::is_on_link`:
+   loopback, or inside a directly attached non-/32 subnet) — never to a
+   Tailscale peer or anything else that merely sent us a packet. Invariant 7
+   holds; there is a test that a TEST-NET address is never written to.
+3. **Sleep and network changes.** `spawn_link_watch` ticks every 5 s: the
+   wall clock running >10 s ahead of the monotonic one means we slept (the
+   monotonic clock pauses in sleep on both macOS and Linux); a changed
+   subnet set means the network moved. Either sends a Ping at once.
+4. **macOS Local Network privacy** makes every LAN `sendto` fail with
+   EHOSTUNREACH while loopback still works — which is why the old "every
+   send failed" warning never fired. Discovery now tracks LAN sends
+   separately (`LinkStatus::{Ok, NoNetwork, Blocked}`), the core emits
+   `CoreEvent::LinkChanged`, `GET /api/link` serves it, and every shell
+   shows a banner (macOS: with a button to the Local Network pane). While
+   blocked it re-Pings every tick — nothing reaches the wire, so it costs
+   nothing, and the roster fills seconds after someone allows Lantern.
+   `install.sh`/`make-dmg.sh` now set `NSLocalNetworkUsageDescription`.
+
+Also: `lantern-gui` **binds its localhost port before starting the engine**.
+The Mac app launches an engine every time it opens; a duplicate used to get
+as far as beaconing a fresh, soon-dead QUIC port before failing on the port
+and exiting, and peers dialled that dead port until the next heartbeat.
+
+**Drag-and-drop.** macOS: the drop handler sat on the window, outside the
+`NavigationSplitView` — each column is its own AppKit hosting view, and a
+drag over a column never reached it. It now lives inside the detail column.
+And the composer is an `NSTextView` (`ComposerTextView`) instead of a
+TextField, because a focused TextField's field editor accepts file drags
+itself and **types the file's path into the message**; ours sends the file.
+Drop on a sidebar row sends to that person. ⌘V with a screenshot or copied
+file sends it. GTK: the drop target moved from the message list to the whole
+conversation pane in the **capture** phase (the entry's own text drop was
+taking files dropped on it), with a "Drop to send to …" overlay; rows take
+drops too.
+
+**macOS shell, also new:** sidebar search (`.searchable`, hit opens the chat
+scrolled to the message), presence menu (Available / Away / Do Not Disturb —
+DnD also silences sounds and banners here), presence colours and lines on
+rows, group sections, unread counts seeded from the store + mark-read on
+open, image previews in transfer cards with Open / Show in Finder,
+Return-sends / ⇧↩-newline, an empty state that says what to check, and the
+GTK env vars (`LANTERN_GUI_PORT`, `LANTERN_DATA_DIR`, `LANTERN_PORT`,
+`LANTERN_TARGETS`, `LANTERN_NAME`, `LANTERN_BROADCAST`) for a second window.
+
+**GTK shell, also new:** per-message delete (in the label's own right-click
+menu, worded "from This Machine"), presence dots, the link banner, a "Look
+again" button in the empty state. Search hits for sealed messages say
+"Sealed message" instead of reading the words out — in GTK, macOS, and the
+`/api/search` response itself.
+
+**Updater:** "Check for Updates" counted `HEAD..upstream`, so a machine whose
+checkout had been pulled but not rebuilt — this Mac, where the checkout *is*
+the dev copy — was told "up to date" while running old code. It now counts
+from the **running build's commit**. `install.sh` writes
+`~/.lantern/installed-commit`, and `update.sh` rebuilds when that is behind
+HEAD even with nothing to pull.
+
+**Verified here:** 49 tests, clippy `-D warnings` across the workspace
+*including* `lantern-gtk` (compiled on this Mac against Homebrew GTK 4.24,
+using only the `v4_10` API), the GTK app starts clean, the Swift app compiles
+warning-free and its engine discovered a loopback peer. **Not verified:** the
+SwiftUI and GTK windows were not looked at on screen, and the cross-machine
+Wi-Fi behaviour needs the Linux box on this build — run `lantern-doctor` on
+both and record it here.
 
 ## Open defects
 

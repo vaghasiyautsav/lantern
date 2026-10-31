@@ -42,9 +42,14 @@ native shell needs a Windows machine (or CI) — deferred per the roadmap.
 - People on the same network appear in the left sidebar automatically. The
   **refresh** button in the title bar asks everyone to check in right away
   instead of waiting for the next heartbeat.
-- Click a person → type → Enter. ✓✓ means delivered.
-- Drop a file anywhere on the window to send it. Files are BLAKE3-verified
-  chunk by chunk; interrupted transfers resume from where they stopped.
+- Click a person → type → Enter (Shift-Enter for a new line). ✓✓ means
+  delivered.
+- Drop a file on the conversation or the message box to send it — or drop it
+  straight onto a person in the sidebar. Paste a screenshot (⌘V / Ctrl-V) to
+  send it as a picture. Files are BLAKE3-verified chunk by chunk; interrupted
+  transfers resume from where they stopped.
+- Search every conversation from the sidebar. Set yourself Away or Do Not
+  Disturb from the menu by your name (macOS) or the header (Linux).
 - **Verify identity** shows their eight safety words — read them aloud to
   each other once; if they match, mark verified. If someone's key ever
   changes, Lantern warns you loudly.
@@ -83,6 +88,18 @@ whether each send succeeded, and every datagram that arrives — then tells you
 which of the four usual causes you have. Quit Lantern first for the cleanest
 read, though the doctor sets `SO_REUSEPORT` and can run alongside it.
 
+**First, look at the sidebar.** If the operating system is refusing
+Lantern's traffic, the app says so there. On macOS that is almost always
+**Local Network privacy**: System Settings → Privacy & Security → Local
+Network → turn Lantern on. macOS asks once, and can ask again after an update
+rebuilds the app; until it's answered yes, nobody can appear. Lantern
+reconnects by itself within a few seconds of being allowed.
+
+Lantern also asks everyone to check in again by itself when the machine wakes
+from sleep or changes network, and answers each newcomer directly rather than
+only by broadcast — Wi-Fi drops broadcast frames far more often than direct
+ones.
+
 Known causes, in the order the doctor checks them:
 
 1. **The two machines are on different subnets.** Compare the interface IPs
@@ -110,6 +127,15 @@ Known causes, in the order the doctor checks them:
 ```
 
 Open http://localhost:3999 and http://localhost:4000 side by side.
+
+The macOS app reads the same environment variables as the GTK app, so a
+second native window is one command:
+
+```bash
+LANTERN_GUI_PORT=4000 LANTERN_DATA_DIR=~/.lantern2 LANTERN_NAME=Second \
+    LANTERN_PORT=3940 LANTERN_TARGETS=3939,3940 \
+    /Applications/Lantern.app/Contents/MacOS/Lantern
+```
 
 ## CLI
 
