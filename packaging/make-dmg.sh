@@ -64,7 +64,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>Lantern</string>
   <key>CFBundleIconFile</key><string>Lantern</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Lantern finds the other computers running Lantern on this network, and sends your messages and files straight to them. Nothing goes over the internet.</string>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

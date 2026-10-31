@@ -89,6 +89,10 @@ if [ -f packaging/update.sh ]; then
     mv -f "$tmp" "$HOME/.lantern/bin/lantern-update"
 fi
 
+# What was just installed, for lantern-update: a checkout that is current
+# while the install is not still has a build to do.
+git rev-parse --short HEAD > "$HOME/.lantern/installed-commit" 2>/dev/null || true
+
 # Linux: desktop entry + icon so Lantern appears in the app launcher.
 if [ "$(uname)" = "Linux" ]; then
     for s in 512 256 128 48; do
@@ -199,7 +203,10 @@ LAUNCH
   <key>CFBundleExecutable</key><string>${EXECUTABLE}</string>
   <key>CFBundleIconFile</key><string>Lantern</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Lantern finds the other computers running Lantern on this network, and sends your messages and files straight to them. Nothing goes over the internet.</string>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

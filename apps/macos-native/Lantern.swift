@@ -10,6 +10,7 @@
 
 import SwiftUI
 import AppKit
+import ImageIO
 import UniformTypeIdentifiers
 import UserNotifications
 
@@ -57,8 +58,18 @@ enum Notifier {
     }
 }
 
-let GUI_PORT = 3999
+/// The engine's localhost port. `LANTERN_GUI_PORT` picks another, so a second
+/// copy of the app can drive a second engine on one Mac — the same env-var
+/// convention the GTK shell uses for its two-instance test (see README).
+let GUI_PORT = Int(ProcessInfo.processInfo.environment["LANTERN_GUI_PORT"] ?? "") ?? 3999
 let BASE = "http://localhost:\(GUI_PORT)"
+
+/// Where identity, history and the outbox live: `~/.lantern`, or
+/// `LANTERN_DATA_DIR` for a second instance.
+let DATA_DIR: URL = ProcessInfo.processInfo.environment["LANTERN_DATA_DIR"]
+    .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+    ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".lantern")
 
 // MARK: - Wire models
 
@@ -81,10 +92,34 @@ struct Peer: Codable, Identifiable, Equatable {
     /// but must not be drawn as if it were reachable.
     var online: Bool = true
     var sinceBeaconS: UInt64?
+    /// "active", "away" or "dnd", as their beacon announces it.
+    var state: String?
+    /// Their free-text status line, usually empty.
+    var status: String?
+    /// Group label from their beacon; the sidebar clusters on it.
+    var group: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, host, addr, verified, words, online
+        case id, name, host, addr, verified, words, online, state, status, group
         case sinceBeaconS = "since_beacon_s"
+    }
+
+    var away: Bool { state == "away" }
+    var dnd: Bool { state == "dnd" }
+
+    /// The line under their name: how they've said they are, else which
+    /// machine they're on — or, once they've gone quiet, when they were last
+    /// heard from.
+    var subtitle: String {
+        guard online else { return lastSeenText }
+        let mood = dnd ? "Do not disturb" : away ? "Away" : nil
+        let line = (status ?? "").trimmingCharacters(in: .whitespaces)
+        switch (mood, line.isEmpty) {
+        case (let m?, false): return "\(m) · \(line)"
+        case (let m?, true): return m
+        case (nil, false): return line
+        case (nil, true): return host
+        }
     }
 
     /// "last seen 4 min ago" — plain language, no false precision.
@@ -129,6 +164,28 @@ struct UpdateInfo: Codable {
     var blocked: String?
     var can_update: Bool
     var summary: String
+}
+
+/// Can our beacons leave this Mac? `GET /api/link` and the "link" event.
+struct LinkInfo: Codable, Equatable {
+    var status: String // ok · no-network · blocked
+    var detail: String?
+}
+
+struct SearchHit: Codable, Identifiable {
+    var mid: String
+    var peer: String
+    var outgoing: Bool
+    var ts: UInt64
+    var text: String
+    /// Arrived sealed and not opened — the hit names it without its words.
+    var sealed: Bool?
+    var id: String { mid }
+}
+
+struct UnreadCount: Codable {
+    var peer: String
+    var n: Int
 }
 
 struct HistoryMessage: Codable {
@@ -189,7 +246,13 @@ final class Model: ObservableObject {
             if let s = selected {
                 unread[s] = 0
                 updateBadge()
-                Task { await self.loadHistory(s) }
+                Task {
+                    await self.loadHistory(s)
+                    // Badges are seeded from the engine's store at launch,
+                    // so reading a conversation has to tell the store too —
+                    // or the count comes back next time Lantern opens.
+                    _ = await self.postJSON("/api/mark-read/\(s)", [:])
+                }
             }
         }
     }
@@ -217,10 +280,40 @@ final class Model: ObservableObject {
     /// sheet says so rather than looking frozen.
     @Published var updateHandedOff = false
 
+    /// Whether discovery can reach the network at all. Drives the one banner
+    /// that explains an empty sidebar in terms someone can act on.
+    @Published var link = LinkInfo(status: "ok")
+    /// What our beacons announce: "active", "away" or "dnd".
+    @Published var presence = "active"
+    /// Sidebar search across every conversation; non-empty swaps the roster
+    /// for the matches.
+    @Published var search = "" { didSet { runSearch() } }
+    @Published var searchHits: [SearchHit] = []
+    /// A search hit was opened: scroll to it once that history is loaded.
+    @Published var pendingJump: String?
+    /// The file on disk behind a transfer card, by xid — the picked file for
+    /// one we sent, the saved file for one we received. Lets the card preview
+    /// an image and show the file in Finder.
+    @Published var filePaths: [String: URL] = [:]
+    /// Bumped to put the cursor in the composer.
+    @Published var focusComposer = 0
+
     private var ws: URLSessionWebSocketTask?
     private var fileMeta: [String: (name: String, size: UInt64)] = [:]
+    private var searchTask: Task<Void, Never>?
 
     var currentPeer: Peer? { peers.first { $0.id == selected } }
+
+    /// Peers clustered by the group their beacon announces — named groups
+    /// first, the ungrouped last, the same order the GTK roster uses.
+    var peerGroups: [(name: String, peers: [Peer])] {
+        let names = Set(peers.map { $0.group ?? "" }).sorted {
+            $0.isEmpty != $1.isEmpty ? !$0.isEmpty : $0.lowercased() < $1.lowercased()
+        }
+        return names.map { g in (g, peers.filter { ($0.group ?? "") == g }) }
+    }
+
+    var hasGroups: Bool { peers.contains { !($0.group ?? "").isEmpty } }
 
     func start() {
         Task {
@@ -234,11 +327,16 @@ final class Model: ObservableObject {
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
             await self.refreshPeers()
+            await self.loadUnread()
+            await self.refreshLink()
             self.connectWS()
             await self.loadBuild()
         }
         Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
-            Task { @MainActor in await self.refreshPeers() }
+            Task { @MainActor in
+                await self.refreshPeers()
+                await self.refreshLink()
+            }
         }
     }
 
@@ -311,6 +409,55 @@ final class Model: ObservableObject {
         }
     }
 
+    /// Unread counts from the engine's store, so badges survive a restart
+    /// instead of starting from zero every launch.
+    func loadUnread() async {
+        guard let list: [UnreadCount] = await getJSON("/api/unread") else { return }
+        for u in list where u.peer != selected { unread[u.peer] = u.n }
+        updateBadge()
+    }
+
+    func refreshLink() async {
+        if let l: LinkInfo = await getJSON("/api/link") { link = l }
+    }
+
+    /// Tell the network how we are. Do Not Disturb also silences this Mac:
+    /// messages still arrive and badge, but no sound and no banner.
+    func setPresence(_ state: String) {
+        presence = state
+        Task {
+            _ = await postJSON("/api/presence", ["state": state, "away": state == "away"])
+        }
+    }
+
+    private func runSearch() {
+        searchTask?.cancel()
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            searchHits = []
+            return
+        }
+        searchTask = Task {
+            // One query per pause in typing, not one per keystroke.
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            // Alphanumerics only: a bare "+" in a query string decodes as a
+            // space, which would quietly search "c  " for "c++".
+            let enc = q.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+            guard let hits: [SearchHit] = await getJSON("/api/search?q=\(enc)"),
+                  !Task.isCancelled
+            else { return }
+            searchHits = hits
+        }
+    }
+
+    /// Open the conversation a hit belongs to, scrolled to the hit.
+    func openHit(_ hit: SearchHit) {
+        pendingJump = hit.mid
+        search = ""
+        selected = hit.peer
+    }
+
     func loadHistory(_ peerID: String) async {
         items = []
         if let hist: [HistoryMessage] = await getJSON("/api/history/\(peerID)") {
@@ -381,9 +528,13 @@ final class Model: ObservableObject {
         }
     }
 
-    func sendFiles(_ urls: [URL]) {
+    /// Send files to the open conversation, or to `peerID` — a drop onto
+    /// someone in the sidebar opens their conversation and sends there.
+    func sendFiles(_ urls: [URL], to peerID: String? = nil) {
+        if let peerID, peerID != selected { selected = peerID }
         guard let peer = selected else {
-            flash("Pick a person first, then drop the file.")
+            flash("Pick a person first, then drop the file — or drop it "
+                + "straight onto someone in the sidebar.")
             return
         }
         let target = currentPeer
@@ -391,7 +542,16 @@ final class Model: ObservableObject {
             flash(explain(nil, peer: target))
             return
         }
-        for url in urls {
+        // The engine streams one file; a folder would fail halfway into the
+        // offer with an error about reading a directory. Say it up front.
+        let folders = urls.filter { $0.hasDirectoryPath }
+        if !folders.isEmpty {
+            flash(folders.count == 1
+                ? "\(folders[0].lastPathComponent) is a folder — Lantern sends "
+                    + "files. Compress it first (right-click → Compress)."
+                : "Folders can't be sent yet — compress them first.")
+        }
+        for url in urls where !url.hasDirectoryPath {
             Task {
                 let r = await postJSON(
                     "/api/filepath", ["peer": peer, "path": url.path])
@@ -401,6 +561,7 @@ final class Model: ObservableObject {
                         .attributesOfItem(atPath: url.path)
                     let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
                     fileMeta[xid] = (name, size)
+                    filePaths[xid] = url
                     upsertFile(
                         xid: xid, outgoing: true, name: name, size: size,
                         status: "sending…", done: false, failed: false)
@@ -410,6 +571,34 @@ final class Model: ObservableObject {
                 }
             }
         }
+    }
+
+    /// A pasted screenshot or picture is a file transfer like any other —
+    /// ipmsg's inline images ride its file mechanism too. It's saved under
+    /// the data directory's outbox first, because the engine streams from
+    /// disk, and named for when it was pasted, the way macOS names
+    /// screenshots.
+    func sendImage(_ image: NSImage) {
+        guard let tiff = image.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?
+                .representation(using: .png, properties: [:])
+        else {
+            flash("Couldn't read that image from the clipboard.")
+            return
+        }
+        let dir = DATA_DIR.appendingPathComponent("outbox")
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let url = dir.appendingPathComponent("Pasted image \(f.string(from: Date())).png")
+        do {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+            try png.write(to: url)
+        } catch {
+            flash("Couldn't save the pasted image: \(error.localizedDescription)")
+            return
+        }
+        sendFiles([url])
     }
 
     // -- deleting ---------------------------------------------------------
@@ -638,6 +827,11 @@ final class Model: ObservableObject {
         case "peer":
             Task { await refreshPeers() }
 
+        case "link":
+            link = LinkInfo(
+                status: ev["status"] as? String ?? "ok",
+                detail: ev["detail"] as? String)
+
         case "msg":
             let peer = ev["peer"] as? String ?? ""
             let text = ev["text"] as? String ?? ""
@@ -651,10 +845,14 @@ final class Model: ObservableObject {
                     id: mid, outgoing: false, ts: ts,
                     kind: sealed ? .sealed : .text(text), delivered: true,
                     replyTo: ev["reply_to"] as? String))
+                // On screen is read — in the store too, or it reappears as
+                // unread at the next launch.
+                Task { _ = await postJSON("/api/mark-read/\(peer)", [:]) }
             } else {
                 unread[peer, default: 0] += 1
                 updateBadge()
             }
+            guard presence != "dnd" else { break }
             NSSound(named: "Pop")?.play()
             // A sealed message's whole point is that its words are not
             // sitting in a notification.
@@ -701,6 +899,7 @@ final class Model: ObservableObject {
                 unread[peer, default: 0] += 1
                 updateBadge()
             }
+            guard presence != "dnd" else { break }
             Notifier.notify(
                 title: (ev["peer_name"] as? String) ?? "Incoming file",
                 body: "Sending you \(name) · \(fmtSize(size))")
@@ -717,10 +916,11 @@ final class Model: ObservableObject {
                 ? "the download folder"
                 : (path as NSString).deletingLastPathComponent
                     .replacingOccurrences(of: NSHomeDirectory(), with: "~")
+            if !path.isEmpty { filePaths[xid] = URL(fileURLWithPath: path) }
             upsertFile(
                 xid: xid, outgoing: false, name: name, size: size,
                 status: "saved to " + folder, done: true, failed: false)
-            NSSound(named: "Glass")?.play()
+            if presence != "dnd" { NSSound(named: "Glass")?.play() }
 
         case "progress":
             guard let xid = ev["xid"] as? String, let meta = fileMeta[xid],
@@ -776,6 +976,59 @@ final class Model: ObservableObject {
 
 func nowMS() -> UInt64 {
     UInt64(Date().timeIntervalSince1970 * 1000)
+}
+
+/// Collects drop results across item-provider callbacks, which arrive on
+/// arbitrary queues.
+private final class URLCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+    func add(_ url: URL) { lock.lock(); urls.append(url); lock.unlock() }
+    var all: [URL] { lock.lock(); defer { lock.unlock() }; return urls }
+}
+
+/// The file URLs in a drop, delivered once, on the main queue — so a drop of
+/// five files is one send with at most one complaint, not five.
+func loadFileURLs(_ providers: [NSItemProvider], _ done: @escaping ([URL]) -> Void) {
+    let group = DispatchGroup()
+    let found = URLCollector()
+    for p in providers where p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+        group.enter()
+        _ = p.loadObject(ofClass: URL.self) { url, _ in
+            if let url, url.isFileURL { found.add(url) }
+            group.leave()
+        }
+    }
+    group.notify(queue: .main) { done(found.all) }
+}
+
+let IMAGE_EXTENSIONS: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "webp", "tiff", "tif", "bmp"]
+
+func isImageFile(_ url: URL) -> Bool {
+    IMAGE_EXTENSIONS.contains(url.pathExtension.lowercased())
+}
+
+/// Downsampled previews for image transfers. Decoding a 12-megapixel photo
+/// on every redraw of the timeline would make scrolling stutter, so each is
+/// decoded once, small, and kept.
+enum Thumbnails {
+    private static let cache = NSCache<NSURL, NSImage>()
+
+    static func image(for url: URL, maxPixels: Int = 720) -> NSImage? {
+        if let hit = cache.object(forKey: url as NSURL) { return hit }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+              ] as CFDictionary)
+        else { return nil }
+        // Pixels to points at 2x, so a preview is sharp on Retina.
+        let img = NSImage(cgImage: cg, size: NSSize(
+            width: CGFloat(cg.width) / 2, height: CGFloat(cg.height) / 2))
+        cache.setObject(img, forKey: url as NSURL)
+        return img
+    }
 }
 
 func fmtSize(_ b: UInt64) -> String {
@@ -856,6 +1109,17 @@ struct AvatarView: View {
     /// nil = draw no presence dot at all (used for your own messages, where
     /// presence is meaningless).
     var online: Bool?
+    /// "away" turns the dot amber, "dnd" red; anything else is green.
+    var state: String?
+
+    private var dotColor: Color {
+        guard online == true else { return Color(NSColor.tertiaryLabelColor) }
+        switch state {
+        case "dnd": return .red
+        case "away": return .orange
+        default: return .green
+        }
+    }
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -873,7 +1137,7 @@ struct AvatarView: View {
                 // hollow ring for offline — so it survives colour blindness
                 // and greyscale (DESIGN §5.6).
                 Circle()
-                    .fill(online ? Color.green : Color(NSColor.tertiaryLabelColor))
+                    .fill(dotColor)
                     .frame(width: size * 0.3, height: size * 0.3)
                     .overlay(
                         Circle()
@@ -890,10 +1154,13 @@ struct AvatarView: View {
 struct SidebarRow: View {
     let peer: Peer
     let unread: Int
+    /// A file is being dragged over this row: dropping sends it to them.
+    var dropTargeted = false
 
     var body: some View {
         HStack(spacing: 10) {
-            AvatarView(name: peer.name, colorKey: peer.id, online: peer.online)
+            AvatarView(name: peer.name, colorKey: peer.id, online: peer.online,
+                       state: peer.state)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
                     Text(peer.name)
@@ -907,7 +1174,7 @@ struct SidebarRow: View {
                             .help("Identity verified by safety words")
                     }
                 }
-                Text(peer.online ? peer.host : peer.lastSeenText)
+                Text(peer.subtitle)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
@@ -923,9 +1190,125 @@ struct SidebarRow: View {
             }
         }
         .padding(.vertical, 3)
+        .padding(.horizontal, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .strokeBorder(Color.accentColor, lineWidth: dropTargeted ? 2 : 0)
+                .background(RoundedRectangle(cornerRadius: 7)
+                    .fill(Color.accentColor.opacity(dropTargeted ? 0.12 : 0))))
+        .padding(.horizontal, -4)
         .help(peer.online
-            ? "\(peer.name) on \(peer.host) · \(peer.addr)"
+            ? "\(peer.name) on \(peer.host) · \(peer.addr)\nDrop a file here to send it to them."
             : "\(peer.name) — \(peer.lastSeenText). Messages won't send.")
+    }
+}
+
+/// One search match in the sidebar: who, when, and the line itself.
+struct SearchHitRow: View {
+    let hit: SearchHit
+    let peerName: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text(hit.outgoing ? "You → \(peerName)" : peerName)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text(fmtDay(hit.ts))
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+            }
+            // A sealed message is found, but not read out: the seal is the
+            // point, and a search result is no place to break it.
+            Text(hit.sealed == true && !hit.outgoing ? "🔒 Sealed message" : hit.text)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+    }
+}
+
+/// The one thing that explains an empty sidebar *and* can be fixed from
+/// here. macOS asks once whether Lantern may use the local network; until
+/// that's answered yes, every datagram to the LAN fails, nobody appears, and
+/// nothing else on screen says why.
+struct LinkBanner: View {
+    let link: LinkInfo
+
+    private static let settingsURL = URL(string:
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")
+
+    var body: some View {
+        if link.status == "blocked" || link.status == "no-network" {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(link.status == "blocked"
+                        ? "macOS is blocking Lantern"
+                        : "Not connected to a network",
+                      systemImage: link.status == "blocked"
+                        ? "hand.raised.fill" : "wifi.slash")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(link.status == "blocked"
+                    ? "Lantern isn't allowed to use the local network, so nobody "
+                        + "here can see this Mac and it can't see them. Turn "
+                        + "Lantern on under Privacy & Security → Local Network; "
+                        + "it reconnects by itself."
+                    : "People appear as soon as Wi-Fi or Ethernet is back.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if link.status == "blocked", let url = Self.settingsURL {
+                    Button("Open Local Network Settings") {
+                        NSWorkspace.shared.open(url)
+                    }
+                    .controlSize(.small)
+                }
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(Color.orange.opacity(0.12)))
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.35)))
+            .padding(.horizontal, 10)
+            .padding(.bottom, 6)
+            .help(link.detail.map { "The system said: \($0)" } ?? "")
+        }
+    }
+}
+
+/// Shown over the conversation while a file is dragged across it.
+struct DropHint: View {
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(Color.accentColor,
+                          style: StrokeStyle(lineWidth: 2.5, dash: [9, 5]))
+            .background(RoundedRectangle(cornerRadius: 12)
+                .fill(Color.accentColor.opacity(0.07)))
+            .overlay(
+                VStack(spacing: 7) {
+                    Image(systemName: "arrow.down.doc.fill")
+                        .font(.system(size: 30))
+                        .foregroundColor(.accentColor)
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                    Text(subtitle)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 22)
+                .padding(.vertical, 16)
+                .background(RoundedRectangle(cornerRadius: 14)
+                    .fill(.regularMaterial)))
+            .padding(8)
+            .allowsHitTesting(false)
+            .transition(.opacity)
     }
 }
 
@@ -953,6 +1336,8 @@ struct MessageRow: View {
     var onJumpToQuoted: () -> Void = {}
     /// Delete this message from this Mac.
     var onDelete: () -> Void = {}
+    /// The file on disk behind a transfer card, once there is one.
+    var filePath: URL?
 
     /// The reply affordance appears on hover. It can't live in a context
     /// menu alone: selectable text hands right-click to AppKit's own
@@ -995,6 +1380,12 @@ struct MessageRow: View {
                 Button("Copy Text") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
+                }
+            }
+            if let filePath {
+                Button("Open") { NSWorkspace.shared.open(filePath) }
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([filePath])
                 }
             }
             Divider()
@@ -1071,7 +1462,7 @@ struct MessageRow: View {
                     TransferCard(
                         name: name, size: size, status: status,
                         done: done, failed: failed, outgoing: item.outgoing,
-                        fraction: fraction)
+                        fraction: fraction, path: filePath)
                 }
 
                 if endsRun {
@@ -1087,6 +1478,12 @@ struct MessageRow: View {
                     Button("Copy") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(text, forType: .string)
+                    }
+                }
+                if let filePath {
+                    Button("Open") { NSWorkspace.shared.open(filePath) }
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([filePath])
                     }
                 }
                 Divider()
@@ -1157,6 +1554,15 @@ struct TransferCard: View {
     let outgoing: Bool
     /// 0…1 once the engine is reporting bytes moved; nil before that.
     var fraction: Double?
+    /// The local file, when there is one: what we picked, or what was saved.
+    var path: URL?
+
+    /// Pictures show as pictures — the transfer is the same, only the card
+    /// differs, as with the GTK shell's image bubbles.
+    private var preview: NSImage? {
+        guard let path, isImageFile(path) else { return nil }
+        return Thumbnails.image(for: path)
+    }
 
     private var icon: String {
         if done { return "checkmark.circle.fill" }
@@ -1171,6 +1577,31 @@ struct TransferCard: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if let preview {
+                Image(nsImage: preview)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 300, maxHeight: 220, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .onTapGesture { if let path { NSWorkspace.shared.open(path) } }
+                    .help("Click to open")
+            }
+            details
+        }
+        .padding(11)
+        .frame(maxWidth: 380, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(NSColor.controlBackgroundColor)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(failed
+                    ? Color.red.opacity(0.45)
+                    : Color(NSColor.separatorColor)))
+    }
+
+    private var details: some View {
         HStack(spacing: 11) {
             Image(systemName: icon)
                 .font(.system(size: 22))
@@ -1211,17 +1642,20 @@ struct TransferCard: View {
                 }
             }
             Spacer(minLength: 0)
+            if let path, done || outgoing {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([path])
+                } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Show in Finder")
+            }
         }
-        .padding(11)
-        .frame(maxWidth: 380, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(NSColor.controlBackgroundColor)))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(failed
-                    ? Color.red.opacity(0.45)
-                    : Color(NSColor.separatorColor)))
     }
 }
 
@@ -1437,9 +1871,243 @@ extension View {
     }
 }
 
+// MARK: - Composer
+
+/// The message box. An NSTextView rather than a SwiftUI TextField, for three
+/// things a TextField can't be talked out of:
+///
+/// * A file dropped on it is **sent**. The field editor behind a focused
+///   TextField takes file drags itself and types the file's *path* into the
+///   message — and the composer is focused whenever a chat is open, so that
+///   is exactly where people drop. It read as "dropping files doesn't work".
+/// * ⌘V with a screenshot or a copied file sends it, as Ctrl-V does in the
+///   GTK shell; text always pastes as plain text.
+/// * Return sends and ⇧↩ / ⌥↩ start a new line — except while an input
+///   method is composing (Japanese, Chinese, dead-key accents), which needs
+///   Return for itself.
+final class ComposerTextView: NSTextView {
+    var onSubmit: () -> Void = {}
+    var onEscape: () -> Void = {}
+    var onFiles: ([URL]) -> Void = { _ in }
+    var onImage: (NSImage) -> Void = { _ in }
+    var onDropTarget: (Bool) -> Void = { _ in }
+    var placeholder = "" { didSet { if placeholder != oldValue { needsDisplay = true } } }
+
+    static func fileURLs(_ pb: NSPasteboard) -> [URL] {
+        (pb.readObjects(forClasses: [NSURL.self],
+                        options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
+        if isReturn && !hasMarkedText() {
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if mods.contains(.shift) || mods.contains(.option) {
+                insertNewlineIgnoringFieldEditor(nil)
+            } else if !mods.contains(.command) {
+                onSubmit()
+            } else {
+                super.keyDown(with: event)
+            }
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    /// Esc cancels a reply. NSTextView would otherwise open its word
+    /// completion popup, which nobody writing a chat message wants.
+    override func cancelOperation(_ sender: Any?) { onEscape() }
+
+    override func paste(_ sender: Any?) {
+        let pb = NSPasteboard.general
+        let urls = Self.fileURLs(pb)
+        if !urls.isEmpty {
+            onFiles(urls)
+            return
+        }
+        // An image with no text beside it is a screenshot or a copied
+        // picture. An image *with* text is nearly always a selection from a
+        // web page, and then the person meant the words.
+        if !pb.canReadObject(forClasses: [NSString.self], options: nil),
+           let image = NSImage(pasteboard: pb) {
+            onImage(image)
+            return
+        }
+        pasteAsPlainText(sender)
+    }
+
+    // -- drag and drop: files are sent, anything else is text as usual ---
+
+    override var acceptableDragTypes: [NSPasteboard.PasteboardType] {
+        super.acceptableDragTypes + [.fileURL]
+    }
+
+    private func carriesFiles(_ info: NSDraggingInfo) -> Bool {
+        !Self.fileURLs(info.draggingPasteboard).isEmpty
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard carriesFiles(sender) else { return super.draggingEntered(sender) }
+        onDropTarget(true)
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        carriesFiles(sender) ? .copy : super.draggingUpdated(sender)
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        onDropTarget(false)
+        super.draggingExited(sender)
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        carriesFiles(sender) ? true : super.prepareForDragOperation(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = Self.fileURLs(sender.draggingPasteboard)
+        guard !urls.isEmpty else { return super.performDragOperation(sender) }
+        onDropTarget(false)
+        onFiles(urls)
+        return true
+    }
+
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        onDropTarget(false)
+        super.concludeDragOperation(sender)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, !placeholder.isEmpty else { return }
+        let x = textContainerInset.width + (textContainer?.lineFragmentPadding ?? 0)
+        (placeholder as NSString).draw(
+            at: NSPoint(x: x, y: textContainerInset.height),
+            withAttributes: [
+                .font: font ?? NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.placeholderTextColor,
+            ])
+    }
+}
+
+/// SwiftUI face of [`ComposerTextView`]: grows from one line to six, then
+/// scrolls.
+struct ComposerField: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var height: CGFloat
+    var placeholder: String
+    /// Changing this puts the cursor in the box.
+    var focusToken: Int
+    var onSubmit: () -> Void
+    var onEscape: () -> Void
+    var onFiles: ([URL]) -> Void
+    var onImage: (NSImage) -> Void
+    var onDropTarget: (Bool) -> Void
+
+    static let minHeight: CGFloat = 30
+    static let maxHeight: CGFloat = 124
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        // TextKit 1, built by hand: the height is measured from the layout
+        // manager, and asking a TextKit 2 view for one silently switches it.
+        let storage = NSTextStorage()
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(containerSize: NSSize(
+            width: 0, height: CGFloat.greatestFiniteMagnitude))
+        container.widthTracksTextView = true
+        layout.addTextContainer(container)
+
+        let tv = ComposerTextView(frame: .zero, textContainer: container)
+        tv.isRichText = false
+        tv.importsGraphics = false
+        tv.allowsUndo = true
+        tv.font = .systemFont(ofSize: 13)
+        tv.textColor = .labelColor
+        tv.insertionPointColor = .controlAccentColor
+        tv.drawsBackground = false
+        tv.textContainerInset = NSSize(width: 6, height: 7)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.minSize = NSSize(width: 0, height: Self.minHeight)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                            height: CGFloat.greatestFiniteMagnitude)
+        tv.delegate = context.coordinator
+
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = tv
+        context.coordinator.textView = tv
+        wire(tv)
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let tv = context.coordinator.textView else { return }
+        wire(tv)
+        tv.placeholder = placeholder
+        if tv.string != text {
+            tv.string = text
+            tv.needsDisplay = true
+        }
+        context.coordinator.measure()
+        if context.coordinator.focusToken != focusToken {
+            context.coordinator.focusToken = focusToken
+            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        }
+    }
+
+    private func wire(_ tv: ComposerTextView) {
+        tv.onSubmit = onSubmit
+        tv.onEscape = onEscape
+        tv.onFiles = onFiles
+        tv.onImage = onImage
+        tv.onDropTarget = onDropTarget
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: ComposerField
+        weak var textView: ComposerTextView?
+        var focusToken = Int.min
+
+        init(_ parent: ComposerField) { self.parent = parent }
+
+        func textDidChange(_ notification: Notification) {
+            guard let tv = textView else { return }
+            parent.text = tv.string
+            // The placeholder lives outside the glyphs' dirty rect.
+            tv.needsDisplay = true
+            measure()
+        }
+
+        func measure() {
+            guard let tv = textView, let lm = tv.layoutManager,
+                  let tc = tv.textContainer else { return }
+            lm.ensureLayout(for: tc)
+            let used = lm.usedRect(for: tc).height + tv.textContainerInset.height * 2
+            let h = min(max(used, ComposerField.minHeight), ComposerField.maxHeight)
+            guard abs(h - parent.height) > 0.5 else { return }
+            // Not during the view update that asked for the measurement.
+            DispatchQueue.main.async { self.parent.height = h }
+        }
+    }
+}
+
 struct ConversationView: View {
     @EnvironmentObject var model: Model
-    @FocusState private var composerFocused: Bool
+    /// A file is being dragged over the conversation, or over the composer
+    /// (which takes its own drops — see ComposerTextView).
+    @State private var dropTargeted = false
+    @State private var composerDropTargeted = false
+    @State private var composerHeight = ComposerField.minHeight
     /// Briefly ringed after jumping to a quoted original, so the eye lands
     /// on it instead of hunting the scrollback.
     @State private var highlighted: String?
@@ -1589,7 +2257,7 @@ struct ConversationView: View {
                                     quoted: quoted(for: item, peerName: peer.name),
                                     onReply: {
                                         model.replyingTo = item
-                                        composerFocused = true
+                                        model.focusComposer += 1
                                     },
                                     onOpenSealed: {
                                         model.openSealed(item.id)
@@ -1599,7 +2267,8 @@ struct ConversationView: View {
                                             jump(to: rid, proxy)
                                         }
                                     },
-                                    onDelete: { model.deleteMessage(item) })
+                                    onDelete: { model.deleteMessage(item) },
+                                    filePath: model.filePaths[item.id])
                                     .id(item.id)
                                     .background(
                                         RoundedRectangle(cornerRadius: 10)
@@ -1610,6 +2279,19 @@ struct ConversationView: View {
                         .padding(14)
                     }
                     .onChange(of: model.items) { _ in
+                        // History is cleared before it reloads; nothing to
+                        // aim at until it's back.
+                        guard !model.items.isEmpty else { return }
+                        // Opened from a search hit: land on the hit, not the
+                        // bottom. A hit older than the loaded history just
+                        // opens the conversation.
+                        if let target = model.pendingJump {
+                            model.pendingJump = nil
+                            if model.items.contains(where: { $0.id == target }) {
+                                DispatchQueue.main.async { jump(to: target, proxy) }
+                                return
+                            }
+                        }
                         if let last = model.items.last {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                         }
@@ -1678,15 +2360,18 @@ struct ConversationView: View {
                     .help("Seal — \(peer.name) sees a closed envelope until "
                         + "they open it, and you see when they do")
 
-                    TextField("Message \(peer.name)…  (or drop files here)",
-                              text: $model.draft, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .lineLimit(1...6)
-                        .focused($composerFocused)
-                        .onSubmit { model.sendMessage() }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
+                    ComposerField(
+                        text: $model.draft,
+                        height: $composerHeight,
+                        placeholder: "Message \(peer.name)  ·  drop or paste files to send",
+                        focusToken: model.focusComposer,
+                        onSubmit: { model.sendMessage() },
+                        onEscape: { model.replyingTo = nil },
+                        onFiles: { model.sendFiles($0) },
+                        onImage: { model.sendImage($0) },
+                        onDropTarget: { composerDropTargeted = $0 })
+                        .frame(height: composerHeight)
+                        .padding(.horizontal, 3)
                         .background(
                             RoundedRectangle(cornerRadius: 9)
                                 .fill(Color(NSColor.textBackgroundColor)))
@@ -1704,42 +2389,115 @@ struct ConversationView: View {
                     .buttonStyle(.plain)
                     .keyboardShortcut(.return, modifiers: [.command])
                     .disabled(!canSend)
-                    .help("Send  (⌘↩)")
+                    .help("Send  (↩ · new line ⇧↩)")
                 }
                 .padding(12)
                 .background(.bar)
             }
-            .onAppear { composerFocused = true }
+            // The drop target lives here, inside the detail column, and not
+            // on the window: NavigationSplitView hosts each column in its own
+            // AppKit view, and a drop handler attached outside the split view
+            // never saw a drag that was over a column — which is all of them.
+            .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
+                loadFileURLs(providers) { model.sendFiles($0) }
+                return true
+            }
+            .overlay {
+                if dropTargeted || composerDropTargeted {
+                    DropHint(
+                        title: "Drop to send to \(peer.name)",
+                        subtitle: peer.online
+                            ? "Straight to \(peer.host), encrypted. Nothing leaves the LAN."
+                            : "\(peer.name) is offline — nothing can be sent right now.")
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: dropTargeted || composerDropTargeted)
+            .onAppear { model.focusComposer += 1 }
             .clearChatConfirmation($confirmClear)
         } else {
-            VStack(spacing: 10) {
-                Image(systemName: "lamp.desk")
-                    .font(.system(size: 40))
-                    .foregroundColor(.secondary)
-                    .symbolRenderingMode(.hierarchical)
-                Text(model.peers.isEmpty
-                    ? "Nobody on this network yet"
-                    : "Select someone to start")
-                    .font(.system(size: 16, weight: .medium))
-                Text(model.peers.isEmpty
-                    ? "Open Lantern on another machine on the same network "
-                        + "and it appears in the sidebar on its own."
-                    : "Messages and files go straight to their machine.\n"
-                        + "No server, no cloud, nothing in between.")
+            EmptyConversation()
+                .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
+                    loadFileURLs(providers) { model.sendFiles($0) }
+                    return true
+                }
+                .overlay {
+                    if dropTargeted {
+                        DropHint(
+                            title: "Pick someone first",
+                            subtitle: "Or drop the file straight onto a person in the sidebar.")
+                    }
+                }
+        }
+    }
+}
+
+/// The detail pane before a conversation is open. When nobody has appeared,
+/// it says the few things that are actually worth checking, in the order
+/// they turn out to be the answer.
+struct EmptyConversation: View {
+    @EnvironmentObject var model: Model
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: model.peers.isEmpty
+                ? "antenna.radiowaves.left.and.right" : "bubble.left.and.bubble.right")
+                .font(.system(size: 38))
+                .foregroundColor(.secondary)
+                .symbolRenderingMode(.hierarchical)
+            Text(model.peers.isEmpty
+                ? (model.engineUp ? "Looking for people on this network…" : "Starting Lantern…")
+                : "Select someone to start")
+                .font(.system(size: 16, weight: .medium))
+            if model.peers.isEmpty && model.engineUp {
+                VStack(alignment: .leading, spacing: 7) {
+                    tip("1.circle", "Lantern is open on the other machine.")
+                    tip("2.circle", "Both are on the same network — not a guest Wi-Fi, "
+                        + "which usually keeps devices apart.")
+                    tip("3.circle", "If this Mac shows a warning in the sidebar, "
+                        + "follow it: macOS may be blocking Lantern.")
+                }
+                .frame(maxWidth: 380, alignment: .leading)
+                .padding(.top, 2)
+                Button {
+                    model.refreshNow()
+                } label: {
+                    Label("Look Again", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.refreshing)
+                .padding(.top, 4)
+            } else {
+                Text("Messages and files go straight to their machine.\n"
+                    + "No server, no cloud, nothing in between.")
                     .font(.system(size: 12.5))
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func tip(_ icon: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+            Text(text)
+                .font(.system(size: 12.5))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject var model: Model
-    @State private var dropTargeted = false
     /// Who the sidebar is asking about clearing, if anyone.
     @State private var confirmClear: Peer?
+    /// The row a file is being dragged over, if any.
+    @State private var rowDropTarget: String?
+
+    private var onlineCount: Int { model.peers.filter(\.online).count }
 
     var body: some View {
         NavigationSplitView {
@@ -1747,7 +2505,9 @@ struct ContentView: View {
                 // Sidebar header: names what the list is, and holds the one
                 // control that belongs to the list rather than a conversation.
                 HStack(spacing: 6) {
-                    Text("On this network")
+                    Text(onlineCount > 0
+                        ? "On this network · \(onlineCount)"
+                        : "On this network")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(.secondary)
                     Spacer(minLength: 0)
@@ -1766,64 +2526,27 @@ struct ContentView: View {
                     .keyboardShortcut("r", modifiers: .command)
                     .disabled(model.refreshing || !model.engineUp)
                     .help("Look for people again now  (⌘R) — Lantern also "
-                        + "checks on its own every few seconds")
+                        + "checks on its own, and again whenever the Mac wakes "
+                        + "or changes network")
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
                 .padding(.bottom, 4)
 
-                // Right-click a person to clear that chat without opening it
-                // first — the point of deleting is usually to be rid of a
-                // conversation, not to go and read it again.
-                List(model.peers, selection: $model.selected) { peer in
-                    SidebarRow(peer: peer, unread: model.unread[peer.id] ?? 0)
-                        .contextMenu {
-                            Button("Clear Conversation…", role: .destructive) {
-                                confirmClear = peer
-                            }
-                        }
+                LinkBanner(link: model.link)
+
+                if !model.search.isEmpty {
+                    searchResults
+                } else {
+                    roster
                 }
-                .listStyle(.sidebar)
-                .clearChatConfirmation($confirmClear)
-                if model.peers.isEmpty {
-                    // Short here on purpose — the detail pane already
-                    // explains what to do; repeating it twice reads as noise.
-                    Text(model.engineUp ? "No one yet." : "Starting the engine…")
-                        .font(.system(size: 11.5))
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                }
-                Spacer(minLength: 0)
+
                 Divider()
-                if let me = model.me {
-                    HStack(spacing: 8) {
-                        AvatarView(name: me.name, colorKey: "me-self",
-                                   size: 26, online: nil)
-                        VStack(alignment: .leading, spacing: 1) {
-                            HStack(spacing: 4) {
-                                Text(me.name)
-                                    .font(.system(size: 12, weight: .medium))
-                                    .lineLimit(1)
-                                Image(systemName: "lock.fill")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.green)
-                            }
-                            Text(me.short + "…")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .contentShape(Rectangle())
-                    .help("You: \(me.name)\nSafety words — anyone verifying you "
-                        + "should see exactly these:\n"
-                        + me.words.joined(separator: " · "))
-                }
+                if let me = model.me { footer(me) }
             }
-            .navigationSplitViewColumnWidth(min: 220, ideal: 250)
+            .searchable(text: $model.search, placement: .sidebar,
+                        prompt: "Search messages")
+            .navigationSplitViewColumnWidth(min: 230, ideal: 260)
         } detail: {
             ConversationView()
         }
@@ -1858,41 +2581,152 @@ struct ContentView: View {
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        // Drop anywhere in the window — with a visible target, so it doesn't
-        // depend on the user guessing that dropping works.
-        .overlay {
-            if dropTargeted {
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(Color.accentColor, lineWidth: 2.5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color.accentColor.opacity(0.07)))
-                    .overlay(
-                        Label(model.selected == nil
-                            ? "Pick a person first"
-                            : "Drop to send to \(model.currentPeer?.name ?? "them")",
-                              systemImage: "arrow.down.doc")
-                            .font(.system(size: 13, weight: .medium))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(Capsule().fill(.regularMaterial)))
-                    .padding(6)
-                    .allowsHitTesting(false)
-            }
-        }
-        .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
-            for provider in providers {
-                provider.loadItem(
-                    forTypeIdentifier: UTType.fileURL.identifier,
-                    options: nil
-                ) { data, _ in
-                    if let data = data as? Data,
-                       let url = URL(dataRepresentation: data, relativeTo: nil) {
-                        Task { @MainActor in self.model.sendFiles([url]) }
+    }
+
+    // Right-click a person to clear that chat without opening it first —
+    // the point of deleting is usually to be rid of a conversation, not to
+    // go and read it again. Drop a file on a person to send it to them.
+    @ViewBuilder private var roster: some View {
+        List(selection: $model.selected) {
+            if model.hasGroups {
+                ForEach(model.peerGroups, id: \.name) { group in
+                    Section(group.name.isEmpty ? "Everyone else" : group.name) {
+                        ForEach(group.peers) { peer in row(peer) }
                     }
                 }
+            } else {
+                ForEach(model.peers) { peer in row(peer) }
             }
-            return true
+        }
+        .listStyle(.sidebar)
+        .clearChatConfirmation($confirmClear)
+        if model.peers.isEmpty {
+            // Short here on purpose — the detail pane already explains what
+            // to do; repeating it twice reads as noise.
+            Text(model.engineUp ? "No one yet." : "Starting the engine…")
+                .font(.system(size: 11.5))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+        }
+        Spacer(minLength: 0)
+    }
+
+    private func row(_ peer: Peer) -> some View {
+        SidebarRow(peer: peer, unread: model.unread[peer.id] ?? 0,
+                   dropTargeted: rowDropTarget == peer.id)
+            .tag(peer.id)
+            .onDrop(of: [UTType.fileURL], isTargeted: Binding(
+                get: { rowDropTarget == peer.id },
+                set: { on in
+                    if on { rowDropTarget = peer.id }
+                    else if rowDropTarget == peer.id { rowDropTarget = nil }
+                })
+            ) { providers in
+                loadFileURLs(providers) { model.sendFiles($0, to: peer.id) }
+                return true
+            }
+            .contextMenu {
+                Button("Send File…") { pickFiles(for: peer) }
+                Divider()
+                Button("Clear Conversation…", role: .destructive) {
+                    confirmClear = peer
+                }
+            }
+    }
+
+    @ViewBuilder private var searchResults: some View {
+        if model.searchHits.isEmpty {
+            Text("No messages match “\(model.search)”.")
+                .font(.system(size: 11.5))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            Spacer(minLength: 0)
+        } else {
+            List(model.searchHits) { hit in
+                Button { model.openHit(hit) } label: {
+                    SearchHitRow(
+                        hit: hit,
+                        peerName: model.peers.first { $0.id == hit.peer }?.name
+                            ?? String(hit.peer.prefix(8)))
+                }
+                .buttonStyle(.plain)
+            }
+            .listStyle(.sidebar)
+        }
+    }
+
+    /// You, with how you're showing to everyone else, and the control to
+    /// change it.
+    private func footer(_ me: Me) -> some View {
+        HStack(spacing: 8) {
+            AvatarView(name: me.name, colorKey: "me-self", size: 26,
+                       online: true, state: model.presence)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(me.name)
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 9))
+                        .foregroundColor(.green)
+                }
+                Text(presenceLabel)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+            Menu {
+                Picker("Show me as", selection: Binding(
+                    get: { model.presence },
+                    set: { model.setPresence($0) })
+                ) {
+                    Text("Available").tag("active")
+                    Text("Away").tag("away")
+                    Text("Do Not Disturb — no sounds or banners").tag("dnd")
+                }
+                .pickerStyle(.inline)
+                Divider()
+                Button("Copy My Safety Words") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(
+                        me.words.joined(separator: " "), forType: .string)
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 13))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 24, height: 22)
+            .help("How you show to others, and your safety words")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+        .help("You: \(me.name) · \(me.short)…\nSafety words — anyone verifying you "
+            + "should see exactly these:\n"
+            + me.words.joined(separator: " · "))
+    }
+
+    private var presenceLabel: String {
+        switch model.presence {
+        case "away": return "Away"
+        case "dnd": return "Do not disturb"
+        default: return "Available"
+        }
+    }
+
+    private func pickFiles(for peer: Peer) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.message = "Send to \(peer.name) — straight to their machine, "
+            + "encrypted. Nothing leaves the LAN."
+        panel.prompt = "Send"
+        if panel.runModal() == .OK {
+            model.sendFiles(panel.urls, to: peer.id)
         }
     }
 }
@@ -1904,16 +2738,33 @@ final class EngineDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Notifier.requestAuthorization()
+        let env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let bin = home.appendingPathComponent(".lantern/bin/lantern-gui")
+        let bin = env["LANTERN_ENGINE"].map { URL(fileURLWithPath: $0) }
+            ?? home.appendingPathComponent(".lantern/bin/lantern-gui")
         guard FileManager.default.isExecutableFile(atPath: bin.path) else { return }
 
-        let logPath = home.appendingPathComponent(".lantern/gui.log").path
+        try? FileManager.default.createDirectory(
+            at: DATA_DIR, withIntermediateDirectories: true)
+        let logPath = DATA_DIR.appendingPathComponent("gui.log").path
         if !FileManager.default.fileExists(atPath: logPath) {
             FileManager.default.createFile(atPath: logPath, contents: nil)
         }
         let proc = Process()
         proc.executableURL = bin
+        // The GTK shell's env vars, passed on as the engine's flags, so a
+        // second profile on one Mac is one command (README, same-machine).
+        var args: [String] = []
+        if GUI_PORT != 3999 { args += ["--gui-port", String(GUI_PORT)] }
+        if env["LANTERN_DATA_DIR"] != nil { args += ["--data-dir", DATA_DIR.path] }
+        if let p = env["LANTERN_PORT"] { args += ["--discovery-port", p] }
+        if let t = env["LANTERN_TARGETS"] { args += ["--targets", t] }
+        if let n = env["LANTERN_NAME"] { args += ["--name", n] }
+        if let g = env["LANTERN_GROUP"] { args += ["--group", g] }
+        if let b = env["LANTERN_BROADCAST"] {
+            args += ["--broadcast", b == "false" ? "false" : "true"]
+        }
+        proc.arguments = args
         if let log = FileHandle(forWritingAtPath: logPath) {
             log.seekToEndOfFile()
             proc.standardOutput = log
