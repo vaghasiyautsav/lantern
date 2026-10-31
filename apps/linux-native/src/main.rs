@@ -236,6 +236,20 @@ fn abbreviate_home(path: &std::path::Path) -> String {
     }
 }
 
+/// The local paths in a drop. A multi-file drag arrives as one FileList, a
+/// single file as a bare File, depending on the source application. Only
+/// local paths count: the core streams from disk, and invariant 7 forbids the
+/// shell fetching anything off the link.
+fn dropped_paths(value: &glib::Value) -> Vec<std::path::PathBuf> {
+    if let Ok(list) = value.get::<gdk::FileList>() {
+        return list.files().iter().filter_map(|f| f.path()).collect();
+    }
+    if let Ok(file) = value.get::<gio::File>() {
+        return file.path().into_iter().collect();
+    }
+    Vec::new()
+}
+
 /// A round, coloured initials badge.
 fn avatar(name: &str, key: &str, size: i32) -> gtk::Label {
     let a = gtk::Label::new(Some(&initials(name)));
@@ -288,6 +302,31 @@ const STYLE: &str = "
     padding: 6px 12px;
 }
 .lantern-meta { font-size: 0.8em; }
+/* Presence has a colour and a word (the row's subtitle says it too), so it
+   never rests on hue alone. */
+.lantern-dot { font-size: 0.7em; }
+.lantern-peer-row:drop(active) {
+    background-color: alpha(@theme_selected_bg_color, 0.22);
+    border-radius: 8px;
+}
+.lantern-dot-on { color: #2ec27e; }
+.lantern-dot-away { color: #e5a50a; }
+.lantern-dot-dnd { color: #e01b24; }
+.lantern-dot-off { color: alpha(currentColor, 0.35); }
+.lantern-linknote {
+    margin: 6px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background-color: alpha(#e5a50a, 0.14);
+    border: 1px solid alpha(#e5a50a, 0.45);
+}
+.lantern-drop-hint {
+    padding: 18px 26px;
+    border-radius: 14px;
+    border: 2px dashed @theme_selected_bg_color;
+    background-color: alpha(@theme_bg_color, 0.94);
+    font-weight: bold;
+}
 ";
 
 fn build_ui(
@@ -383,8 +422,18 @@ fn build_ui(
     search_entry.set_margin_start(6);
     search_entry.set_margin_end(6);
 
+    // Why the roster might be empty when the cause is on this machine: the
+    // OS refusing every beacon, or no network at all. Hidden while all is
+    // well; LinkChanged shows and clears it.
+    let link_note = gtk::Label::new(None);
+    link_note.add_css_class("lantern-linknote");
+    link_note.set_wrap(true);
+    link_note.set_xalign(0.0);
+    link_note.set_visible(false);
+
     let left_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     left_box.append(&search_entry);
+    left_box.append(&link_note);
     left_box.append(&empty_label);
     left_box.append(&peers_scroll);
     peers_scroll.set_vexpand(true);
@@ -466,16 +515,33 @@ fn build_ui(
     ));
     ph_sub.add_css_class("dim-label");
     ph_sub.set_justify(gtk::Justification::Center);
+    let ph_again = gtk::Button::with_label("Look again");
+    ph_again.set_halign(gtk::Align::Center);
+    ph_again.set_margin_top(6);
     placeholder.append(&ph_icon);
     placeholder.append(&ph_title);
     placeholder.append(&ph_sub);
+    placeholder.append(&ph_again);
 
     let stack = gtk::Stack::new();
     stack.add_named(&placeholder, Some("empty"));
     stack.add_named(&msg_scroll, Some("messages"));
     stack.set_visible_child_name("empty");
     stack.set_vexpand(true);
-    right.append(&stack);
+
+    // Drawn over the conversation while a file is dragged anywhere on it.
+    let drop_hint = gtk::Label::new(None);
+    drop_hint.add_css_class("lantern-drop-hint");
+    drop_hint.set_halign(gtk::Align::Center);
+    drop_hint.set_valign(gtk::Align::Center);
+    drop_hint.set_justify(gtk::Justification::Center);
+    drop_hint.set_can_target(false);
+    drop_hint.set_visible(false);
+    let stack_overlay = gtk::Overlay::new();
+    stack_overlay.set_child(Some(&stack));
+    stack_overlay.add_overlay(&drop_hint);
+    stack_overlay.set_vexpand(true);
+    right.append(&stack_overlay);
 
     let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     composer.set_margin_top(8);
@@ -651,7 +717,15 @@ fn build_ui(
 
     let append_text = {
         let append_row = append_row.clone();
-        move |outgoing: bool, sender: &str, key: &str, ts: u64, delivered: Option<bool>, text: &str| {
+        let backend = Rc::clone(&backend);
+        let flash = flash.clone();
+        move |outgoing: bool,
+              sender: &str,
+              key: &str,
+              ts: u64,
+              delivered: Option<bool>,
+              text: &str,
+              mid: Option<lantern_core::Uuid>| {
             let lbl = gtk::Label::new(Some(text));
             lbl.set_wrap(true);
             lbl.set_selectable(true);
@@ -659,6 +733,32 @@ fn build_ui(
             // Keep a long message from stretching edge to edge; a bubble that
             // spans the whole window reads as a wall, not a message.
             lbl.set_max_width_chars(46);
+            // Delete rides the label's own right-click menu (beside Copy and
+            // Select All) rather than a second menu fighting it for the
+            // click. The wording says where the deletion reaches: Wisp has
+            // no delete-for-everyone, so the other side keeps their copy.
+            if let Some(mid) = mid {
+                let group = gio::SimpleActionGroup::new();
+                let delete = gio::SimpleAction::new("delete", None);
+                let backend = Rc::clone(&backend);
+                let flash = flash.clone();
+                let weak = lbl.downgrade();
+                delete.connect_activate(move |_, _| {
+                    backend.core.delete_message(&mid);
+                    // label → column → row → the message list
+                    if let Some(row) = weak.upgrade().and_then(|l| l.parent()).and_then(|c| c.parent()) {
+                        if let Some(list) = row.parent().and_then(|p| p.downcast::<gtk::Box>().ok()) {
+                            list.remove(&row);
+                        }
+                    }
+                    flash("Deleted from this machine. The other side keeps their copy.");
+                });
+                group.add_action(&delete);
+                lbl.insert_action_group("msg", Some(&group));
+                let menu = gio::Menu::new();
+                menu.append(Some("Delete from This Machine"), Some("msg.delete"));
+                lbl.set_extra_menu(Some(&menu));
+            }
             append_row(
                 outgoing,
                 sender,
@@ -805,16 +905,42 @@ fn build_ui(
         }
     };
 
+    // Dropping a file on a person sends it to them. The rows are rebuilt by
+    // refresh_peers, which exists before the send path does, so the handler
+    // is filled in once it can be (see "drop files onto a person").
+    type RowDrop = Rc<dyn Fn([u8; 32], Vec<std::path::PathBuf>)>;
+    let row_drop: Rc<RefCell<Option<RowDrop>>> = Rc::new(RefCell::new(None));
+
     let refresh_peers = {
         let state = Rc::clone(&state);
         let backend = Rc::clone(&backend);
         let peer_list = peer_list.clone();
         let empty_label = empty_label.clone();
+        let ph_title = ph_title.clone();
+        let ph_sub = ph_sub.clone();
+        let ph_again = ph_again.clone();
+        let row_drop = Rc::clone(&row_drop);
         move || {
             let st = state.borrow();
             while let Some(child) = peer_list.first_child() {
                 peer_list.remove(&child);
             }
+            // With nobody found, the placeholder says what to check instead
+            // of "select someone" with nobody to select.
+            if st.peers.is_empty() {
+                ph_title.set_text("Looking for people on this network…");
+                ph_sub.set_text(
+                    "Check that Lantern is open on the other machine, and that both\n\
+                     are on the same network — a guest Wi-Fi usually keeps devices apart.",
+                );
+            } else {
+                ph_title.set_text("Select someone to start");
+                ph_sub.set_text(
+                    "Messages and files go straight to their machine.\n\
+                     No server, no cloud, nothing in between.",
+                );
+            }
+            ph_again.set_visible(st.peers.is_empty());
             if !st.search_results.is_empty() {
                 empty_label.set_visible(false);
                 for m in &st.search_results {
@@ -836,7 +962,13 @@ fn build_ui(
                     )));
                     head.add_css_class("caption-heading");
                     head.set_halign(gtk::Align::Start);
-                    let body = gtk::Label::new(Some(&m.text));
+                    // Found, not read out — a search result is no place to
+                    // break a seal.
+                    let body = gtk::Label::new(Some(if m.sealed && !m.outgoing {
+                        "🔒 Sealed message"
+                    } else {
+                        m.text.as_str()
+                    }));
                     body.set_halign(gtk::Align::Start);
                     body.add_css_class("dim-label");
                     body.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -854,6 +986,25 @@ fn build_ui(
             let mut selected_at = None;
             for (i, p) in st.peers.iter().enumerate() {
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                row.add_css_class("lantern-peer-row");
+                row.set_tooltip_text(Some(&format!("Drop a file here to send it to {}", p.name)));
+                let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+                drop.set_types(&[gdk::FileList::static_type(), gio::File::static_type()]);
+                {
+                    let id = p.id;
+                    let row_drop = Rc::clone(&row_drop);
+                    drop.connect_drop(move |_, value, _, _| {
+                        let paths = dropped_paths(value);
+                        if paths.is_empty() {
+                            return false;
+                        }
+                        if let Some(f) = row_drop.borrow().as_ref() {
+                            f(id, paths);
+                        }
+                        true
+                    });
+                }
+                row.add_controller(drop);
                 row.set_margin_top(6);
                 row.set_margin_bottom(6);
                 row.set_margin_start(10);
@@ -895,7 +1046,18 @@ fn build_ui(
                 if !p.online {
                     row.set_opacity(0.5);
                 }
-                text_col.append(&n);
+                let dot = gtk::Label::new(Some("●"));
+                dot.add_css_class("lantern-dot");
+                dot.add_css_class(match (p.online, p.state) {
+                    (false, _) => "lantern-dot-off",
+                    (true, lantern_core::Presence::Away) => "lantern-dot-away",
+                    (true, lantern_core::Presence::Dnd) => "lantern-dot-dnd",
+                    (true, _) => "lantern-dot-on",
+                });
+                let name_row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+                name_row.append(&dot);
+                name_row.append(&n);
+                text_col.append(&name_row);
                 text_col.append(&h);
                 row.append(&text_col);
 
@@ -1006,6 +1168,7 @@ fn build_ui(
                         m.ts,
                         Some(m.state >= 1),
                         &m.text,
+                        Some(m.mid),
                     );
                 } else if m.sealed {
                     append_sealed(&peer.name, &hex::encode(peer.id), m.ts, m.mid, peer.id);
@@ -1017,6 +1180,7 @@ fn build_ui(
                         m.ts,
                         None,
                         &m.text,
+                        Some(m.mid),
                     );
                 }
             }
@@ -1061,6 +1225,9 @@ fn build_ui(
                 now,
                 Some(false),
                 &if sealed { format!("🔒 {text}") } else { text.clone() },
+                // The mid is only known once the send returns; the row gets
+                // its delete the next time this conversation is opened.
+                None,
             );
             // Sending always follows, even if we were reading history.
             pin_to_bottom();
@@ -1203,53 +1370,77 @@ fn build_ui(
     }
 
     // ---- drop files onto the conversation --------------------------------
-    // Only a local path can be sent: the core streams from disk, and
-    // invariant 7 forbids the shell fetching anything off the link.
+    // The whole conversation pane takes the drop — header, messages and the
+    // message box — and in the capture phase, so it gets a file before the
+    // entry does. Attached to the message list alone, a file dropped on the
+    // entry (where the cursor already is, so where people drop) was taken
+    // by the entry's own text drop and typed in as a URI.
     {
         let state = Rc::clone(&state);
         let send_path = send_path.clone();
         let flash = flash.clone();
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         drop.set_types(&[gdk::FileList::static_type(), gio::File::static_type()]);
+        drop.set_propagation_phase(gtk::PropagationPhase::Capture);
 
-        let scroll_enter = msg_scroll.clone();
+        let hint_enter = drop_hint.clone();
+        let state_enter = Rc::clone(&state);
         drop.connect_enter(move |_, _, _| {
-            scroll_enter.add_css_class("lantern-drop-active");
+            let st = state_enter.borrow();
+            let who = st
+                .selected
+                .and_then(|id| st.peers.iter().find(|p| p.id == id))
+                .map(|p| (p.name.clone(), p.online));
+            hint_enter.set_text(&match who {
+                Some((name, true)) => format!(
+                    "Drop to send to {name}\nStraight to their machine, encrypted."
+                ),
+                Some((name, false)) => format!(
+                    "Drop to send to {name}\n{name} is offline — nothing can be sent right now."
+                ),
+                None => "Pick someone first\nOr drop the file onto a person in the sidebar.".into(),
+            });
+            hint_enter.set_visible(true);
             gdk::DragAction::COPY
         });
-        let scroll_leave = msg_scroll.clone();
-        drop.connect_leave(move |_| {
-            scroll_leave.remove_css_class("lantern-drop-active");
-        });
+        let hint_leave = drop_hint.clone();
+        drop.connect_leave(move |_| hint_leave.set_visible(false));
 
-        let scroll_drop = msg_scroll.clone();
+        let hint_drop = drop_hint.clone();
         drop.connect_drop(move |_, value, _, _| {
-            scroll_drop.remove_css_class("lantern-drop-active");
+            hint_drop.set_visible(false);
             if state.borrow().selected.is_none() {
-                flash("Pick a person first, then drop the file.");
+                flash("Pick a person first, then drop the file — or drop it onto them in the sidebar.");
                 return false;
             }
-            // A multi-file drag arrives as one FileList, a single file as
-            // a bare File, depending on the source application.
-            if let Ok(list) = value.get::<gdk::FileList>() {
-                let paths: Vec<_> = list.files().iter().filter_map(|f| f.path()).collect();
-                if paths.is_empty() {
-                    return false;
-                }
-                for path in paths {
-                    send_path(path);
-                }
-                return true;
+            let paths = dropped_paths(value);
+            if paths.is_empty() {
+                return false;
             }
-            if let Ok(file) = value.get::<gio::File>() {
-                if let Some(path) = file.path() {
-                    send_path(path);
-                    return true;
-                }
+            for path in paths {
+                send_path(path);
             }
-            false
+            true
         });
-        msg_scroll.add_controller(drop);
+        right.add_controller(drop);
+    }
+
+    // ---- drop files onto a person ----------------------------------------
+    {
+        let state = Rc::clone(&state);
+        let peer_list = peer_list.clone();
+        let send_path = send_path.clone();
+        *row_drop.borrow_mut() = Some(Rc::new(move |peer: [u8; 32], paths: Vec<std::path::PathBuf>| {
+            // Open their conversation first: the send path sends to whoever
+            // is open, and the card belongs on screen where it can be seen.
+            let idx = state.borrow().peers.iter().position(|p| p.id == peer);
+            if let Some(row) = idx.and_then(|i| peer_list.row_at_index(i as i32)) {
+                peer_list.select_row(Some(&row));
+            }
+            for path in paths {
+                send_path(path);
+            }
+        }));
     }
 
     // ---- check for updates ----------------------------------------------
@@ -1409,6 +1600,11 @@ fn build_ui(
             let btn = btn.clone();
             glib::timeout_add_seconds_local_once(2, move || btn.set_sensitive(true));
         });
+    }
+
+    {
+        let refresh_btn = refresh_btn.clone();
+        ph_again.connect_clicked(move |_| refresh_btn.emit_clicked());
     }
 
     // ---- clear conversation ---------------------------------------------
@@ -1577,6 +1773,41 @@ fn build_ui(
         });
     }
 
+    // Beacons refused, or no network: say so where the empty roster is.
+    let show_link = {
+        let link_note = link_note.clone();
+        move |status: lantern_core::LinkStatus, detail: Option<String>| match status {
+            lantern_core::LinkStatus::Ok => link_note.set_visible(false),
+            lantern_core::LinkStatus::NoNetwork => {
+                link_note.set_markup(
+                    "<b>Not connected to a network</b>\n\
+                     People appear as soon as Wi-Fi or Ethernet is back.",
+                );
+                link_note.set_tooltip_text(None);
+                link_note.set_visible(true);
+            }
+            lantern_core::LinkStatus::Blocked => {
+                link_note.set_markup(if cfg!(target_os = "macos") {
+                    "<b>macOS is blocking Lantern</b>\n\
+                     Nobody here can see you, and you can't see them. Allow Lantern \
+                     under Privacy &amp; Security → Local Network; it reconnects by itself."
+                } else {
+                    "<b>This machine is refusing Lantern's network traffic</b>\n\
+                     Nobody here can see you, and you can't see them. A firewall rule is \
+                     the usual cause — allow UDP port 3939. Lantern reconnects by itself."
+                });
+                link_note.set_tooltip_text(
+                    detail.map(|d| format!("The system said: {d}")).as_deref(),
+                );
+                link_note.set_visible(true);
+            }
+        }
+    };
+    {
+        let (status, detail) = backend.core.link_status();
+        show_link(status, detail);
+    }
+
     // Badges come from the store, so three unread messages are still three
     // unread messages after a restart — they used to live and die with RAM.
     {
@@ -1627,6 +1858,7 @@ fn build_ui(
         let append_picture = append_picture.clone();
         let set_file_state = set_file_state.clone();
         let set_file_progress = set_file_progress.clone();
+        let show_link = show_link.clone();
         let app = app.clone();
         let window = window.clone();
         glib::MainContext::default().spawn_local(async move {
@@ -1702,7 +1934,7 @@ fn build_ui(
                             if sealed {
                                 append_sealed(&peer_name, &hex::encode(peer), ts, mid, peer);
                             } else {
-                                append_text(false, &peer_name, &hex::encode(peer), ts, None, &text);
+                                append_text(false, &peer_name, &hex::encode(peer), ts, None, &text, Some(mid));
                             }
                         } else {
                             *state.borrow_mut().unread.entry(peer).or_insert(0) += 1;
@@ -1795,9 +2027,10 @@ fn build_ui(
                             );
                         }
                     }
+                    CoreEvent::LinkChanged { status, detail } => show_link(status, detail),
                     CoreEvent::TrustWarning { detail, .. } => {
                         let now = glib::real_time() as u64 / 1000;
-                        append_text(false, "⚠ Trust warning", "warn", now, None, &detail);
+                        append_text(false, "⚠ Trust warning", "warn", now, None, &detail, None);
                     }
                     _ => {}
                 }
