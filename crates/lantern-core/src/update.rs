@@ -199,7 +199,21 @@ pub fn check_blocking() -> UpdateCheck {
         );
     }
 
-    let range = format!("HEAD..{upstream}");
+    // Count from what is *running*, not from where the checkout happens to
+    // be. They differ whenever the checkout was pulled without reinstalling —
+    // on a machine that is also where Lantern is developed, that is every
+    // `git pull` — and counting from HEAD then reported "up to date" to an
+    // app several commits behind its own source. The build commit is used
+    // only when the repo actually has it; a build from a commit since
+    // rewritten away falls back to HEAD rather than to an error.
+    let base = if build.commit != "unknown"
+        && git(&repo, &["cat-file", "-e", &format!("{}^{{commit}}", build.commit)]).is_ok()
+    {
+        build.commit.clone()
+    } else {
+        "HEAD".to_string()
+    };
+    let range = format!("{base}..{upstream}");
     let behind = git(&repo, &["rev-list", "--count", &range])
         .ok()
         .and_then(|s| s.parse().ok())
@@ -274,6 +288,14 @@ pub fn start(data_dir: &Path) -> Result<(), String> {
     }
     std::fs::create_dir_all(data_dir).ok();
     let log = log_path(data_dir);
+    // update.sh rebuilds a current checkout when the install is behind it,
+    // judging by this stamp. install.sh writes it, but a copy installed
+    // before it did has none — and this binary knows exactly what it was
+    // built from, so say so rather than let the script think it's current.
+    let stamp = data_dir.join("installed-commit");
+    if !stamp.exists() && check.build.commit != "unknown" {
+        std::fs::write(&stamp, format!("{}\n", check.build.commit)).ok();
+    }
 
     // `sh -c` exits at once, leaving the script parented to init and immune
     // to this process going away moments later.

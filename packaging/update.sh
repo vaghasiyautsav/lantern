@@ -129,7 +129,25 @@ fi
 echo "$OUT"
 
 COUNT="$(git rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || echo 0)"
-if [ "$COUNT" = "0" ]; then
+
+# The checkout can be current while the installed Lantern is not — someone
+# pulled by hand, or this is the machine Lantern is developed on. install.sh
+# stamps what it installed; if that is behind HEAD there is still a build to
+# do even with nothing to pull. Without this the app's own check said "N new
+# commits", the Update button ran this script, and it answered "already up
+# to date" and quit.
+INSTALLED="$(cat "$DATA/installed-commit" 2>/dev/null || true)"
+STALE=0
+if [ -n "$INSTALLED" ] && git cat-file -e "$INSTALLED^{commit}" 2>/dev/null; then
+    STALE="$(git rev-list --count "$INSTALLED..HEAD" 2>/dev/null || echo 0)"
+fi
+
+if [ "$COUNT" = "0" ] && [ "$STALE" != "0" ]; then
+    echo "Nothing new to pull, but the installed build ($INSTALLED) is $STALE commit(s) behind this checkout."
+    git --no-pager log --oneline --no-decorate "$INSTALLED..HEAD" | sed 's/^/  /'
+fi
+
+if [ "$COUNT" = "0" ] && [ "$STALE" = "0" ]; then
     AHEAD="$(git rev-list --count "$UPSTREAM..HEAD" 2>/dev/null || echo 0)"
     if [ "$AHEAD" != "0" ]; then
         echo "You are ahead of $UPSTREAM by $AHEAD commit(s) — nothing to pull."
@@ -139,10 +157,12 @@ if [ "$COUNT" = "0" ]; then
     exit 0
 fi
 
-echo
-bold "$COUNT new commit(s):"
-git --no-pager log --oneline --no-decorate "HEAD..$UPSTREAM" | sed 's/^/  /'
-echo
+if [ "$COUNT" != "0" ]; then
+    echo
+    bold "$COUNT new commit(s):"
+    git --no-pager log --oneline --no-decorate "HEAD..$UPSTREAM" | sed 's/^/  /'
+    echo
+fi
 
 if [ "$MODE" = "check" ]; then
     echo "--check given, stopping here. Run without it to install."
@@ -165,11 +185,13 @@ if [ "$MODE" = "handoff" ]; then
 fi
 
 # 4. Fast-forward and build -------------------------------------------------
-say running merge "Fast-forwarding to $UPSTREAM"
-if ! OUT="$(git merge --ff-only "$UPSTREAM" 2>&1)"; then
-    fail merge "This checkout has commits GitHub doesn't have, so there's nothing to fast-forward to. Push or reset them first: git -C $REPO status"
+if [ "$COUNT" != "0" ]; then
+    say running merge "Fast-forwarding to $UPSTREAM"
+    if ! OUT="$(git merge --ff-only "$UPSTREAM" 2>&1)"; then
+        fail merge "This checkout has commits GitHub doesn't have, so there's nothing to fast-forward to. Push or reset them first: git -C $REPO status"
+    fi
+    echo "$OUT"
 fi
-echo "$OUT"
 AFTER="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 say running build "Building $AFTER (this takes a few minutes)"
