@@ -741,6 +741,52 @@ timeout (8 s), stalling every other beacon behind it. Now spawned, one per
 peer at a time, and a failure is logged (once per peer per 10 min) instead
 of swallowed.
 
+### Later on 9 Nov — the newest message hid behind the composer (0.2.4)
+
+**macOS, three causes, each found with a scripted build** (below):
+
+- **LazyVStack estimates the scroll height.** For rows it hasn't built,
+  SwiftUI guesses, and with chat bubbles of every height it guessed short.
+  The NSScrollView's document ended up to 120pt above the real last
+  message, so no scroll, SwiftUI's or AppKit's, could bring it into view.
+  The newest `eagerTail` (50) messages are now a plain VStack below the lazy
+  history. All 500 eager took 1.5 s to open and 0.3 s per send. The split
+  opens in ~0.2 s and sends in under 0.1 s.
+- **A GeometryReader isn't re-measured on a plain scroll** (macOS 27,
+  NSScrollView-backed ScrollView). A marker's preference updates when
+  content changes, never when the person scrolls. A preference set in a
+  ScrollView's `.background` never arrives at all. So "at the bottom?" can't
+  come from SwiftUI. `ScrollWatcher` is an NSView in the end marker's
+  background that observes the clip view's bounds/frame and the document's
+  frame. It reads the scroll position from AppKit. It counts a scroll only
+  when the position moves while the visible and content heights hold;
+  otherwise the composer shrinking reads as "scrolled away". While
+  following, it re-pins on any size change.
+- **onChange runs after layout.** By the time `onChange(of: items)` or a
+  composer height change fires, the new row is already laid out. So "is
+  the end on screen?" asked then says no. Following is decided only by
+  scrolls, never by growth.
+
+Incoming while scrolled up shows a "N new messages" pill. Your own sends
+always scroll.
+
+**Linux:** the four-frame tick pin is replaced by a `stick` flag fed by
+`value-changed`. `notify::upper` and `notify::page-size` re-pin from an idle
+while it's set.
+
+**How it was tested, without screen access:** a scratch copy of
+Lantern.swift with test hooks (`LANTERN_TEST_LOG`) opened the first peer
+and sent 12 messages through `sendMessage()`. It grew the composer with a
+5-line draft, scrolled up, and logged AppKit's distance-from-end after each
+step. Incoming messages came from a second engine over loopback only:
+`lantern-gui --data-dir <scratch> --discovery-port 3941 --targets 3940,3941
+--gui-port 4001 --broadcast=false`, with the app on `LANTERN_PORT=3940
+LANTERN_BROADCAST=false`. Nothing reaches the LAN or the real instance on
+3939. The GTK app got the same script, using `entry.emit_activate()`.
+
+**Sidebar:** names are 14pt semibold on macOS, 1.12em on Linux. Avatars are
+38.
+
 ## Open defects
 
 1. **Safety words encode 80 bits, not 88.** `safety_words` takes 11 bits per
