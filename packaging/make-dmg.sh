@@ -75,6 +75,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
+# Sign ad-hoc so macOS sees the app as local.lantern.gui. macOS matches the
+# Local Network switch by code-signing identifier; swiftc's linker signature
+# says "LanternShell", which no switch ever matches. The bootstrap execs
+# LanternShell, so that is the process macOS checks: it gets the bundle id
+# too, then the bundle is sealed around it.
+codesign --force --sign - --identifier local.lantern.gui "$APP/Contents/MacOS/LanternShell"
+codesign --force --sign - --identifier local.lantern.gui "$APP"
+
 # 3. Drag-to-install layout + image.
 ln -s /Applications "$STAGE/Applications"
 rm -f Lantern.dmg

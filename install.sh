@@ -228,6 +228,16 @@ LAUNCH
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>
 PLIST
+    # Sign the bundle (ad-hoc) so the app's code-signing identifier is its
+    # bundle id. swiftc's output is only linker-signed, as "Lantern", and
+    # macOS matches the Local Network switch by signing identifier: with the
+    # wrong one, the switch can read On in System Settings while every
+    # message to another computer still fails with "No route to host", and
+    # no prompt ever appears. Signing the bundle also binds Info.plist.
+    if ! codesign --force --sign - --identifier local.lantern.gui "$STAGE" 2>/dev/null; then
+        echo "warning: couldn't sign Lantern.app — on this Mac, messages may not reach"
+        echo "         other computers even with Local Network access switched on."
+    fi
     # Swap: the old bundle only goes away once the new one is complete.
     rm -rf "$APP"
     mv "$STAGE" "$APP"
