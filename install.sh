@@ -32,6 +32,21 @@ if [ "$(uname)" = "Linux" ]; then
     # engine + CLI + localhost interface.
     if pkg-config --atleast-version=4.10 gtk4 2>/dev/null; then
         BUILD_GTK=1
+    elif [ -x "$HOME/.lantern/bin/lantern-gtk" ]; then
+        # The native app is installed but can no longer be built — almost
+        # always an Ubuntu release upgrade, which removes -dev packages and
+        # leaves the GTK runtime. Falling back the way a fresh install does
+        # would quietly point the launcher at the browser version and leave
+        # the old native binary running beside a new engine. Stop instead,
+        # before anything is replaced, and say exactly what to run.
+        echo
+        bold "Can't rebuild the native Lantern app: GTK 4's development files are missing."
+        echo "This usually happens after an Ubuntu upgrade. Install them, then update again:"
+        echo
+        echo "    sudo apt install libgtk-4-dev"
+        echo
+        echo "Nothing was changed — your current Lantern still works."
+        exit 3
     else
         BUILD_GTK=0
         echo "note: GTK 4.10+ not found — skipping the native GTK app."
@@ -207,6 +222,8 @@ LAUNCH
   <key>NSHighResolutionCapable</key><true/>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Lantern finds the other computers running Lantern on this network, and sends your messages and files straight to them. Nothing goes over the internet.</string>
+  <key>NSBonjourServices</key>
+  <array><string>_lantern-check._tcp</string></array>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

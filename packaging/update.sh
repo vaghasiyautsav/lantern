@@ -195,7 +195,13 @@ fi
 AFTER="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 say running build "Building $AFTER (this takes a few minutes)"
-if ! bash "$REPO/install.sh"; then
+bash "$REPO/install.sh"
+RC=$?
+if [ "$RC" = "3" ]; then
+    # install.sh's "the native app can't be built here any more" — shown in
+    # the app's update dialog, so it has to carry the fix, not just the fact.
+    fail build "GTK 4's development files are missing (an Ubuntu upgrade usually removes them), so the native app can't be rebuilt. Run: sudo apt install libgtk-4-dev — then update again. Nothing was replaced."
+elif [ "$RC" != "0" ]; then
     fail build "The build failed. Nothing was replaced — the log above says where it stopped. Your previous Lantern still works."
 fi
 
