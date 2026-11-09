@@ -345,6 +345,12 @@ struct Inner {
     last_ping_reply: Option<std::time::Instant>,
     /// Offers awaiting a human decision: xid → (peer, that session's outbox).
     pending_consent: HashMap<Uuid, ([u8; 32], mpsc::Sender<ControlFrame>)>,
+    /// Peers whose queued messages are being retried right now, so a burst
+    /// of beacons from one peer doesn't pile up one dial per beacon.
+    flushing: std::collections::HashSet<[u8; 32]>,
+    /// When we last logged that a peer's queue couldn't be delivered —
+    /// once per peer per ten minutes, not once per heartbeat.
+    flush_warned: HashMap<[u8; 32], Instant>,
 }
 
 pub struct Core {
@@ -401,6 +407,8 @@ impl Core {
                 warned: std::collections::HashSet::new(),
                 last_ping_reply: None,
                 pending_consent: HashMap::new(),
+                flushing: std::collections::HashSet::new(),
+                flush_warned: HashMap::new(),
             })),
             events: event_tx,
             seq: std::sync::atomic::AtomicU64::new(1),
@@ -777,9 +785,41 @@ impl Core {
         if queued.is_empty() {
             return;
         }
-        let Ok(session) = self.ensure_session(peer).await else {
-            return;
+        if !self.inner.lock().await.flushing.insert(peer) {
+            return; // a retry for this peer is already under way
+        }
+        let session = self.ensure_session(peer).await;
+        self.inner.lock().await.flushing.remove(&peer);
+        let session = match session {
+            Ok(s) => s,
+            Err(e) => {
+                // Said, not swallowed: "seen but never delivered" is
+                // otherwise invisible from both ends. On macOS a dial that
+                // dies like this while beacons still arrive is the Local
+                // Network permission — answering is allowed, initiating
+                // isn't.
+                let mut g = self.inner.lock().await;
+                let due = g
+                    .flush_warned
+                    .get(&peer)
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(600));
+                if due {
+                    g.flush_warned.insert(peer, Instant::now());
+                    let name = g
+                        .roster
+                        .get(&peer)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| hex::encode(&peer[..4]));
+                    warn!(
+                        "{} queued message(s) for {name} still not delivered — couldn't \
+                         connect: {e}",
+                        queued.len()
+                    );
+                }
+                return;
+            }
         };
+        self.inner.lock().await.flush_warned.remove(&peer);
         for m in queued {
             let _ = session
                 .outbox
@@ -1541,7 +1581,17 @@ impl Core {
                 }
                 // They are reachable: push anything that queued while they
                 // were not. Cheap when the queue is empty (one indexed query).
-                self.flush_undelivered(beacon.id).await;
+                //
+                // In its own task. Dialling a peer that can't be reached
+                // takes the whole handshake timeout, and this loop is the
+                // only reader of beacons: awaited here, one unreachable peer
+                // with a queue held up every other peer's sighting by eight
+                // seconds per beacon.
+                {
+                    let core = Arc::clone(&self);
+                    let id = beacon.id;
+                    tokio::spawn(async move { core.flush_undelivered(id).await });
+                }
                 let _ = self
                     .events
                     .send(CoreEvent::PeerSeen {
@@ -1884,6 +1934,64 @@ async fn reply_to_offer(
     }
 }
 
+/// Exclusive hold on a profile (a data directory) for as long as it lives.
+///
+/// One identity, one engine. Two processes on one profile both beacon the
+/// same key with different QUIC ports and boot nonces, so every peer's
+/// roster flips between them and a message goes to whichever was heard
+/// last — while both write the same database. That happened for real: an
+/// update relaunched the GTK app, a click on the launcher started the web
+/// engine beside it, and delivery became a coin toss. Binaries take this
+/// before `Core::start`; tests, which restart cores in-process, don't.
+pub struct ProfileLock {
+    _file: std::fs::File,
+}
+
+/// Take the profile lock, or say who has it.
+pub fn lock_profile(data_dir: &std::path::Path) -> Result<ProfileLock, String> {
+    use std::io::{Read, Seek, Write};
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("{}: {e}", data_dir.display()))?;
+    let path = data_dir.join("engine.lock");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {
+            // Who holds it, for the next process's error message. The lock
+            // is the advisory kind, so the content is only ever a hint.
+            let me = std::env::args()
+                .next()
+                .map(|a| {
+                    std::path::Path::new(&a)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or(a)
+                })
+                .unwrap_or_else(|| "lantern".into());
+            let _ = file.set_len(0);
+            let _ = write!(file, "{me} (pid {})", std::process::id());
+            Ok(ProfileLock { _file: file })
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut holder = String::new();
+            let _ = file.rewind();
+            let _ = file.read_to_string(&mut holder);
+            let holder = holder.trim();
+            Err(format!(
+                "Lantern is already running on this profile ({}){}. One profile \
+                 can only be open once — use that one, or quit it first.",
+                data_dir.display(),
+                if holder.is_empty() { String::new() } else { format!(" — {holder}") }
+            ))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 pub fn user_download_dir() -> Option<PathBuf> {
     // Windows has no HOME; the profile directory is USERPROFILE, and the
     // folder is not localised on disk the way XDG's is.
@@ -2020,6 +2128,17 @@ mod tests {
         let path = dir.join("user-dirs.dirs");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn a_profile_opens_once() {
+        let dir = scratch("profile-lock");
+        let first = lock_profile(&dir).expect("first lock");
+        let second = lock_profile(&dir).err().expect("second lock must fail");
+        assert!(second.contains("already running"), "{second}");
+        assert!(second.contains("pid"), "names the holder: {second}");
+        drop(first);
+        assert!(lock_profile(&dir).is_ok(), "released when the holder goes");
     }
 
     #[test]

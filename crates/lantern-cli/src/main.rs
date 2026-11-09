@@ -73,6 +73,11 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
+    // One engine per profile: a CLI started beside the app on the same data
+    // directory would be a second node with the app's identity.
+    let _profile = lantern_core::lock_profile(&expand_tilde(&args.data_dir))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let (core, mut events) = Core::start(CoreConfig {
         data_dir: expand_tilde(&args.data_dir),
         display_name: args.name.clone(),

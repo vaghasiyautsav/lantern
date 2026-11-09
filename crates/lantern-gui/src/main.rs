@@ -107,6 +107,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // And the profile, which the port alone doesn't protect: the GTK app
+    // and the CLI run engines too, without this port. Two engines on one
+    // profile announce one identity twice and peers deliver to whichever
+    // they heard last — see `lock_profile`.
+    let _profile = match lantern_core::lock_profile(&data_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     let (core, mut events_rx) = Core::start(CoreConfig {
         data_dir: data_dir.clone(),
         display_name: name.clone(),

@@ -101,7 +101,18 @@ fn main() -> glib::ExitCode {
         .map(|v| v != "false")
         .unwrap_or(true);
 
-    let core = rt.block_on(async {
+    // The profile lock comes first, before any engine exists. Without it a
+    // second launch started a whole core — beaconing a fresh QUIC port —
+    // only to hand off to the running window and exit, and with the web
+    // engine (lantern-gui) already on the profile, two engines answered for
+    // one identity. Now there is no core unless this process owns the
+    // profile. A second GTK launch still just focuses the first window
+    // (GApplication does that before activate ever runs here); any other
+    // holder gets told why below.
+    let profile = lantern_core::lock_profile(&data_dir);
+    let profile_err = profile.as_ref().err().cloned();
+
+    let core = profile.is_ok().then(|| rt.block_on(async {
         let (core, mut events) = Core::start(CoreConfig {
             data_dir: data_dir.clone(),
             display_name: name.clone(),
@@ -128,14 +139,18 @@ fn main() -> glib::ExitCode {
             }
         });
         core
-    });
+    }));
 
-    let backend = Rc::new(Backend {
-        core,
-        rt: rt_handle,
-        my_name: name,
-        data_dir,
+    let backend = core.map(|core| {
+        Rc::new(Backend {
+            core,
+            rt: rt_handle,
+            my_name: name,
+            data_dir: data_dir.clone(),
+        })
     });
+    // Held for the life of the process.
+    let _profile = profile;
 
     // Keep the runtime alive for the whole app lifetime.
     std::mem::forget(rt);
@@ -164,10 +179,59 @@ fn main() -> glib::ExitCode {
             w.present();
             return;
         }
-        let w = build_ui(app, Rc::clone(&backend), event_rx.borrow_mut().take());
+        let Some(backend) = backend.as_ref() else {
+            let why = profile_err.clone().unwrap_or_default();
+            *window_slot.borrow_mut() = Some(already_running_window(app, &why));
+            return;
+        };
+        let w = build_ui(app, Rc::clone(backend), event_rx.borrow_mut().take());
         *window_slot.borrow_mut() = Some(w);
     });
     app.run()
+}
+
+/// Another engine owns this profile — usually the web version a browser
+/// launcher started. Say so and which one, rather than run a second node
+/// with the same identity or crash on the way up.
+fn already_running_window(app: &gtk::Application, why: &str) -> gtk::ApplicationWindow {
+    let w = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title("Lantern")
+        .default_width(440)
+        .resizable(false)
+        .build();
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    v.set_margin_top(20);
+    v.set_margin_bottom(18);
+    v.set_margin_start(20);
+    v.set_margin_end(20);
+    let heading = gtk::Label::new(Some("Lantern is already running"));
+    heading.add_css_class("title-3");
+    heading.set_halign(gtk::Align::Start);
+    let detail = gtk::Label::new(Some(&format!(
+        "{why}\n\nIf that's the browser version, close it (or run \
+         pkill -f lantern-gui) and open Lantern again."
+    )));
+    detail.set_wrap(true);
+    detail.set_xalign(0.0);
+    detail.set_selectable(true);
+    detail.add_css_class("dim-label");
+    let close = gtk::Button::with_label("Close");
+    close.set_halign(gtk::Align::End);
+    {
+        let w = w.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.close();
+            }
+        });
+    }
+    v.append(&heading);
+    v.append(&detail);
+    v.append(&close);
+    w.set_child(Some(&v));
+    w.present();
+    w
 }
 
 // ---- small formatting helpers ------------------------------------------
