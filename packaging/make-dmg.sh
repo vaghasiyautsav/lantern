@@ -68,6 +68,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>NSHighResolutionCapable</key><true/>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Lantern finds the other computers running Lantern on this network, and sends your messages and files straight to them. Nothing goes over the internet.</string>
+  <key>NSBonjourServices</key>
+  <array><string>_lantern-check._tcp</string></array>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

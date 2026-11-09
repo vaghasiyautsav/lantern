@@ -11,6 +11,7 @@
 import SwiftUI
 import AppKit
 import ImageIO
+import Network
 import UniformTypeIdentifiers
 import UserNotifications
 
@@ -70,6 +71,74 @@ let DATA_DIR: URL = ProcessInfo.processInfo.environment["LANTERN_DATA_DIR"]
     .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
     ?? FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".lantern")
+
+// MARK: - Local Network permission
+
+/// macOS Local Network privacy, asked for — and read back — by the app.
+///
+/// All of Lantern's LAN traffic comes from the engine, a helper binary, and
+/// macOS never put the question to anyone on its behalf: the permission sat
+/// at "not decided", which macOS treats as *no* for anything Lantern starts
+/// while still letting it *answer* others. So every Mac saw every other one
+/// — beacons arrive, and replies to them pass — and messages went nowhere,
+/// because opening a connection to send one is not a reply. It failed as
+/// "No route to host", deep in the engine's log.
+///
+/// A Bonjour browse from the app itself is what makes macOS ask, and its
+/// policy-denied error is the one dependable way to read the answer: browse
+/// for a throwaway service we also advertise; seeing it means allowed.
+/// The permission covers the engine too — macOS charges it to this app.
+final class LocalNetworkCheck: @unchecked Sendable {
+    private var browser: NWBrowser?
+    private var listener: NWListener?
+    private let type = "_lantern-check._tcp"
+    private let name = "lantern-check-" + UUID().uuidString.prefix(8)
+    /// true = allowed, false = denied. Called on the main queue, on change.
+    private let onChange: (Bool) -> Void
+    private var last: Bool?
+
+    init(onChange: @escaping (Bool) -> Void) { self.onChange = onChange }
+
+    func start() {
+        guard browser == nil else { return }
+        if let listener = try? NWListener(using: .tcp) {
+            listener.service = NWListener.Service(name: name, type: type)
+            listener.newConnectionHandler = { $0.cancel() }
+            listener.start(queue: .main)
+            self.listener = listener
+        }
+        let browser = NWBrowser(for: .bonjour(type: type, domain: nil), using: .tcp)
+        browser.stateUpdateHandler = { [weak self] state in
+            // kDNSServiceErr_PolicyDenied: Local Network access is refused
+            // (or was never decided, which macOS treats the same).
+            if case .waiting(let error) = state, case .dns(let code) = error, code == -65570 {
+                self?.report(false)
+            }
+        }
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self else { return }
+            let seen = results.contains {
+                if case .service(let n, _, _, _) = $0.endpoint { return n == self.name }
+                return false
+            }
+            if seen { self.report(true) }
+        }
+        browser.start(queue: .main)
+        self.browser = browser
+    }
+
+    private func report(_ allowed: Bool) {
+        guard allowed != last else { return }
+        last = allowed
+        onChange(allowed)
+        // Once allowed there is nothing left to watch; until then keep
+        // browsing, so flipping the switch in Settings is noticed at once.
+        if allowed {
+            browser?.cancel()
+            listener?.cancel()
+        }
+    }
+}
 
 // MARK: - Wire models
 
@@ -283,6 +352,19 @@ final class Model: ObservableObject {
     /// Whether discovery can reach the network at all. Drives the one banner
     /// that explains an empty sidebar in terms someone can act on.
     @Published var link = LinkInfo(status: "ok")
+    /// macOS Local Network permission: nil until known. `false` means
+    /// people may still appear, but nothing sent can reach them.
+    @Published var localNetwork: Bool?
+    private var localNetworkCheck: LocalNetworkCheck?
+
+    /// What the sidebar banner should say. macOS's own answer wins over the
+    /// engine's view: a refusal that still lets beacons in looks healthy
+    /// from inside the engine.
+    var linkForBanner: LinkInfo {
+        localNetwork == false
+            ? LinkInfo(status: "blocked", detail: "Local Network access is off for Lantern")
+            : link
+    }
     /// What our beacons announce: "active", "away" or "dnd".
     @Published var presence = "active"
     /// Sidebar search across every conversation; non-empty swaps the roster
@@ -316,6 +398,21 @@ final class Model: ObservableObject {
     var hasGroups: Bool { peers.contains { !($0.group ?? "").isEmpty } }
 
     func start() {
+        let check = LocalNetworkCheck { [weak self] allowed in
+            Task { @MainActor in
+                guard let self else { return }
+                let was = self.localNetwork
+                self.localNetwork = allowed
+                // Just allowed: ask everyone to check in, so the roster and
+                // the queued messages move now rather than a heartbeat later.
+                if allowed && was == false {
+                    _ = await self.postJSON("/api/refresh", [:])
+                    await self.refreshPeers()
+                }
+            }
+        }
+        localNetworkCheck = check
+        check.start()
         Task {
             // Engine may still be booting; poll until it answers.
             for _ in 0..<80 {
@@ -1252,10 +1349,10 @@ struct LinkBanner: View {
                         ? "hand.raised.fill" : "wifi.slash")
                     .font(.system(size: 12, weight: .semibold))
                 Text(link.status == "blocked"
-                    ? "Lantern isn't allowed to use the local network, so nobody "
-                        + "here can see this Mac and it can't see them. Turn "
-                        + "Lantern on under Privacy & Security → Local Network; "
-                        + "it reconnects by itself."
+                    ? "Lantern isn't allowed to use the local network. People "
+                        + "may still show up here, but nothing you send can "
+                        + "reach them. Turn Lantern on under Privacy & Security "
+                        + "→ Local Network; it reconnects by itself."
                     : "People appear as soon as Wi-Fi or Ethernet is back.")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
@@ -2533,7 +2630,7 @@ struct ContentView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 4)
 
-                LinkBanner(link: model.link)
+                LinkBanner(link: model.linkForBanner)
 
                 if !model.search.isEmpty {
                     searchResults
