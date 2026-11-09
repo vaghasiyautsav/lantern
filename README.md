@@ -97,7 +97,10 @@ after an update rebuilds the app.
 **People show up but messages stay at "Sending…"?** On macOS that is the same
 permission, half-applied: until it's granted, macOS lets Lantern *answer*
 other machines — so they appear — but not start a connection, which is what
-sending is. Allow it and the queued messages go within seconds.
+sending is. Allow it and the queued messages go within seconds. If Lantern
+is already switched on there and messages still don't go, update Lantern.
+Builds before 0.2.3 weren't signed under Lantern's own name, so macOS didn't
+apply that switch to the app that was actually running.
 
 Lantern also asks everyone to check in again by itself when the machine wakes
 from sleep or changes network, and answers each newcomer directly rather than

@@ -230,6 +230,11 @@ when someone clicks a button, in a script the app hands off to, keeps that.
 An automatic one wouldn't — so if a future session is tempted by "just check
 once a day in the background", the answer is still no.
 8. Received paths are normalized and confined to the destination root.
+9. The macOS app is **signed as `local.lantern.gui`** (ad-hoc is enough) in
+   every script that builds it — `install.sh` and `packaging/make-dmg.sh`.
+   macOS matches the Local Network switch by code-signing identifier, and
+   swiftc alone signs it as the executable's name. Unsigned, the switch can
+   read On while every outgoing message fails (9 Nov 2026).
 
 ## Fixed 17 Aug 2026 — LAN discovery never left the machine
 
@@ -674,21 +679,40 @@ both and record it here.
 
 ## 9 Nov 2026 — "the other Mac is there but messages don't send"; Linux opened in a browser
 
-**macOS: Local Network permission was never decided.** Read straight from
-`/Library/Preferences/com.apple.networkextension.plist`: `local.lantern.gui`
-had `DenyMulticast = true` and `MulticastPreferenceSet = false` — no answer
-ever recorded (every app the user *had* allowed shows `false`/`true`). macOS
-treats undecided as no for traffic the app **starts**, but lets it **answer**:
-beacons came in, replies to them went out (including the new unicast copies,
-which is why a fresh peer's reply worked and the same send 37 s later
-didn't), inbound sessions from Linux delivered fine — and every outbound
-QUIC dial failed in quinn-udp with EHOSTUNREACH. Seen, never sent. Nobody was
-asked because all LAN traffic comes from the engine, a helper binary. The app
-now runs `LocalNetworkCheck` at launch: a Bonjour browse for a throwaway
-service it also advertises, which is what makes macOS show the prompt, and
-whose `kDNSServiceErr_PolicyDenied` is the reliable read-back. Denied → the
-banner (overriding the engine's link status, which looked healthy); allowed →
-`/api/refresh` so the queue flushes now. `NSBonjourServices` added.
+**macOS: the Local Network switch was On, but not for the app that ran.**
+macOS treats an app without a decision as no for traffic it **starts**, but
+lets it **answer**: beacons came in, replies to them went out (including the
+new unicast copies, which is why a fresh peer's reply worked and the same
+send 37 s later didn't), inbound sessions from Linux delivered fine, and
+every outbound QUIC dial failed in quinn-udp with EHOSTUNREACH. Seen, never
+sent.
+
+The cause took two passes to find. `com.apple.networkextension.plist` holds
+**one `networkprivacy-<GeneratedUID>` configuration per user**, and this Mac
+has a stale one from a user that no longer exists. The first read hit that one
+(`DenyMulticast = true`, `MulticastPreferenceSet = false`) and wrongly
+concluded "never decided". Match the suffix to
+`dscl . -read /Users/$USER GeneratedUID`. The real user's rule for
+`local.lantern.gui` was **allowed** and had been since 7 Nov. But the rules
+match on `SigningIdentifier` (no designated requirement), and install.sh only
+ever ran swiftc, whose linker signature names the code `Lantern`. No rule
+matched `Lantern`, so it was undecided-hence-denied. And macOS never
+prompted, presumably because it had already recorded an answer for the
+bundle id. Re-signing the installed bundle (`codesign --force --sign -`) and
+relaunching it delivered all 11 queued messages within two seconds, with no
+prompt and no change to any setting. install.sh and make-dmg.sh now sign
+(invariant 9). The DMG's main executable is a bash bootstrap that execs
+`LanternShell`, so `LanternShell` gets the identifier too. Check it with
+`codesign -dv /Applications/Lantern.app` → `Identifier=local.lantern.gui`.
+
+Kept from the first pass: the app runs `LocalNetworkCheck` at launch, a
+Bonjour browse for a throwaway service it also advertises. On a first install
+that is what makes macOS show the prompt, and its
+`kDNSServiceErr_PolicyDenied` is the reliable read-back. Denied → the banner
+(overriding the engine's link status, which looked healthy). Allowed →
+`/api/refresh`, so the queue flushes now. `NSBonjourServices` added. The engine
+inherits the app's responsibility (it's spawned by it), so only the app needs
+the identifier. The engine binary keeps its linker signature.
 
 **Not detected by the 31 Oct link check**, and that's worth knowing: it calls
 the link blocked only when *every* LAN send fails, and here the directed
