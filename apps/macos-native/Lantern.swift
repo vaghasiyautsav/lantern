@@ -2198,6 +2198,135 @@ struct ComposerField: NSViewRepresentable {
     }
 }
 
+/// Keeps a SwiftUI ScrollView pinned to its end while the person is reading
+/// the end, and leaves it alone once they scroll away. Put it in the
+/// background of a marker at the very end of the scroll view's content.
+///
+/// This has to be AppKit, not SwiftUI. On macOS a GeometryReader isn't
+/// re-measured when the view only scrolls, so SwiftUI can't tell a scroll
+/// from content growing. And `ScrollViewProxy.scrollTo` can land a little
+/// short of the end, leaving part of the last message under the composer.
+/// The NSScrollView behind every SwiftUI ScrollView knows exactly where
+/// the scroll position and the end are.
+struct ScrollWatcher: NSViewRepresentable {
+    let handle: ScrollEndHandle
+    /// Called whenever following may have changed: true while the view is
+    /// following the end of the content.
+    var onChange: (_ following: Bool) -> Void
+
+    func makeNSView(context: Context) -> WatcherView {
+        let v = WatcherView()
+        v.onChange = onChange
+        handle.view = v
+        return v
+    }
+
+    func updateNSView(_ v: WatcherView, context: Context) {
+        v.onChange = onChange
+        handle.view = v
+    }
+
+    /// Lives in the content, so its own frame is the position of the end
+    /// marker it's the background of.
+    final class WatcherView: NSView {
+        var onChange: ((Bool) -> Void)?
+        /// Scrolled to the end — by the person or by us — and not scrolled
+        /// away since. While this holds, anything that changes size (a
+        /// message arriving, the composer growing, a preview loading) is
+        /// followed down to the new end at once.
+        private(set) var following = true
+        private weak var watched: NSScrollView?
+        private var last: (offset: CGFloat, visible: CGFloat, content: CGFloat)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            attach()
+            // The scroll view may not be assembled around us yet.
+            DispatchQueue.main.async { [weak self] in self?.attach() }
+        }
+
+        private func attach() {
+            guard let sv = enclosingScrollView, sv !== watched else { return }
+            let center = NotificationCenter.default
+            center.removeObserver(self)
+            watched = sv
+            last = nil
+            let clip = sv.contentView
+            clip.postsBoundsChangedNotifications = true
+            clip.postsFrameChangedNotifications = true
+            center.addObserver(self, selector: #selector(changed),
+                               name: NSView.boundsDidChangeNotification, object: clip)
+            center.addObserver(self, selector: #selector(changed),
+                               name: NSView.frameDidChangeNotification, object: clip)
+            if let doc = sv.documentView {
+                doc.postsFrameChangedNotifications = true
+                center.addObserver(self, selector: #selector(changed),
+                                   name: NSView.frameDidChangeNotification, object: doc)
+            }
+            // The marker moving down as messages arrive.
+            postsFrameChangedNotifications = true
+            center.addObserver(self, selector: #selector(changed),
+                               name: NSView.frameDidChangeNotification, object: self)
+            changed()
+        }
+
+        /// Puts the end marker at the bottom edge of the visible area.
+        func scrollToEnd() {
+            following = true
+            guard let sv = watched, let doc = sv.documentView else { return }
+            let clip = sv.contentView
+            let visible = clip.documentVisibleRect
+            let marker = convert(bounds, to: doc)
+            let y = doc.isFlipped ? marker.maxY - visible.height : marker.minY
+            let top = max(0, doc.frame.height - visible.height)
+            let target = NSPoint(x: visible.minX, y: min(max(0, y), top))
+            if abs(target.y - visible.minY) > 0.5 {
+                clip.scroll(to: target)
+                sv.reflectScrolledClipView(clip)
+            }
+            onChange?(following)
+        }
+
+        @objc private func changed() {
+            guard let sv = watched, let doc = sv.documentView else { return }
+            let visible = sv.contentView.documentVisibleRect
+            let marker = convert(bounds, to: doc)
+            let content = doc.frame.height
+            let offset = doc.isFlipped ? visible.minY : content - visible.maxY
+            // Points of content below the visible area.
+            let distance = doc.isFlipped
+                ? marker.maxY - visible.maxY
+                : visible.minY - marker.minY
+            // A scroll is the position moving while the visible area and the
+            // content both keep their size. When the composer grows or
+            // shrinks AppKit nudges the position to fit; that isn't the
+            // person scrolling away, and mustn't stop the following.
+            var scrolled = true
+            if let last {
+                scrolled = abs(last.offset - offset) > 0.5
+                    && abs(last.visible - visible.height) < 0.5
+                    && abs(last.content - content) < 0.5
+            }
+            last = (offset, visible.height, content)
+            if scrolled {
+                following = distance <= 60
+            } else if following && distance > 0.5 {
+                scrollToEnd()
+                return
+            }
+            onChange?(following)
+        }
+
+        deinit { NotificationCenter.default.removeObserver(self) }
+    }
+}
+
+/// Lets SwiftUI ask the ScrollWatcher for an exact scroll to the end.
+final class ScrollEndHandle {
+    weak var view: ScrollWatcher.WatcherView?
+    func scrollToEnd() { view?.scrollToEnd() }
+}
+
 struct ConversationView: View {
     @EnvironmentObject var model: Model
     /// A file is being dragged over the conversation, or over the composer
@@ -2211,6 +2340,21 @@ struct ConversationView: View {
     /// Clearing a conversation can't be undone, so it asks first. Non-nil
     /// while the confirmation is up, and carries who it's about.
     @State private var confirmClear: Peer?
+    /// The view is following the end of the conversation: it was scrolled
+    /// to the end, by the person or by us, and hasn't been scrolled away
+    /// since. An incoming message moves the view only then; someone reading
+    /// back through history isn't yanked down, they get the pill instead.
+    @State private var following = true
+    /// Incoming messages that arrived while scrolled up — the pill's count.
+    @State private var unseenBelow = 0
+    /// The last message the view has already reacted to. nil while a
+    /// conversation is (re)loading, so the list that arrives reads as
+    /// "opened", not as one very large new message.
+    @State private var shownLast: String?
+    /// Reaches the ScrollWatcher, for an exact scroll to the end.
+    @State private var scroller = ScrollEndHandle()
+
+    private static let bottomID = "lantern-conversation-bottom"
 
     private var canSend: Bool {
         !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2244,6 +2388,81 @@ struct ConversationView: View {
         }
     }
 
+    /// Bring the end of the conversation fully into view, above the composer.
+    ///
+    /// In passes, on purpose. A new row is laid out *after* the change that
+    /// added it has been handled, so a scroll issued straight away aims at
+    /// the old bottom and stops one message short — the message just sent
+    /// or received, left hidden behind the composer. So SwiftUI scrolls a
+    /// run-loop turn later, and the watcher then puts the end exactly at
+    /// the bottom edge. Once that has happened the watcher keeps it there
+    /// by itself.
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        unseenBelow = 0
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(Self.bottomID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(Self.bottomID, anchor: .bottom)
+                DispatchQueue.main.async { scroller.scrollToEnd() }
+            }
+        }
+        // After any slide has finished.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            scroller.scrollToEnd()
+        }
+    }
+
+    /// Called on every change to the timeline: decides whether this one
+    /// moves the view, and where to.
+    private func itemsChanged(_ proxy: ScrollViewProxy) {
+        // History is cleared before it reloads; nothing to aim at until it's
+        // back, and what comes back is a conversation being opened.
+        guard let last = model.items.last else {
+            shownLast = nil
+            unseenBelow = 0
+            return
+        }
+        // Opened from a search hit: land on the hit, not the bottom. A hit
+        // older than the loaded history just opens the conversation.
+        if let target = model.pendingJump {
+            model.pendingJump = nil
+            if model.items.contains(where: { $0.id == target }) {
+                shownLast = last.id
+                DispatchQueue.main.async { jump(to: target, proxy) }
+                return
+            }
+        }
+        if shownLast == nil {
+            // Just opened: start at the latest message, without a slide.
+            shownLast = last.id
+            scrollToBottom(proxy, animated: false)
+        } else if last.id != shownLast {
+            shownLast = last.id
+            // Your own message always comes into view. Theirs does when you
+            // were following the end; otherwise it waits behind the pill.
+            // (The watcher's answer, not the state mirrored from it: this
+            // runs before SwiftUI has re-rendered.)
+            if last.outgoing || (scroller.view?.following ?? true) {
+                scrollToBottom(proxy, animated: true)
+            } else {
+                unseenBelow += 1
+            }
+        }
+        // Same messages with new heights — a delivery tick, a transfer card
+        // finishing with its preview — need nothing here: the watcher
+        // follows any change of size while the end is being read.
+    }
+
+    /// Mirrors the watcher's answer into state, for the pill — touching
+    /// state only when it actually flips.
+    private func followingChanged(_ now: Bool) {
+        if now != following { following = now }
+        if now && unseenBelow > 0 { unseenBelow = 0 }
+    }
+
     /// A new run starts on a change of sender, or after a five-minute gap —
     /// long enough that the next line reads as a new thought.
     private func startsRun(_ item: ChatItem, after prev: ChatItem?) -> Bool {
@@ -2258,6 +2477,48 @@ struct ConversationView: View {
         guard let prev else { return true }
         let cal = Calendar.current
         return !cal.isDate(dateOf(prev.ts), inSameDayAs: dateOf(item.ts))
+    }
+
+    /// How many of the newest messages are built eagerly, below the lazily
+    /// built history. See the comment where the two stacks meet.
+    private static let eagerTail = 50
+
+    /// One message as the timeline shows it, with the day separator above
+    /// it when it starts a new day. `idx` is its place in `model.items`.
+    @ViewBuilder
+    private func messageRow(_ idx: Int, _ item: ChatItem, peer: Peer,
+                            proxy: ScrollViewProxy) -> some View {
+        let prev = idx > 0 ? model.items[idx - 1] : nil
+        if needsDaySeparator(item, after: prev) {
+            DaySeparator(ts: item.ts)
+        }
+        let next = idx + 1 < model.items.count ? model.items[idx + 1] : nil
+        MessageRow(
+            item: item,
+            peerName: peer.name,
+            myName: model.me?.name ?? "Me",
+            showsHeader: startsRun(item, after: prev),
+            endsRun: next.map { startsRun($0, after: item) } ?? true,
+            quoted: quoted(for: item, peerName: peer.name),
+            onReply: {
+                model.replyingTo = item
+                model.focusComposer += 1
+            },
+            onOpenSealed: {
+                model.openSealed(item.id)
+            },
+            onJumpToQuoted: {
+                if let rid = item.replyTo {
+                    jump(to: rid, proxy)
+                }
+            },
+            onDelete: { model.deleteMessage(item) },
+            filePath: model.filePaths[item.id])
+            .id(item.id)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.accentColor.opacity(
+                        highlighted == item.id ? 0.13 : 0)))
     }
 
     var body: some View {
@@ -2331,68 +2592,76 @@ struct ConversationView: View {
                 // Messages
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
+                      VStack(spacing: 0) {
+                        let indexed = Array(model.items.enumerated())
+                        let split = max(0, indexed.count - Self.eagerTail)
+                        VStack(alignment: .leading, spacing: 0) {
                             if model.items.isEmpty {
                                 ConversationStarter(peer: peer)
                             }
-                            ForEach(Array(model.items.enumerated()),
-                                    id: \.element.id) { idx, item in
-                                let prev = idx > 0 ? model.items[idx - 1] : nil
-                                if needsDaySeparator(item, after: prev) {
-                                    DaySeparator(ts: item.ts)
+                            // Older history, built as it scrolls into view.
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(indexed[..<split], id: \.element.id) { idx, item in
+                                    messageRow(idx, item, peer: peer, proxy: proxy)
                                 }
-                                let next = idx + 1 < model.items.count
-                                    ? model.items[idx + 1] : nil
-                                MessageRow(
-                                    item: item,
-                                    peerName: peer.name,
-                                    myName: model.me?.name ?? "Me",
-                                    showsHeader: startsRun(item, after: prev),
-                                    endsRun: next.map {
-                                        startsRun($0, after: item)
-                                    } ?? true,
-                                    quoted: quoted(for: item, peerName: peer.name),
-                                    onReply: {
-                                        model.replyingTo = item
-                                        model.focusComposer += 1
-                                    },
-                                    onOpenSealed: {
-                                        model.openSealed(item.id)
-                                    },
-                                    onJumpToQuoted: {
-                                        if let rid = item.replyTo {
-                                            jump(to: rid, proxy)
-                                        }
-                                    },
-                                    onDelete: { model.deleteMessage(item) },
-                                    filePath: model.filePaths[item.id])
-                                    .id(item.id)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .fill(Color.accentColor.opacity(
-                                                highlighted == item.id ? 0.13 : 0)))
+                            }
+                            // The newest messages, built eagerly. A LazyVStack
+                            // sizes the scroll view from *estimates* for rows
+                            // it hasn't built, and with bubbles of every
+                            // height the estimate came up short: the end of
+                            // the scrollable area sat up to 120pt above the
+                            // real last message, so nothing could scroll it
+                            // into view and it stayed behind the composer.
+                            // Laid out for real, the end is where it says.
+                            // Not everything: 500 messages built eagerly
+                            // took 1.5s to open and 0.3s per message sent.
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(indexed[split...], id: \.element.id) { idx, item in
+                                    messageRow(idx, item, peer: peer, proxy: proxy)
+                                }
                             }
                         }
                         .padding(14)
+
+                        // The end of the conversation, as something to scroll
+                        // to. Below the padding, so the last message lands
+                        // with room under it instead of flush against the
+                        // composer. It also carries the scroll watcher.
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.bottomID)
+                            .background(ScrollWatcher(handle: scroller) { now in
+                                followingChanged(now)
+                            })
+                      }
                     }
-                    .onChange(of: model.items) { _ in
-                        // History is cleared before it reloads; nothing to
-                        // aim at until it's back.
-                        guard !model.items.isEmpty else { return }
-                        // Opened from a search hit: land on the hit, not the
-                        // bottom. A hit older than the loaded history just
-                        // opens the conversation.
-                        if let target = model.pendingJump {
-                            model.pendingJump = nil
-                            if model.items.contains(where: { $0.id == target }) {
-                                DispatchQueue.main.async { jump(to: target, proxy) }
-                                return
+                    .onChange(of: model.items) { _ in itemsChanged(proxy) }
+                    // The composer growing, or the reply strip appearing,
+                    // takes height from this view; the watcher sees the
+                    // visible area shrink and keeps the end in view.
+                    .overlay(alignment: .bottom) {
+                        if unseenBelow > 0 && !following {
+                            Button {
+                                scrollToBottom(proxy, animated: true)
+                            } label: {
+                                Label(unseenBelow == 1
+                                        ? "1 new message"
+                                        : "\(unseenBelow) new messages",
+                                      systemImage: "arrow.down")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(Capsule().fill(Color.accentColor))
+                                    .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
                             }
-                        }
-                        if let last = model.items.last {
-                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                            .buttonStyle(.plain)
+                            .padding(.bottom, 10)
+                            .transition(.opacity)
+                            .help("Jump to the latest message")
                         }
                     }
+                    .animation(.easeOut(duration: 0.15), value: unseenBelow > 0 && !following)
                 }
 
                 Divider()

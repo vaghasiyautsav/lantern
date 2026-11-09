@@ -671,38 +671,50 @@ fn build_ui(
     // So let the adjustment announce when it has grown, and follow only when
     // the view is already parked at the bottom: someone who scrolled up to
     // read should not be yanked back down because a message arrived.
-    // Two things make this harder than it looks.
     //
-    // A row's height is unknown until GTK allocates it, which happens on the
-    // frame clock — after any idle callback we could queue — and a wrapped
-    // label can take more than one layout pass to settle, each pass pushing
-    // the bottom further down. So pin across a few frames instead of trying
-    // to guess the one correct moment.
-    //
-    // And the bottom is `upper - page_size`; `upper` alone is the full
-    // content height, which just clamps and lands short.
+    // A row's height is unknown until GTK allocates it, and a wrapped label
+    // or an inline image can take more than one layout pass to settle, each
+    // pushing the bottom further down. Pinning across a fixed number of
+    // frames (four, until 9 Nov 2026) still lost to that: the newest message
+    // ended up hidden under the composer. So `stick` records whether the
+    // view is parked at the end — the user's own scrolling sets and clears
+    // it — and while it's set, every change in content height (`upper`) or
+    // visible height (`page-size`, the window resized) follows the end down
+    // once that layout pass is done.
+    let stick = Rc::new(std::cell::Cell::new(true));
+    {
+        let adj = msg_scroll.vadjustment();
+        let s = Rc::clone(&stick);
+        adj.connect_value_changed(move |a| {
+            s.set(a.value() >= a.upper() - a.page_size() - 24.0);
+        });
+        let follow = {
+            let s = Rc::clone(&stick);
+            move |a: &gtk::Adjustment| {
+                if !s.get() {
+                    return;
+                }
+                // Notified mid-layout; move once it's done, not during it.
+                let a = a.clone();
+                glib::idle_add_local_once(move || a.set_value(a.upper() - a.page_size()));
+            }
+        };
+        adj.connect_upper_notify(follow.clone());
+        adj.connect_page_size_notify(follow);
+    }
     let pin_to_bottom = {
         let msg_scroll = msg_scroll.clone();
+        let stick = Rc::clone(&stick);
         move || {
-            // A tick callback is `Fn`, so the frame counter needs a Cell.
-            let frames = std::cell::Cell::new(0u32);
-            msg_scroll.add_tick_callback(move |sw, _| {
-                let a = sw.vadjustment();
-                a.set_value(a.upper() - a.page_size());
-                frames.set(frames.get() + 1);
-                if frames.get() < 4 {
-                    glib::ControlFlow::Continue
-                } else {
-                    glib::ControlFlow::Break
-                }
-            });
+            stick.set(true);
+            let a = msg_scroll.vadjustment();
+            a.set_value(a.upper() - a.page_size());
         }
     };
 
     // One chat row: avatar and bubble, mirrored for our own messages.
     let append_row = {
         let msg_box = msg_box.clone();
-        let msg_scroll = msg_scroll.clone();
         let pin_to_bottom = pin_to_bottom.clone();
         move |outgoing: bool,
               sender: &str,
@@ -763,17 +775,13 @@ fn build_ui(
                 row.append(&column);
             }
 
-            // Decide *before* appending. Afterwards the adjustment has
-            // already grown by a row, so the view always measures as "not at
-            // the bottom" and following would never happen — which is
-            // precisely how this broke before.
-            let adj = msg_scroll.vadjustment();
-            let was_at_bottom = adj.value() >= adj.upper() - adj.page_size() - 24.0;
-
             msg_box.append(&row);
 
-            // Someone who scrolled up to read history stays where they are.
-            if was_at_bottom {
+            // Our own rows always come into view. Anyone else's follow in
+            // only if the view was already at the end — `stick` knows, and
+            // the adjustment handlers above do the following once the row
+            // has a height. Someone reading back through history stays put.
+            if outgoing {
                 pin_to_bottom();
             }
         }
