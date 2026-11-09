@@ -1255,38 +1255,41 @@ struct SidebarRow: View {
     var dropTargeted = false
 
     var body: some View {
-        HStack(spacing: 10) {
-            AvatarView(name: peer.name, colorKey: peer.id, online: peer.online,
-                       state: peer.state)
-            VStack(alignment: .leading, spacing: 1) {
+        HStack(spacing: 11) {
+            // Sized with the name: the sidebar's default type read small
+            // next to the conversation, and a bigger name over the old
+            // avatar looked top-heavy.
+            AvatarView(name: peer.name, colorKey: peer.id, size: 38,
+                       online: peer.online, state: peer.state)
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(peer.name)
-                        .fontWeight(.medium)
+                        .font(.system(size: 14, weight: .semibold))
                         .lineLimit(1)
                         .foregroundColor(peer.online ? .primary : .secondary)
                     if peer.verified {
                         Image(systemName: "checkmark.shield.fill")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundColor(.green)
                             .help("Identity verified by safety words")
                     }
                 }
                 Text(peer.subtitle)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
             }
             Spacer()
             if unread > 0 {
                 Text(String(unread))
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 7)
                     .padding(.vertical, 2)
                     .background(Capsule().fill(Color.accentColor))
             }
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
         .padding(.horizontal, 4)
         .background(
             RoundedRectangle(cornerRadius: 7)

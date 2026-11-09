@@ -369,6 +369,10 @@ const STYLE: &str = "
 /* Presence has a colour and a word (the row's subtitle says it too), so it
    never rests on hue alone. */
 .lantern-dot { font-size: 0.7em; }
+/* Sidebar names read small at the label default next to the conversation;
+   the subtitle was the 0.8em meta size, which was smaller still. */
+.lantern-peer-name { font-size: 1.12em; font-weight: 600; }
+.lantern-peer-sub { font-size: 0.9em; }
 .lantern-peer-row:drop(active) {
     background-color: alpha(@theme_selected_bg_color, 0.22);
     border-radius: 8px;
@@ -1081,13 +1085,15 @@ fn build_ui(
                 row.set_margin_bottom(6);
                 row.set_margin_start(10);
                 row.set_margin_end(8);
-                row.append(&avatar(&p.name, &hex::encode(p.id), 34));
+                row.append(&avatar(&p.name, &hex::encode(p.id), 38));
 
-                let text_col = gtk::Box::new(gtk::Orientation::Vertical, 1);
+                let text_col = gtk::Box::new(gtk::Orientation::Vertical, 2);
                 text_col.set_hexpand(true);
                 text_col.set_valign(gtk::Align::Center);
                 let n = gtk::Label::new(None);
                 n.set_halign(gtk::Align::Start);
+                n.add_css_class("lantern-peer-name");
+                n.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 // The tick means an out-of-band safety-word comparison
                 // happened — never that the transport is merely encrypted.
                 if backend.core.is_verified(&p.id) {
@@ -1114,7 +1120,8 @@ fn build_ui(
                 let h = gtk::Label::new(Some(&sub));
                 h.set_halign(gtk::Align::Start);
                 h.add_css_class("dim-label");
-                h.add_css_class("lantern-meta");
+                h.add_css_class("lantern-peer-sub");
+                h.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 if !p.online {
                     row.set_opacity(0.5);
                 }
