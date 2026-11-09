@@ -91,9 +91,13 @@ read, though the doctor sets `SO_REUSEPORT` and can run alongside it.
 **First, look at the sidebar.** If the operating system is refusing
 Lantern's traffic, the app says so there. On macOS that is almost always
 **Local Network privacy**: System Settings → Privacy & Security → Local
-Network → turn Lantern on. macOS asks once, and can ask again after an update
-rebuilds the app; until it's answered yes, nobody can appear. Lantern
-reconnects by itself within a few seconds of being allowed.
+Network → turn Lantern on. macOS asks when Lantern opens, and can ask again
+after an update rebuilds the app.
+
+**People show up but messages stay at "Sending…"?** On macOS that is the same
+permission, half-applied: until it's granted, macOS lets Lantern *answer*
+other machines — so they appear — but not start a connection, which is what
+sending is. Allow it and the queued messages go within seconds.
 
 Lantern also asks everyone to check in again by itself when the machine wakes
 from sleep or changes network, and answers each newcomer directly rather than
@@ -114,6 +118,11 @@ Known causes, in the order the doctor checks them:
    only to `255.255.255.255`, which the kernel emits on a single interface — on
    a machine with Docker, libvirt or a VPN up, usually the wrong one. The CLI
    also defaulted `--broadcast` to false. Both are fixed; rebuild both sides.
+
+**Linux, after an Ubuntu upgrade:** the upgrade removes GTK's development
+files, so an update can't rebuild the native app. Lantern now stops and says
+so instead of falling back to the browser version; run
+`sudo apt install libgtk-4-dev` and update again.
 
 ## Same-machine test (two instances)
 

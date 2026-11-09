@@ -63,7 +63,7 @@ cost more than the features did. So:
 6. **Say what you are mid-way through** in the Status section below before
    you stop. That is the only channel between the two machines.
 
-## Status (last update: 31 Oct 2026 — see "31 Oct 2026" below)
+## Status (last update: 9 Nov 2026 — see "31 Oct 2026" and "9 Nov 2026" below)
 
 **Working, tested:** engine — signed-beacon discovery (see the 17 Aug fix
 below — cross-machine discovery was broken until then), identity-pinned
@@ -671,6 +671,51 @@ warning-free and its engine discovered a loopback peer. **Not verified:** the
 SwiftUI and GTK windows were not looked at on screen, and the cross-machine
 Wi-Fi behaviour needs the Linux box on this build — run `lantern-doctor` on
 both and record it here.
+
+## 9 Nov 2026 — "the other Mac is there but messages don't send"; Linux opened in a browser
+
+**macOS: Local Network permission was never decided.** Read straight from
+`/Library/Preferences/com.apple.networkextension.plist`: `local.lantern.gui`
+had `DenyMulticast = true` and `MulticastPreferenceSet = false` — no answer
+ever recorded (every app the user *had* allowed shows `false`/`true`). macOS
+treats undecided as no for traffic the app **starts**, but lets it **answer**:
+beacons came in, replies to them went out (including the new unicast copies,
+which is why a fresh peer's reply worked and the same send 37 s later
+didn't), inbound sessions from Linux delivered fine — and every outbound
+QUIC dial failed in quinn-udp with EHOSTUNREACH. Seen, never sent. Nobody was
+asked because all LAN traffic comes from the engine, a helper binary. The app
+now runs `LocalNetworkCheck` at launch: a Bonjour browse for a throwaway
+service it also advertises, which is what makes macOS show the prompt, and
+whose `kDNSServiceErr_PolicyDenied` is the reliable read-back. Denied → the
+banner (overriding the engine's link status, which looked healthy); allowed →
+`/api/refresh` so the queue flushes now. `NSBonjourServices` added.
+
+**Not detected by the 31 Oct link check**, and that's worth knowing: it calls
+the link blocked only when *every* LAN send fails, and here the directed
+broadcast and the reply-unicasts succeed. The engine alone cannot see this
+state; only the app can ask macOS.
+
+**Linux: Ubuntu 24.04 → 26.04 removed `libgtk-4-dev`.** The update's
+install.sh found no GTK 4.10 dev files, took the fresh-install fallback and
+rewrote the launcher to the browser version — while the update relaunched the
+*old* (3 Sep) `lantern-gtk`, so two engines ran on one profile. install.sh now
+exits 3 before replacing anything when a native app is installed but can't be
+rebuilt, and update.sh turns that into "run `sudo apt install libgtk-4-dev`".
+
+**One engine per profile** (`lantern_core::lock_profile`, `engine.lock` in the
+data dir, `File::try_lock`, held for the process's life, names the holder in
+the error). Two engines on one profile announce one identity with two QUIC
+ports, so peers deliver to whichever they heard last. lantern-gui, the CLI
+and the GTK app take it before `Core::start`; GTK checks it before starting a
+core at all and shows "already running" if another engine holds it, while a
+second GTK launch still just focuses the window. Tests don't take it — they
+restart cores in-process.
+
+**Queued-message retries run off the discovery loop.** `flush_undelivered`
+was awaited inline; a dial to an unreachable peer takes the handshake
+timeout (8 s), stalling every other beacon behind it. Now spawned, one per
+peer at a time, and a failure is logged (once per peer per 10 min) instead
+of swallowed.
 
 ## Open defects
 
