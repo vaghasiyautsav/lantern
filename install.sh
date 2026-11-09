@@ -178,10 +178,47 @@ if [ "$(uname)" = "Darwin" ]; then
     if command -v swiftc >/dev/null 2>&1; then
         bold "Step 5: compiling the native macOS app (SwiftUI)…"
         ARCH="$(uname -m)"
-        swiftc -parse-as-library -O \
-            -target "${ARCH}-apple-macos13.0" \
-            -o "$STAGE/Contents/MacOS/Lantern" \
-            apps/macos-native/Lantern.swift
+        build_app() {
+            swiftc -parse-as-library -O \
+                -target "${ARCH}-apple-macos13.0" "$@" \
+                -o "$STAGE/Contents/MacOS/Lantern" \
+                apps/macos-native/Lantern.swift
+        }
+        SWIFT_LOG="$(mktemp)"; RETRY_LOG="$(mktemp)"
+        if ! build_app 2>"$SWIFT_LOG"; then
+            # The macOS 27 SDK makes SwiftUI's @State a macro, and the macro's
+            # plugin (libSwiftUIMacros) ships only inside Xcode. With just the
+            # Command Line Tools every @State fails: "plugin for module
+            # 'SwiftUIMacros' not found". The Tools also install the previous
+            # SDK, which predates the macro, so build against that instead;
+            # the app still targets macOS 13 either way.
+            BUILT=""
+            if grep -q 'SwiftUIMacros' "$SWIFT_LOG"; then
+                DEFAULT_SDK="$(cd "$(xcrun --show-sdk-path)" && pwd -P)"
+                TRIED=" $DEFAULT_SDK "
+                for sdk in $(ls -d "$(dirname "$DEFAULT_SDK")"/MacOSX[0-9]*.sdk 2>/dev/null | sort -V -r); do
+                    real="$(cd "$sdk" && pwd -P)"
+                    case "$TRIED" in *" $real "*) continue ;; esac
+                    TRIED="$TRIED$real "
+                    echo "This SDK's SwiftUI needs Xcode to compile; using $(basename "$real") instead…"
+                    if build_app -sdk "$real" 2>"$RETRY_LOG"; then BUILT=1; break; fi
+                done
+            fi
+            if [ -z "$BUILT" ]; then
+                # An older SDK that got further has the errors that matter.
+                if [ -s "$RETRY_LOG" ]; then cat "$RETRY_LOG" >&2; else cat "$SWIFT_LOG" >&2; fi
+                rm -rf "$STAGE"
+                echo
+                echo "Couldn't compile the Mac app, so Lantern.app was not replaced."
+                if grep -q 'SwiftUIMacros' "$SWIFT_LOG" &&
+                   { [ ! -s "$RETRY_LOG" ] || grep -q 'SwiftUIMacros' "$RETRY_LOG"; }; then
+                    echo "This SDK's SwiftUI needs Xcode (free in the App Store). Install it,"
+                    echo "run: sudo xcode-select -s /Applications/Xcode.app — then update again."
+                fi
+                exit 1
+            fi
+        fi
+        rm -f "$SWIFT_LOG" "$RETRY_LOG"
     else
         echo "swiftc not found — falling back to browser launcher"
         EXECUTABLE="lantern-launch"

@@ -809,6 +809,16 @@ invisible until the others list 3941 in `--targets`/`LANTERN_TARGETS` too.
   instead. If a pane ever renders empty, bisect the *other* pane.
 - `cargo test` at the workspace root fails on macOS because `lantern-gtk`
   needs pkg-config/GTK. Use `cargo test --workspace --exclude lantern-gtk`.
+- **macOS 27 SDK + Command Line Tools only = SwiftUI won't compile** (9 Nov
+  2026). In that SDK `@State` is a macro whose plugin (`libSwiftUIMacros`)
+  ships only in Xcode's `MacOSX.platform`, so every `@State` fails with
+  "plugin for module 'SwiftUIMacros' not found" and install.sh died at
+  Step 5 on the second Mac. It works on Utsav's Mac only because
+  xcode-select points at Xcode. The Tools also ship the previous SDK
+  (`MacOSX26.5.sdk`), and install.sh now retries against it when it sees
+  that error. Reproduce with
+  `DEVELOPER_DIR=/Library/Developer/CommandLineTools swiftc …`. Building
+  against the Xcode toolchain alone hides it.
 
 ## Pending: the Windows CI job should ship a package, not three .exes
 
